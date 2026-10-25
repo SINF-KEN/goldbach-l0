@@ -963,6 +963,37 @@ void test_gap_stats()
         o.gt[1] = 2;
         check(fails(o, false), "a count30 gap error flag fails the run");
     }
+    {
+        // a gap backfill whose row a crash lost (gap state on disk, log line
+        // not): its re-run writes the row, once
+        const std::string lg = (dir / "log").string();
+        const uint64_t A5 = 4000000003000000000ull, B5 = A5 + 200;
+        const auto run = [&](bool gaps) {
+            GoldbachStats g(cands, plan, CHECK30_TAIL);
+            if (gaps) g.begin_gaps(A5);
+            g.finish_run(A5, B5, (B5 - A5) / 2 + 1);
+            g.commit("test", 0);
+        };
+        const std::string tag = "GBGAPS v1 version=test start=" + std::to_string(A5) + " ";
+        const auto rows = [&] {
+            const std::string s = slurp_file(lg);
+            size_t n = 0;
+            for (size_t p = s.find(tag); p != std::string::npos; p = s.find(tag, p + 1)) ++n;
+            return n;
+        };
+        run(false);                                        // the p(n) run (no gaps: an old binary)
+        run(true);                                         // its gap backfill
+        check(rows() == 1, "a gap backfill logs its row");
+        const std::string g5 = slurp_file(gst);
+        std::string s = slurp_file(lg);
+        const size_t p = s.find(tag);
+        s.erase(p, s.find('\n', p) + 1 - p);
+        { std::FILE* f = std::fopen(lg.c_str(), "wb"); std::fwrite(s.data(), 1, s.size(), f); std::fclose(f); }
+        run(true);
+        check(rows() == 1, "a re-run writes the gap row a crash lost");
+        run(true);
+        check(rows() == 1 && slurp_file(gst) == g5, "a re-run with its row logged writes nothing (gap state untouched)");
+    }
     for (const char* v : {"GB_STATS_STATE", "GB_STATS_LOG", "GB_RECORDS_FILE", "GB_STATS_LIVE"}) ::unsetenv(v);
     std::error_code ec;
     fs::remove_all(dir, ec);
