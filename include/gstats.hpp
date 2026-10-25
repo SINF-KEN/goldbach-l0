@@ -825,10 +825,11 @@ private:
         const std::string h = dense_list(g.samp);
         return o + " gsamp=" + (h.empty() ? std::string("-") : h);
     }
-    /// Appends @p line to the run log, durably (fsync): the state is already
-    /// on disk, and a line left in the page cache is lost by a crash (the
-    /// gap history is rebuilt from these lines). The state file is
-    /// authoritative, so a failed append only warns.
+    /// Appends @p line to the run log. The log is a human-readable history;
+    /// the state file is authoritative, so a failed append only warns. The
+    /// append is durable (fsync): the state is already on disk, and a line
+    /// left in the page cache is lost by a crash (the gap history is rebuilt
+    /// from these lines).
     void append_log(const std::string& line) const
     {
         std::FILE* f = std::fopen(log_path_.c_str(), "ab");
