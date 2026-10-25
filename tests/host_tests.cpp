@@ -1001,10 +1001,11 @@ void test_gap_stats()
                 if (pcount[i]) want += std::to_string(pcount[i]);
             }
             const std::string lgs = slurp_file(lg);
-            const size_t r = lgs.find(tag);
-            const std::string row = lgs.substr(r, lgs.find('\n', r) - r);
+            const std::string ptag = "GBPSAMP v1 version=test start=" + std::to_string(A5) + " ";
+            const size_t r = lgs.find(ptag);
+            const std::string row = r == std::string::npos ? "" : lgs.substr(r, lgs.find('\n', r) - r);
             check(row.find(" psev=" + std::to_string((B5 - A5) / 2 + 1) + " psamp=" + want) != std::string::npos,
-                  "the backfill row carries the run's sampled p(n) histogram (psev, psamp)");
+                  "a backfill run logs its sampled p(n) histogram (GBPSAMP psev, psamp)");
         }
         const std::string g5 = slurp_file(gst);
         std::string s = slurp_file(lg);
@@ -1014,7 +1015,13 @@ void test_gap_stats()
         run(true);
         check(rows() == 1, "a re-run writes the gap row a crash lost");
         run(true);
-        check(rows() == 1 && slurp_file(gst) == g5, "a re-run with its row logged writes nothing (gap state untouched)");
+        check(rows() == 1 && slurp_file(gst) == g5, "a re-run with its row logged writes no gap row (gap state untouched)");
+        {
+            const std::string lgs = slurp_file(lg), ptag = "GBPSAMP v1 version=test start=" + std::to_string(A5) + " ";
+            size_t n = 0;
+            for (size_t q = lgs.find(ptag); q != std::string::npos; q = lgs.find(ptag, q + 1)) ++n;
+            check(n == 3, "every backfill-path run logs its GBPSAMP row (a later re-run feeds Figure 4 too)");
+        }
     }
     for (const char* v : {"GB_STATS_STATE", "GB_STATS_LOG", "GB_RECORDS_FILE", "GB_STATS_LIVE"}) ::unsetenv(v);
     std::error_code ec;
