@@ -595,11 +595,17 @@ public:
                              (unsigned long long)c.first, (unsigned long long)c.second,
                              state_path_.c_str());
                 // a gap backfill: the p(n) statistics of the range are in, its
-                // gaps may not be (the gap state keeps its own ranges)
+                // gaps may not be (the gap state keeps its own ranges). The row also
+                // carries the run's sampled p(n) histogram (psev evens, psamp counts by
+                // prime index, classes summed): the state holds it only cumulatively,
+                // so these rows give the p(n) history (live paper Figure 4) of a range
+                // the backfill re-runs.
                 if (gap_start_ == start_) {
                     const std::string row = "GBGAPS v1 version=" + std::string(version) + " start=" +
                                             std::to_string(start_) + " limit=" + std::to_string(limit_) +
-                                            " evens=" + std::to_string(evens_) + gap_fields() + "\n";
+                                            " evens=" + std::to_string(evens_) + gap_fields() +
+                                            " psev=" + std::to_string(evens_sampled_) +
+                                            " psamp=" + dense_list(by_prime(samp_, nullptr)) + "\n";
                     if (commit_gaps())
                         append_log(row);
                     else if (gaps_cover(start_, limit_) && !log_has_gaps_in(start_, limit_)) {
