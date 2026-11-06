@@ -1,0 +1,281 @@
+# CI for goldbach-l0 — runs entirely on the production machine (Intel Arc
+# B580) through two self-hosted runners (see ci/README.md "GitHub Actions"):
+#   goldbach-cpu : kernels, host, static, full (builds and GPU-free tests)
+#   goldbach-gpu : gpu (one job at a time; it pauses the production campaign)
+#
+# Gates (all must pass):
+#   kernels : the local Intel toolchain is the pinned one (ocloc = CR_VER);
+#             every module variant compiles; each shipped .spv is BYTE-
+#             IDENTICAL to a fresh compile of its source, so a kernel edited
+#             without rebuilding its binary fails here
+#   host    : gcc and clang with -Werror and a strict warning set, plus a
+#             clang ASan + UBSan build; ctest -LE gpu (host_tests,
+#             check_constants, cli_tests, stats_known, stats_tools)
+#   static  : host <-> kernel constant mirrors, shellcheck, actionlint,
+#             Python syntax
+#   full    : every target incl. the goldbach-tools validators (local
+#             checkout), benchmark figures
+#   gpu     : pushes only — the local CI (ci/goldbach_ci.py run, the
+#             production tree's copy; CPU tests are the jobs above): run_range
+#             paused, tests/gpu_validate.sh quick, bench.py A/B vs the running
+#             release, a 2e13-integer CI window with production's arguments
+#             compared bit for bit with the running release's result + with
+#             primecount. PASS promotes the commit (fast-forward only) and runs
+#             a quick benchmark session; anything else keeps the running
+#             release; run_range is resumed either way. Live progress in the
+#             job log, report = job summary, logs + figures = artifact.
+name: CI
+
+# Pushes only: a pull request's head branch is tested by its push (the
+# checks show on the PR); pull_request runs only repeated the CPU jobs on
+# the one CPU runner.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per commit. A newer push to the same branch (not main) cancels the
+# superseded run's CPU jobs (job-level groups below), so its GPU job is
+# skipped; a GPU job that is already running is never cancelled (it may hold
+# production paused mid-slice).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CR_VER: 26.35.39758.10     # intel/compute-runtime release (ocloc) — pinned
+  # every shipped kernel module: label | source | ocloc -D options
+  KERNEL_MODULES: |
+    goldbach|kernels/goldbach.cl|
+    sparse|kernels/sparse.cl|
+    sparse30030|kernels/sparse.cl|-DSCM_M=30030u -DSCM_K=12u -DSCM_RES_LIST=2377u,7979u,9731u,11267u,13799u,14611u,18427u,18649u,21467u,21523u,22823u,23911u -DA3_SPAN=8
+  TOOLS_DIR: /home/ken/coding/goldbach-tools     # local goldbach-tools checkout
+  PROD_DIR: /home/ken/coding/goldbach-l0-tidy     # production tree (run_range, ci-state)
+
+jobs:
+  kernels:
+    name: Kernels (offline compile, shipped binaries fresh)
+    runs-on: [self-hosted, goldbach-cpu]
+    concurrency:
+      group: ci-cpu-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-kernels
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pinned Intel toolchain
+        # after a system update the local ocloc may be newer: the shipped .spv
+        # (built with CR_VER) cannot be compared byte for byte any more, so
+        # that one step is skipped with a warning; compiling every module and
+        # the kernel list still gate. The runtime side of an update is
+        # re-verified by the local CI (GPU stack check).
+        run: |
+          ocloc --version 2>&1 | head -3
+          if ocloc --version 2>&1 | grep -q "${CR_VER%.*}"; then
+            echo "OCLOC_PINNED=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::local ocloc is not the pinned $CR_VER (system update?): shipped .spv freshness not checked — rebuild kernels/*_bmg.spv with the new ocloc and bump CR_VER"
+          fi
+
+      - name: Compile every kernel module offline (Battlemage)
+        run: |
+          out=$RUNNER_TEMP/kernels && rm -rf "$out" && mkdir -p "$out"
+          fail=0
+          while IFS='|' read -r label src opts; do
+            [ -n "$label" ] || continue
+            echo "::group::ocloc $label"
+            if ! nice -n 10 ocloc compile -file "$src" -device bmg -output "$out/$label" ${opts:+-options "$opts"} >"$out/$label.log" 2>&1 \
+               || ! test -s "$out/${label}_bmg.spv"; then
+              cat "$out/$label.log"; echo "::error file=$src::ocloc failed for $label"; fail=1
+            fi
+            tail -3 "$out/$label.log"
+            echo "::endgroup::"
+          done <<<"$KERNEL_MODULES"
+          exit $fail
+
+      - name: Shipped modules contain every __kernel of their source
+        run: |
+          bad=0
+          while IFS='|' read -r label src _; do
+            [ -n "$label" ] || continue
+            spv=kernels/${label}_bmg.spv
+            test -s "$spv" || { echo "::error file=$spv::missing shipped module"; bad=1; continue; }
+            names=$(strings -n 6 "$spv")
+            while read -r k; do
+              grep -qx "$k" <<<"$names" || { echo "::error file=$spv::missing kernel $k"; bad=1; }
+            done < <(grep -v '\\$' "$src" | grep -oP '__kernel\s+void\s+\K\w+' | sort -u)   # skip macro bodies
+          done <<<"$KERNEL_MODULES"
+          exit $bad
+
+      - name: Shipped .spv pass spirv-val (structural check, any toolchain)
+        # the byte-identity gate below needs the pinned ocloc; this one does
+        # not, so a corrupted or truncated module is caught on every runner
+        run: |
+          bad=0
+          while IFS='|' read -r label _ _; do
+            [ -n "$label" ] || continue
+            spirv-val --target-env spv1.4 "kernels/${label}_bmg.spv" || { echo "::error file=kernels/${label}_bmg.spv::spirv-val failed"; bad=1; }
+          done <<<"$KERNEL_MODULES"
+          exit $bad
+
+      - name: Shipped .spv byte-identical to a fresh compile (no stale binary)
+        if: env.OCLOC_PINNED == '1'
+        # ocloc 26.35 SPIR-V output is deterministic. A difference means the
+        # source changed without the binary being rebuilt, or the binary came
+        # from another toolchain. Fix: rebuild with the pinned ocloc and commit
+        # kernels/*_bmg.spv + .bin together with the source.
+        run: |
+          bad=0
+          while IFS='|' read -r label src _; do
+            [ -n "$label" ] || continue
+            if cmp -s "kernels/${label}_bmg.spv" "$RUNNER_TEMP/kernels/${label}_bmg.spv"; then
+              echo "fresh: kernels/${label}_bmg.spv"
+            else
+              echo "::error file=kernels/${label}_bmg.spv::stale: differs from a fresh ocloc $CR_VER compile of $src"; bad=1
+            fi
+          done <<<"$KERNEL_MODULES"
+          exit $bad
+
+  host:
+    name: Host ${{ matrix.name }}
+    runs-on: [self-hosted, goldbach-cpu]
+    concurrency:
+      group: ci-cpu-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-host-${{ matrix.name }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc -Werror
+            cc: gcc
+            cxx: g++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DGB_WERROR=ON
+          - name: clang -Werror
+            cc: clang
+            cxx: clang++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DGB_WERROR=ON
+          - name: clang ASan+UBSan
+            cc: clang
+            cxx: clang++
+            cmake_args: -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGB_WERROR=ON -DGB_SANITIZE=address,undefined
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: "Configure and build (standalone clone: verifier + host tests)"
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          rm -rf build
+          cmake -S . -B build ${{ matrix.cmake_args }}
+          nice -n 10 cmake --build build -j"$(nproc)" --target goldbach_l0 host_tests stats_ref
+
+      - name: ctest (host_tests, check_constants, cli_tests, stats_known, stats_tools; no GPU)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build -LE gpu --output-on-failure --timeout 600
+
+  static:
+    name: Static checks
+    runs-on: [self-hosted, goldbach-cpu]
+    concurrency:
+      group: ci-cpu-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-static
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: User-local tools on PATH (shellcheck, actionlint in ~/.local/bin)
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Host <-> kernel constant mirrors
+        run: python3 tests/check_constants.py
+
+      - name: shellcheck
+        run: |
+          shellcheck --version | head -2
+          shellcheck -S warning build.sh docs/make-plots.sh tests/cli_tests.sh tests/gpu_validate.sh scripts/notify_record.sh
+
+      - name: actionlint (workflow files)
+        run: actionlint -color
+
+      - name: Python syntax
+        run: python3 -m py_compile tests/*.py scripts/*.py ci/*.py
+
+      - name: Local CI logic (journal chain, reference cache, exact gates, ledger)
+        run: python3 tests/test_ci.py
+
+  full:
+    name: Full build with tools + figures
+    runs-on: [self-hosted, goldbach-cpu]
+    concurrency:
+      group: ci-cpu-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-full
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    needs: [kernels, host, static]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: goldbach-l0-tidy
+
+      - name: goldbach-tools at its committed HEAD (tools -> ../goldbach-tools)
+        # a clone, not a link to the live checkout: the build must not depend
+        # on uncommitted edits there (the job logs the commit it used)
+        run: |
+          rm -rf goldbach-tools
+          git clone -q --no-hardlinks "$TOOLS_DIR" goldbach-tools
+          echo "goldbach-tools $(git -C goldbach-tools rev-parse --short=12 HEAD)"
+          test -f goldbach-l0-tidy/tools/sweep.py
+
+      - name: Build every target (verifier, validators, tools)
+        working-directory: goldbach-l0-tidy
+        run: |
+          rm -rf build
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          nice -n 10 cmake --build build -j"$(nproc)"
+          find build -maxdepth 1 -type f -executable -printf '%f\n' | sort
+
+      - name: Render benchmark figures from bench/bench-results.csv
+        working-directory: goldbach-l0-tidy
+        run: |
+          # the plotting virtualenv is not versioned: use the local checkout's
+          if "$TOOLS_DIR/.venv/bin/python" -c "import pandas, matplotlib" 2>/dev/null; then
+            PY="$TOOLS_DIR/.venv/bin/python" bash docs/make-plots.sh
+          else
+            echo "::notice::$TOOLS_DIR/.venv lacks pandas/matplotlib — figures skipped"
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: benchmark-figures
+          path: goldbach-l0-tidy/docs/images/*.png
+          if-no-files-found: ignore
+
+  gpu:
+    # Pushes only (a pull request's head branch is tested by its push); one
+    # GPU job at a time across all branches, queued, never cancelled midway
+    # (a cancelled job is SIGTERMed: goldbach_ci.py still resumes production).
+    name: GPU (production slice, promote)
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, goldbach-gpu]
+    needs: [kernels, host, static]
+    timeout-minutes: 300
+    concurrency:
+      group: goldbach-gpu
+      cancel-in-progress: false
+    steps:
+      - name: Local CI (ci/goldbach_ci.py run, the production tree's copy)
+        run: |
+          python3 "$PROD_DIR/ci/goldbach_ci.py" run "$GITHUB_SHA" --fetch --skip-cpu-tests \
+            --ref "$GITHUB_REF_NAME" --summary "$GITHUB_STEP_SUMMARY" --artifacts "$RUNNER_TEMP/gpu-ci"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: gpu-ci-${{ github.sha }}
+          path: ${{ runner.temp }}/gpu-ci
+          if-no-files-found: ignore

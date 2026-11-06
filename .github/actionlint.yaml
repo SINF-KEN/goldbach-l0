@@ -1,0 +1,5 @@
+self-hosted-runner:
+  # custom labels of the two self-hosted runners on the production machine
+  labels:
+    - goldbach-cpu
+    - goldbach-gpu

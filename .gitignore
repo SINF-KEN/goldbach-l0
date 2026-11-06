@@ -1,0 +1,48 @@
+# Build directory
+build/
+
+# Generated GBPR prime caches, keyed by limit (e.g. base_primes.cache.2000000016)
+*.cache
+base_primes*.cache*
+scm_plan.*.bin
+bench-plots/
+range-*.log
+range-*.log.stderr
+
+# Headless benchmark runner output (tools/tty_baseline.sh, tools/tty_auto.sh)
+tty-*.log
+tty-baseline-last.txt
+
+# Local, machine-specific state (never shared):
+# the resume journal of a running tools/run_range.sh campaign
+range-*.journal
+goldbach_ridges.csv
+goldbach_stats.log
+goldbach_stats.state
+goldbach_stats.state.tmp
+goldbach_live.json
+goldbach_live.json.tmp
+goldbach_records.txt
+__pycache__/
+# secrets / local notification settings (ntfy topic, mail, webhooks) — never commit
+.env
+.env.*
+*.env
+*.key
+*.secret
+*.token
+secrets*
+*.local.sh
+notify.local*
+ntfy*.conf
+# local CI (ci/goldbach_ci.py): releases, ledger, run logs, production config
+# (may hold notification secrets); GPU lock shared with tools/run_range.sh;
+# run_range.sh stop requests and retried-slice recheck queue
+ci-state/
+.goldbach-gpu.lock
+range-*.stop
+range-*.recheck
+
+# native ocloc output (only the .spv modules are loaded and shipped)
+kernels/*.bin
+goldbach_stats.state.lock

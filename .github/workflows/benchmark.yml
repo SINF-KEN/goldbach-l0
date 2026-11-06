@@ -1,0 +1,42 @@
+# Full benchmark session on the production machine (also run automatically by
+# the local CI after every PASS that changes code): current vs previous
+# release vs historical versions, interleaved fresh-process bench.py runs,
+# appended to bench/bench-results.csv; analysis = job summary, figures = artifact.
+# Pauses run_range (slice boundary) for ~10 / ~40 min and resumes it.
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "quick (~10 min: current vs previous) or full (~40 min: + GB_STATS=0, history, sparse, all windows)"
+        type: choice
+        options: [full, quick]
+        default: full
+
+permissions:
+  contents: read
+
+env:
+  PROD_DIR: /home/ken/coding/goldbach-l0-tidy
+
+jobs:
+  benchmark:
+    name: Full benchmark (pauses production)
+    runs-on: [self-hosted, goldbach-gpu]
+    timeout-minutes: 360
+    concurrency:
+      group: goldbach-gpu
+      cancel-in-progress: false
+    steps:
+      - name: goldbach_ci.py benchmark
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: python3 "$PROD_DIR/ci/goldbach_ci.py" benchmark --profile "${PROFILE:-full}" --summary "$GITHUB_STEP_SUMMARY" --artifacts "$RUNNER_TEMP/bench"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench
+          if-no-files-found: ignore
