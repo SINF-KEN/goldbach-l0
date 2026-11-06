@@ -26,7 +26,7 @@ cmake -S . -B build -DGB_WERROR=ON  # what CI builds (strict warnings as errors)
 With `ocloc` on `PATH`, CMake recompiles `kernels/*_bmg.spv` whenever a
 kernel source changes; without it the shipped modules are used. The
 validators and benchmark tools live in the companion repository
-`goldbach-tools` (not published), checked out next to
+[goldbach-tools](https://github.com/SINF-KEN/goldbach-tools), cloned next to
 this one (`tools -> ../goldbach-tools`); without it only `goldbach_l0`,
 `host_tests` and `stats_ref` are built.
 

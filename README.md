@@ -74,6 +74,7 @@ range was verified. Why that holds, and how each step is checked:
 
 ```bash
 git clone https://github.com/SINF-KEN/goldbach-l0-tidy.git
+git clone https://github.com/SINF-KEN/goldbach-tools.git   # validators, benchmarks (optional)
 cd goldbach-l0-tidy
 bash build.sh
 
