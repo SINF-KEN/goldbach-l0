@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""goldbach_ci.py — local CI for goldbach-l0-tidy (stdlib only).
+"""goldbach_ci.py — local CI for goldbach-l0 (stdlib only).
 
 One CI run per commit (GitHub Actions job `gpu`, or the daemon), see
 ci/README.md:

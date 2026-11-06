@@ -8,7 +8,7 @@
 #   goldbach logs     follow the production log
 set -euo pipefail
 
-ROOT=$HOME/coding/goldbach-l0-tidy
+ROOT=$HOME/coding/goldbach-l0
 CI=(python3 "$ROOT/ci/goldbach_ci.py")
 UNITS=(goldbach-ci.service goldbach-sync.timer goldbach-sync.path goldbach-campaign-queue.timer)
 

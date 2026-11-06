@@ -12,7 +12,7 @@
 # Needs: gh (logged in, admin on the repo), curl. No sudo. Also installs the
 # pinned shellcheck / actionlint into ~/.local/bin for the static job.
 set -euo pipefail
-REPO=${GB_RUNNER_REPO:-SINF-KEN/goldbach-l0-tidy}
+REPO=${GB_RUNNER_REPO:-SINF-KEN/goldbach-l0}
 UNITS=$HOME/.config/systemd/user
 
 if [ "${1:-}" = remove ]; then

@@ -52,7 +52,7 @@ env:
     sparse|kernels/sparse.cl|
     sparse30030|kernels/sparse.cl|-DSCM_M=30030u -DSCM_K=12u -DSCM_RES_LIST=2377u,7979u,9731u,11267u,13799u,14611u,18427u,18649u,21467u,21523u,22823u,23911u -DA3_SPAN=8
   TOOLS_DIR: /home/ken/coding/goldbach-tools     # local goldbach-tools checkout
-  PROD_DIR: /home/ken/coding/goldbach-l0-tidy     # production tree (run_range, ci-state)
+  PROD_DIR: /home/ken/coding/goldbach-l0     # production tree (run_range, ci-state)
 
 jobs:
   kernels:
@@ -220,7 +220,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          path: goldbach-l0-tidy
+          path: goldbach-l0
 
       - name: goldbach-tools at its committed HEAD (tools -> ../goldbach-tools)
         # a clone, not a link to the live checkout: the build must not depend
@@ -229,10 +229,10 @@ jobs:
           rm -rf goldbach-tools
           git clone -q --no-hardlinks "$TOOLS_DIR" goldbach-tools
           echo "goldbach-tools $(git -C goldbach-tools rev-parse --short=12 HEAD)"
-          test -f goldbach-l0-tidy/tools/sweep.py
+          test -f goldbach-l0/tools/sweep.py
 
       - name: Build every target (verifier, validators, tools)
-        working-directory: goldbach-l0-tidy
+        working-directory: goldbach-l0
         run: |
           rm -rf build
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -240,7 +240,7 @@ jobs:
           find build -maxdepth 1 -type f -executable -printf '%f\n' | sort
 
       - name: Render benchmark figures from bench/bench-results.csv
-        working-directory: goldbach-l0-tidy
+        working-directory: goldbach-l0
         run: |
           # the plotting virtualenv is not versioned: use the local checkout's
           if "$TOOLS_DIR/.venv/bin/python" -c "import pandas, matplotlib" 2>/dev/null; then
@@ -252,7 +252,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         with:
           name: benchmark-figures
-          path: goldbach-l0-tidy/docs/images/*.png
+          path: goldbach-l0/docs/images/*.png
           if-no-files-found: ignore
 
   gpu:

@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 env:
-  PROD_DIR: /home/ken/coding/goldbach-l0-tidy
+  PROD_DIR: /home/ken/coding/goldbach-l0
 
 jobs:
   benchmark:

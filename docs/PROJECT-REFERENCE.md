@@ -1,4 +1,4 @@
-# PROJECT REFERENCE — goldbach-l0-tidy
+# PROJECT REFERENCE — goldbach-l0
 
 The detailed reference: configuration, CLI, environment, pipeline, kernels,
 host components, and the log of every optimization kept or dropped (§9.2).
@@ -64,7 +64,7 @@ sqrt(5e18) cache (`base_primes.cache.2236067993`) serves every slice of
 ## 3. Repository layout
 
 ```
-goldbach-l0-tidy/
+goldbach-l0/
 ├── CMakeLists.txt          host targets, tests, ocloc SPIR-V rules (kernels/*.cl -> *_bmg.spv, -device bmg)
 ├── build.sh                cmake configure + build
 ├── include/

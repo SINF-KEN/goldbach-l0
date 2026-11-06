@@ -66,7 +66,7 @@ def last_event(log):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=os.path.expanduser("~/coding/goldbach-l0-tidy"))
+    ap.add_argument("--root", default=os.path.expanduser("~/coding/goldbach-l0"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--push", nargs=2, metavar=("START", "LIMIT"))
     ap.add_argument("--slice", default=None)
