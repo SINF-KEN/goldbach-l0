@@ -1,0 +1,19 @@
+# Dependabot version updates. The only third-party dependencies tracked in
+# this repository are the GitHub Actions used by the workflows (C++ deps are
+# system packages / the pinned Intel toolchain, checked by CI's kernels gate).
+#
+# CI runs on the production machine's self-hosted runners, so updates are
+# batched into one weekly PR to keep runner load low.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
