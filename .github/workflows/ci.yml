@@ -63,7 +63,7 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Pinned Intel toolchain
         # after a system update the local ocloc may be newer: the shipped .spv
@@ -162,7 +162,7 @@ jobs:
             cxx: clang++
             cmake_args: -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGB_WERROR=ON -DGB_SANITIZE=address,undefined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: "Configure and build (standalone clone: verifier + host tests)"
         env:
@@ -187,7 +187,7 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: User-local tools on PATH (shellcheck, actionlint in ~/.local/bin)
         run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -218,7 +218,7 @@ jobs:
     needs: [kernels, host, static]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: goldbach-l0
 
@@ -249,7 +249,7 @@ jobs:
             echo "::notice::$TOOLS_DIR/.venv lacks pandas/matplotlib — figures skipped"
           fi
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: benchmark-figures
           path: goldbach-l0/docs/images/*.png
@@ -273,7 +273,7 @@ jobs:
           python3 "$PROD_DIR/ci/goldbach_ci.py" run "$GITHUB_SHA" --fetch --skip-cpu-tests \
             --ref "$GITHUB_REF_NAME" --summary "$GITHUB_STEP_SUMMARY" --artifacts "$RUNNER_TEMP/gpu-ci"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gpu-ci-${{ github.sha }}

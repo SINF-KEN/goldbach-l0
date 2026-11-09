@@ -34,7 +34,7 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: python3 "$PROD_DIR/ci/goldbach_ci.py" benchmark --profile "${PROFILE:-full}" --summary "$GITHUB_STEP_SUMMARY" --artifacts "$RUNNER_TEMP/bench"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: benchmark-${{ github.run_id }}
