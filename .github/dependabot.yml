@@ -3,7 +3,8 @@
 # system packages / the pinned Intel toolchain, checked by CI's kernels gate).
 #
 # CI runs on the production machine's self-hosted runners, so updates are
-# batched into one weekly PR to keep runner load low.
+# batched into one weekly PR to keep runner load low. The PR merges itself
+# once CI passes (.github/workflows/dependabot-automerge.yml).
 version: 2
 updates:
   - package-ecosystem: "github-actions"
