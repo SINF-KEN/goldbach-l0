@@ -1564,7 +1564,7 @@ confuse its presence with an active stage.
 | `ctest -L gpu` → `gpu_validate` (local, GPU) | `tests/gpu_validate.sh`: GPU statistics log + state vs `stats_ref` (tests/stats_compare.py) on 6 windows (one across 2^63), the published windows via `known_windows.py run` (quick: 4e18 + 1e10 and + 1e12; full also + 1e13 and 1e12 across 2^63), end to end in every checker mode, GB_BUCKET_VERIFY=1 (hit lists: both ends, multi-batch K = 5 / 50, ragged first / last segments; the GB_HITLIST=0 ring), `--cpu-check`, the debug_* validators when built | `gpu_validate: 0 failure(s) -> PASS` |
 | `ctest` → `cli_tests` (`tests/cli_tests.sh`) | malformed numbers and options missing their value exit 2; empty / reversed ranges, `--split` > 2^32 - 1 and the removed `--wheel` exit 2; limits above 2^64 - 2^40 exit 1 before GPU work; `2e5` == `200000`; CPU reference PASS | `cli_tests: PASS` |
 | `test_ci.py` (CI static job) | the local CI's journal chain (incl. a PASS row disagreeing with its own `limit=`, a cut-off row), reference cache keys, exact gates | `0 failure(s) -> PASS` |
-| CI `kernels` job | every module compiles; each shipped `.spv` passes `spirv-val`, is byte-identical to a fresh ocloc 26.35 compile (deterministic output) and contains every `__kernel` of its source | all `fresh` |
+| CI `kernels` job | every module compiles; each shipped `.spv` passes `spirv-val`, is byte-identical to a fresh ocloc 26.40 compile (deterministic output) and contains every `__kernel` of its source | all `fresh` |
 | `debug_sieve` | tile kernel (table AND legacy paths) bit-exact vs CPU sieve | OK both, diff_words=0 |
 | `debug_check` | check kernel vs CPU; expected sole miss n=4 | OK (miss n=4 only) |
 | `debug_fb` | large-prime first-offset formula vs host reference | OK both geometries |
@@ -1660,7 +1660,7 @@ with zero code changes.
   per-access.
 - ocloc determinism: older toolchains produced different-but-equivalent
   SPIR-V across sessions (id-space / `__clang_ocl_kern_imp_*` layout
-  wobble). The pinned ocloc 26.35 is deterministic — CI gates on byte
+  wobble). The pinned ocloc 26.40 is deterministic — CI gates on byte
   identity of every shipped `.spv` — but the native `.bin` is not shipped
   and the validators + an A/B remain the gate for any kernel change.
 

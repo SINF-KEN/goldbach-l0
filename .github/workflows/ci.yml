@@ -45,7 +45,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CR_VER: 26.35.39758.10     # intel/compute-runtime release (ocloc) — pinned
+  CR_VER: 26.40.40196.8      # intel/compute-runtime release (ocloc) — pinned
   # every shipped kernel module: label | source | ocloc -D options
   KERNEL_MODULES: |
     goldbach|kernels/goldbach.cl|
@@ -122,7 +122,7 @@ jobs:
 
       - name: Shipped .spv byte-identical to a fresh compile (no stale binary)
         if: env.OCLOC_PINNED == '1'
-        # ocloc 26.35 SPIR-V output is deterministic. A difference means the
+        # ocloc 26.40 SPIR-V output is deterministic. A difference means the
         # source changed without the binary being rebuilt, or the binary came
         # from another toolchain. Fix: rebuild with the pinned ocloc and commit
         # kernels/*_bmg.spv + .bin together with the source.
@@ -257,16 +257,16 @@ jobs:
 
   gpu:
     # Pushes only (a pull request's head branch is tested by its push); one
-    # GPU job at a time across all branches, queued, never cancelled midway
-    # (a cancelled job is SIGTERMed: goldbach_ci.py still resumes production).
+    # GPU job at a time across all branches, never cancelled midway (a
+    # cancelled job is SIGTERMed: goldbach_ci.py still resumes production).
+    # Serialised by the single goldbach-gpu runner (+ ci.lock), NOT by a
+    # concurrency group: a group keeps one pending job and cancels the
+    # older ones, so a later push silently dropped a queued GPU run.
     name: GPU (production slice, promote)
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, goldbach-gpu]
     needs: [kernels, host, static]
     timeout-minutes: 300
-    concurrency:
-      group: goldbach-gpu
-      cancel-in-progress: false
     steps:
       - name: Local CI (ci/goldbach_ci.py run, the production tree's copy)
         run: |
