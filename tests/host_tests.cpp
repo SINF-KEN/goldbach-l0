@@ -410,6 +410,21 @@ void test_sparse_helpers()
             }
     }
     check(ok, "make_groups_scm + scm_group_offsets clear exactly the class multiples");
+
+    // leftover entries: only evens of the segment inside [start, limit] decode
+    {
+        const uint64_t N = 4000000000000000000ull / M * M, start = N + 10, limit = N + uint64_t(M) * 99 + 7;
+        const uint32_t dl = 100;
+        const auto ent = [](uint64_t cr, uint64_t i) { return cr << 32 | i; };
+        uint64_t n = 0;
+        check(scm_leftover_even(ent(5, 0), N, M, dl, start, limit, n) && n == N + 10, "leftover: first even of the run");
+        check(scm_leftover_even(ent(3, 99), N, M, dl, start, limit, n) && n == limit - 1, "leftover: last class bit");
+        check(!scm_leftover_even(ent(4, 0), N, M, dl, start, limit, n), "leftover: below start rejected");
+        check(!scm_leftover_even(ent(4, 99), N, M, dl, start, limit, n), "leftover: above limit rejected");
+        check(!scm_leftover_even(ent(0, dl), N, M, dl, 0, ~0ull, n), "leftover: i >= dl rejected");
+        check(!scm_leftover_even(ent(M / 2, 1), N, M, dl, 0, ~0ull, n), "leftover: class >= M / 2 rejected");
+        check(!scm_leftover_even(~0ull, N, M, dl, 0, ~0ull, n), "leftover: all-ones entry rejected");
+    }
 }
 
 // Phase A (funnel members) + phase B must test every candidate of a class.

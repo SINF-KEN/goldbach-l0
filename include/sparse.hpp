@@ -502,4 +502,24 @@ inline uint32_t scm_first_hit(uint64_t Q, uint32_t c, uint32_t p, uint64_t minv_
     return uint32_t(scm_mulmod((p - x) % p, minv_p, p));
 }
 
+/// Decodes one leftover entry of a sparse segment (kernel layout cr << 32 | i,
+/// even n = N + 2 cr + M i) and checks that it names an even the segment was
+/// asked to verify. A corrupted entry must not be "verified" in place of the
+/// unresolved even it stands for (same contract as the dense path's leftover
+/// index check).
+/// @param N      segment base (first even of class 0).
+/// @param dl     class bits of the segment (i < dl).
+/// @param start,limit  the run's even range (inclusive).
+/// @pre   M even, N + M (dl - 1) <= limit <= MAX_SUPPORTED_LIMIT (ScmEngine::enqueue
+///        clamps dl so), so N + 2 cr + M i cannot wrap.
+/// @return true and the even in @p n iff cr < M / 2, i < dl and start <= n <= limit.
+inline bool scm_leftover_even(uint64_t e, uint64_t N, uint32_t M, uint32_t dl,
+                              uint64_t start, uint64_t limit, uint64_t& n)
+{
+    const uint32_t cr = uint32_t(e >> 32), i = uint32_t(e);
+    if (cr >= M / 2 || i >= dl) return false;
+    n = N + 2ull * cr + uint64_t(M) * i;
+    return start <= n && n <= limit;
+}
+
 } // namespace gb
