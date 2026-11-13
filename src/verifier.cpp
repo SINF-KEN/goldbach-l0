@@ -1577,9 +1577,11 @@ RunStats run_gpu(uint64_t limit,
         seg_stat.sieve_split = sieve_split;
         seg_stat.mask_count  = mask_count_seg;
         seg_stat.tiles       = tiles_launch;
-        seg_stat.large_items = large_count > 0
-            ? (uint64_t(large_count) + LARGE_PRIMES_PER_ITEM - 1) / LARGE_PRIMES_PER_ITEM
-            : 0;
+        // work-items of the packed large-prime kernel as launched below
+        // (LARGE_PACK_PPI primes each; the bucketed / hit-listed primes are
+        // not work-items of it). The legacy LARGE_PRIMES_PER_ITEM count over
+        // every large prime reported ~4x the real launch.
+        seg_stat.large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
         sum_tiles += tiles_launch;
         sum_large_items += seg_stat.large_items;
 
