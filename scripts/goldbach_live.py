@@ -65,9 +65,13 @@ def bar(frac, w=40):
 
 def read_journal(path):
     rows = []
-    for line in open(path):
+    with open(path) as f:
+        lines = f.read().splitlines()
+    for line in lines:
         t = line.split()
         if len(t) >= 4 and t[0] == "PASS":
+            if not (t[1].isdigit() and t[2].isdigit()):     # a row cut off by a crash
+                continue
             d = dict(x.split("=", 1) for x in t[4:] if "=" in x)
             rows.append((int(t[1]), int(t[2]), t[3], d))
     return rows
@@ -177,6 +181,8 @@ def covered_to(ranges, extra=None):
     hi = None
     for a, b in rs:
         if hi is None:
+            if b < START0:               # e.g. a test run at 1e12: not part of the coverage
+                continue
             if a > START0:
                 return None
             hi = b
@@ -204,7 +210,8 @@ def ci_panel(now):
            f"         phase {B}{ph}{R}" + (f" for {hms(since)}, run {hms(total)}" if stt.get("started") else "")]
     if ph == "benchmark":
         try:     # same progress line as the GitHub job log (ci/goldbach_ci.py)
-            sys.path.insert(0, "ci")
+            if "ci" not in sys.path:
+                sys.path.insert(0, "ci")
             import goldbach_ci
             out.append(f"         {goldbach_ci.bench_progress(stt)}")
         except Exception:
@@ -259,7 +266,6 @@ def main():
         # ---------------- progress / speed / ETA ----------------
         if S is not None:
             total = (L - S) // 2 + 1
-            banked = 0
             nxt = S
             for a_, b_, _, _ in rows:
                 if a_ == nxt:

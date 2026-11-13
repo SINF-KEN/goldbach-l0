@@ -154,7 +154,10 @@ failure. A failed run never changes the active release.
   the GPU suite + the CI window with the **same** release, which must
   reproduce its cached reference bit for bit and match primecount (a
   `gpu-stack-check` run in the ledger). If not, production stays stopped
-  with an alert: roll the update back, then `production start`. A change of
+  with an alert: roll the update back, then `production start`. A failed
+  check is recorded in `ci-state/gpu-stack-failed.json` and not repeated on
+  that exact stack (any further change re-runs it; delete the file to retry
+  by hand). A change of
   the VRAM clock (`mem_speed`; stock 19000 on this machine) triggers the same
   check.
 - **ocloc newer than the pinned CR_VER**: the GitHub `kernels` job warns and

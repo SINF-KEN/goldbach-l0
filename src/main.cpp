@@ -79,10 +79,6 @@ void usage() {
         (unsigned long long)gb::DEFAULT_SEGMENT_EVEN);
 }
 
-} // namespace
-
-namespace {
-
 // ---- machine-readable output modes ----------------------------------------
 
 /// @return @p s with '"' and '\\' backslash-escaped and control characters
@@ -108,6 +104,7 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
     std::printf("  \"start\": %llu,\n", (unsigned long long)s.start);
     std::printf("  \"segment\": %llu,\n", (unsigned long long)segment);
     std::printf("  \"split\": %u,\n", split);
+    if (s.split_used) std::printf("  \"split_used\": %u,\n", s.split_used);
     std::printf("  \"spv\": \"%s\",\n", json_escape(spv.c_str()).c_str());
     std::printf("  \"segments\": %llu,\n", (unsigned long long)s.segments);
     std::printf("  \"leftovers\": %llu,\n", (unsigned long long)s.leftovers);
@@ -179,7 +176,8 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         "check_s=%.4f offsets_s=%.4f table_s=%.4f sync_s=%.4f evens_per_sec=%.6g "
         "tiles=%llu large_items=%llu "
         "ridge_min=%u ridge_found=%llu ridge_dropped=%llu ridge_max=%llu "
-        "stats=%d stats_tail=%llu stats_sampled=%llu stats_pmax=%llu primes=%llu twins=%llu\n",
+        "stats=%d stats_tail=%llu stats_sampled=%llu stats_pmax=%llu primes=%llu twins=%llu "
+        "split_used=%u\n",
         gb::VERSION,
         (unsigned long long)s.limit, (unsigned long long)s.start,
         (unsigned long long)segment, split,
@@ -194,7 +192,7 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         (unsigned long long)(s.ridge_top.empty() ? 0 : s.ridge_top.front().p),
         s.stats_on ? 1 : 0, (unsigned long long)s.stats_tail, (unsigned long long)s.stats_sampled,
         (unsigned long long)s.stats_pmax, (unsigned long long)s.stats_primes,
-        (unsigned long long)s.stats_twins);
+        (unsigned long long)s.stats_twins, s.split_used);
 }
 
 /// Prints the per-segment table (header + one row per s.per_segment entry).
@@ -251,6 +249,7 @@ int main(int argc, char** argv) {
     uint64_t segment     = gb::DEFAULT_SEGMENT_EVEN;
     uint64_t split       = 0;
     uint64_t cpu_check   = 0;
+    bool cpu_check_set   = false;
     std::string spv      = "kernels/goldbach_bmg.spv";
     bool sparse          = false;
     bool spv_set         = false;
@@ -279,7 +278,7 @@ int main(int argc, char** argv) {
         else if (a == "--start")     next(start);
         else if (a == "--segment")   next(segment);
         else if (a == "--split")     next(split);
-        else if (a == "--cpu-check") next(cpu_check);
+        else if (a == "--cpu-check") { next(cpu_check); cpu_check_set = true; }
         else if (a == "--sparse")    sparse = true;
         else if (a == "--spv")       { spv = next_str(); spv_set = true; }
         else if (a == "--prime-cache") prime_cache = next_str();
@@ -297,13 +296,19 @@ int main(int argc, char** argv) {
             return 0;
         }
         else if (a == "--help" || a == "-h") { usage(); return 0; }
-        else { std::printf("unknown option: %s\n", a.c_str()); usage(); return 2; }
+        else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
     }
 
     // Range contract (GPU paths): verify every even n with max(start, 4) <= n
     // <= limit. An empty or reversed range is a usage error, never a PASS
     // over evens that were not requested.
-    if (!cpu_check) {
+    // --cpu-check 0 used to mean "flag absent" and silently ran a full GPU
+    // verification of the default range instead.
+    if (cpu_check_set && cpu_check < 4) {
+        std::fprintf(stderr, "error: --cpu-check needs N >= 4\n");
+        return 2;
+    }
+    if (!cpu_check_set) {
         const uint64_t first_even = start < 4 ? 4 : start + (start & 1);
         if (start > limit || first_even > limit || first_even < start) {
             std::fprintf(stderr, "error: no even n >= 4 in [start=%llu, limit=%llu]\n",
@@ -317,7 +322,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        if (cpu_check) {
+        if (cpu_check_set) {
             const bool ok = gb::verify_cpu(cpu_check, verbose);
             std::printf("CPU check up to %llu: %s\n",
                         (unsigned long long)cpu_check, ok ? "PASS" : "FAIL");

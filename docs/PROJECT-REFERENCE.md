@@ -1052,8 +1052,7 @@ Env vars (sparse path): `GB_SPARSE=1` (select the path; also `--sparse`),
 `GB_SCM_SEGW0` / `GB_SCM_SEGW1` (plan costs), `GB_SCM_SPAN` / `GB_SCM_WPL`
 (must match the module: handshake), `GB_SCM_RESTCAP` (384), `GB_SCM_PLAN_CACHE=0` (no plan cache), `GB_SCM_PCAP` /
 `GB_SCM_LCAP` (caps), `GB_SCM_BGROUPS`, `GB_SCM_LARGE_WG`, `GB_SCM_SPV`
-(module override), `GB_SCM_TIMING_ONLY=1` (ablation builds only: no pending
-overflow check), `GB_INIT_TRACE=1`, `GB_PHASE=1` (per-segment kernel times).
+(module override), `GB_INIT_TRACE=1`, `GB_PHASE=1` (per-segment kernel times).
 Production: `GB_SPARSE=1 bash tools/run_range.sh START LIMIT` (the default
 --segment 425000000 selects the geometry's segment).
 

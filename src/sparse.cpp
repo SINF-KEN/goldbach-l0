@@ -701,7 +701,7 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
     }
     r.tile_s = t[0]; r.large_s = t[1]; r.check_a_s = t[2]; r.check_b_s = t[3];
     r.pending = *I.h_pending_n[slot];
-    if (r.pending > I.pending_cap && !std::getenv("GB_SCM_TIMING_ONLY"))   // timing experiments only
+    if (r.pending > I.pending_cap)        // evens beyond the cap were never checked: fail closed
         throw std::runtime_error("sparse: phase-A pending overflow (" + std::to_string(r.pending) + ")");
     const uint32_t nl = *I.h_left_n[slot];
     if (nl > I.leftover_cap) throw std::runtime_error("sparse: leftover overflow");
