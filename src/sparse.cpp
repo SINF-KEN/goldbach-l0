@@ -719,8 +719,11 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
 void ScmEngine::resolve(const ScmSegResult& r, RidgeTracker* ridges) const
 {
     for (uint64_t e : r.left) {
-        const uint32_t cr = uint32_t(e >> 32), i = uint32_t(e);
-        const uint64_t n = r.N + 2ull * cr + uint64_t(im->geo.M) * i;
+        uint64_t n = 0;
+        if (!scm_leftover_even(e, r.N, im->geo.M, r.dl, im->start, im->limit, n))
+            throw std::runtime_error("sparse: leftover entry " + std::to_string(e >> 32) + ":" +
+                                     std::to_string(uint32_t(e)) + " outside the segment at " +
+                                     std::to_string(r.N) + " (corrupted list)");
         bool ok = false;
         for (uint32_t p : im->cand_primes) {
             if (p >= n) break;
