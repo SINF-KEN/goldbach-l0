@@ -596,10 +596,28 @@ public:
                              state_path_.c_str());
                 // a gap backfill: the p(n) statistics of the range are in, its
                 // gaps may not be (the gap state keeps its own ranges)
-                if (gap_start_ == start_ && commit_gaps())
-                    append_log("GBGAPS v1 version=" + std::string(version) + " start=" + std::to_string(start_) +
+                if (gap_start_ == start_) {
+                    // the run's sampled p(n) histogram (psev evens, psamp counts by prime
+                    // index, classes summed), on every re-run: the state holds it only
+                    // cumulatively, so these rows give the p(n) history (live paper
+                    // Figure 4) of a range run again; readers take one row per start
+                    append_log("GBPSAMP v1 version=" + std::string(version) + " start=" + std::to_string(start_) +
                                " limit=" + std::to_string(limit_) + " evens=" + std::to_string(evens_) +
-                               gap_fields() + "\n");
+                               " psev=" + std::to_string(evens_sampled_) +
+                               " psamp=" + dense_list(by_prime(samp_, nullptr)) + "\n");
+                    const std::string row = "GBGAPS v1 version=" + std::string(version) + " start=" +
+                                            std::to_string(start_) + " limit=" + std::to_string(limit_) +
+                                            " evens=" + std::to_string(evens_) + gap_fields() + "\n";
+                    if (commit_gaps())
+                        append_log(row);
+                    else if (gaps_cover(start_, limit_) && !log_has_gaps_in(start_, limit_)) {
+                        // merged, but its row never reached the log (a crash before
+                        // the append hit the disk): the row depends on the run only
+                        std::fprintf(stderr, "stats: %s has no gap row for [%llu, %llu] -- written now\n",
+                                     log_path_.c_str(), (unsigned long long)start_, (unsigned long long)limit_);
+                        append_log(row);
+                    }
+                }
                 return;
             }
         const std::string line = log_line(version);    // before first_ changes (new_first)
@@ -816,13 +834,40 @@ private:
         return o + " gsamp=" + (h.empty() ? std::string("-") : h);
     }
     /// Appends @p line to the run log. The log is a human-readable history;
-    /// the state file is authoritative, so a failed append only warns.
+    /// the state file is authoritative, so a failed append only warns. The
+    /// append is durable (fsync): the state is already on disk, and a line
+    /// left in the page cache is lost by a crash (the gap history is rebuilt
+    /// from these lines).
     void append_log(const std::string& line) const
     {
         std::FILE* f = std::fopen(log_path_.c_str(), "ab");
         if (!f) { std::fprintf(stderr, "stats: cannot append to %s\n", log_path_.c_str()); return; }
-        if (std::fwrite(line.data(), 1, line.size(), f) != line.size() || std::fclose(f) != 0)
+        bool ok = std::fwrite(line.data(), 1, line.size(), f) == line.size();
+        ok = (std::fflush(f) == 0) && ok;
+        ok = (::fsync(::fileno(f)) == 0) && ok;
+        if (std::fclose(f) != 0 || !ok)
             std::fprintf(stderr, "stats: incomplete append to %s\n", log_path_.c_str());
+    }
+
+    /// Whether the log has a line with gap fields (a GBGAPS row, or the
+    /// GBSTATS line of a run that recorded its gaps) for evens in [a, b].
+    bool log_has_gaps_in(uint64_t a, uint64_t b) const
+    {
+        std::FILE* f = std::fopen(log_path_.c_str(), "rb");
+        if (!f) return false;
+        char* ln = nullptr;
+        size_t cap = 0;
+        bool hit = false;
+        while (!hit && ::getline(&ln, &cap, f) > 0) {
+            if (std::strncmp(ln, "GB", 2) != 0 || !std::strstr(ln, " gd1=")) continue;
+            const char* s = std::strstr(ln, " start=");
+            const char* l = std::strstr(ln, " limit=");
+            if (s && l)
+                hit = std::strtoull(s + 7, nullptr, 10) <= b && a <= std::strtoull(l + 7, nullptr, 10);
+        }
+        std::free(ln);
+        std::fclose(f);
+        return hit;
     }
 
     static std::vector<uint64_t> parse_dense(const char* s, size_t n)
@@ -885,6 +930,13 @@ private:
         std::vector<std::pair<uint64_t, uint64_t>> covered;
     };
     std::string gap_path() const { return state_path_ + ".gaps"; }
+    /// Whether the gap state holds all of [a, b].
+    bool gaps_cover(uint64_t a, uint64_t b) const
+    {
+        for (auto& c : load_gaps().covered)
+            if (c.first <= a && b <= c.second) return true;
+        return false;
+    }
     /// The gap state (absent = empty).
     /// @throws std::runtime_error if it exists but is cut off or misses a
     ///         record (save writes every one, "end" last).

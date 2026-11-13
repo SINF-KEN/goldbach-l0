@@ -122,7 +122,7 @@ void test_prime_cache()
         std::vector<std::pair<const char*, std::vector<uint32_t>>> bad;
         auto hole = good;  std::fill(hole.begin() + 1000, hole.begin() + 1100, 0u);
         auto even = good;  even[2000] += 1;
-        auto swap = good;  std::swap(swap[3000], swap[3001]);
+        auto swap = good;  std::swap(swap.at(3000), swap.at(3001));
         bad.push_back({"zero hole", hole});
         bad.push_back({"even entry", even});
         bad.push_back({"out of order", swap});
@@ -962,6 +962,66 @@ void test_gap_stats()
         o = seg_out(A3 - 3, A3 + 3000, A3 - 33, false);
         o.gt[1] = 2;
         check(fails(o, false), "a count30 gap error flag fails the run");
+    }
+    {
+        // a gap backfill whose row a crash lost (gap state on disk, log line
+        // not): its re-run writes the row, once
+        const std::string lg = (dir / "log").string();
+        const uint64_t A5 = 4000000003000000000ull, B5 = A5 + 200;
+        // every even sampled, p(n) on the CPU: the backfill row carries this histogram
+        std::vector<uint64_t> pcount(cands.size(), 0);
+        for (uint64_t n = A5; n <= B5; n += 2)
+            for (size_t i = 0; i < cands.size(); ++i)
+                if (is_prime_u64(n - cands[i])) { ++pcount[i]; break; }
+        const auto run = [&](bool gaps) {
+            GoldbachStats g(cands, plan, CHECK30_TAIL);
+            if (gaps) g.begin_gaps(A5);
+            for (uint64_t n = A5; n <= B5; n += 2)
+                for (const uint32_t q : cands)
+                    if (is_prime_u64(n - q)) { g.add_cpu(n, q, true); break; }
+            g.finish_run(A5, B5, (B5 - A5) / 2 + 1);
+            g.commit("test", (B5 - A5) / 2 + 1);
+        };
+        const std::string tag = "GBGAPS v1 version=test start=" + std::to_string(A5) + " ";
+        const auto rows = [&] {
+            const std::string s = slurp_file(lg);
+            size_t n = 0;
+            for (size_t p = s.find(tag); p != std::string::npos; p = s.find(tag, p + 1)) ++n;
+            return n;
+        };
+        run(false);                                        // the p(n) run (no gaps: an old binary)
+        run(true);                                         // its gap backfill
+        check(rows() == 1, "a gap backfill logs its row");
+        {
+            std::string want;                              // dense: zeros empty, trailing zeros cut
+            size_t last = 0;
+            for (size_t i = 0; i < pcount.size(); ++i) if (pcount[i]) last = i + 1;
+            for (size_t i = 0; i < last; ++i) {
+                if (i) want += ',';
+                if (pcount[i]) want += std::to_string(pcount[i]);
+            }
+            const std::string lgs = slurp_file(lg);
+            const std::string ptag = "GBPSAMP v1 version=test start=" + std::to_string(A5) + " ";
+            const size_t r = lgs.find(ptag);
+            const std::string row = r == std::string::npos ? "" : lgs.substr(r, lgs.find('\n', r) - r);
+            check(row.find(" psev=" + std::to_string((B5 - A5) / 2 + 1) + " psamp=" + want) != std::string::npos,
+                  "a backfill run logs its sampled p(n) histogram (GBPSAMP psev, psamp)");
+        }
+        const std::string g5 = slurp_file(gst);
+        std::string s = slurp_file(lg);
+        const size_t p = s.find(tag);
+        s.erase(p, s.find('\n', p) + 1 - p);
+        { std::FILE* f = std::fopen(lg.c_str(), "wb"); std::fwrite(s.data(), 1, s.size(), f); std::fclose(f); }
+        run(true);
+        check(rows() == 1, "a re-run writes the gap row a crash lost");
+        run(true);
+        check(rows() == 1 && slurp_file(gst) == g5, "a re-run with its row logged writes no gap row (gap state untouched)");
+        {
+            const std::string lgs = slurp_file(lg), ptag = "GBPSAMP v1 version=test start=" + std::to_string(A5) + " ";
+            size_t n = 0;
+            for (size_t q = lgs.find(ptag); q != std::string::npos; q = lgs.find(ptag, q + 1)) ++n;
+            check(n == 3, "every backfill-path run logs its GBPSAMP row (a later re-run feeds Figure 4 too)");
+        }
     }
     for (const char* v : {"GB_STATS_STATE", "GB_STATS_LOG", "GB_RECORDS_FILE", "GB_STATS_LIVE"}) ::unsetenv(v);
     std::error_code ec;
