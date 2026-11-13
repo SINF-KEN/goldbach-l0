@@ -7,8 +7,8 @@
   overclock). Kernels are compiled for `-device bmg`; other Xe2 parts
   should work but are untested.
 - **Driver**: Intel compute-runtime (Level Zero, `xe` kernel driver),
-  developed against 26.31 and 26.35. The kernel modules ship pre-built
-  with the **pinned ocloc 26.35.39758.10** (`.github/workflows/ci.yml`
+  developed against 26.31, 26.35 and 26.40. The kernel modules ship pre-built
+  with the **pinned ocloc 26.40.40196.8** (`.github/workflows/ci.yml`
   `CR_VER`).
 - **Display**: keep the desktop on another GPU (or run headless): a
   compositor on the B580 costs ~20% and makes timings bimodal.

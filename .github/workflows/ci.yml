@@ -45,7 +45,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CR_VER: 26.35.39758.10     # intel/compute-runtime release (ocloc) — pinned
+  CR_VER: 26.40.40196.8      # intel/compute-runtime release (ocloc) — pinned
   # every shipped kernel module: label | source | ocloc -D options
   KERNEL_MODULES: |
     goldbach|kernels/goldbach.cl|
@@ -122,7 +122,7 @@ jobs:
 
       - name: Shipped .spv byte-identical to a fresh compile (no stale binary)
         if: env.OCLOC_PINNED == '1'
-        # ocloc 26.35 SPIR-V output is deterministic. A difference means the
+        # ocloc 26.40 SPIR-V output is deterministic. A difference means the
         # source changed without the binary being rebuilt, or the binary came
         # from another toolchain. Fix: rebuild with the pinned ocloc and commit
         # kernels/*_bmg.spv + .bin together with the source.
