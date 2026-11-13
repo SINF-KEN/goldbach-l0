@@ -54,6 +54,19 @@ for top in 18446744073709551614 18446742974197923842; do
     done
 done
 
+echo "zero / malformed work-group knobs fail closed before any GPU work -> exit 1"
+# A zero grid-stride grid skipped phase B (pending evens never checked) or the
+# hit-list marks, and could still report PASS.
+for knob in GB_CHECK_BGROUPS=0 GB_STATS_BGROUPS=0 GB_BUCKET_GROUPS=0 GB_CHECK_BGROUPS=abc \
+            GB_CHECK_BGROUPS=-1 GB_SCM_BGROUPS=0; do
+    mode=""; [ "${knob%%=*}" = GB_SCM_BGROUPS ] && mode=--sparse
+    out=$(env "$knob" "$BIN" --start 1000000 --limit 2000000 \
+          ${mode:+"$mode"} --csv 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && grep -q "work-group count" <<<"$out" && ! grep -q "result=PASS" <<<"$out"; then
+        echo "  ok   $knob $mode refused"
+    else echo "  FAIL $knob $mode: exit $rc: $(tail -1 <<<"$out")"; fail=1; fi
+done
+
 echo "valid spellings agree; CPU reference passes"
 a=$("$BIN" --cpu-check 200000 2>&1); ra=$?
 b=$("$BIN" --cpu-check 2e5 2>&1); rb=$?

@@ -361,11 +361,26 @@ public:
         for (uint16_t p : S_UNKNOWN_4E18) unknown_.push_back(p);
         load_state();
         (void)load_gaps();                         // a damaged gap state fails before the run, not after
-        for (size_t i = 0; i < np; ++i)
-            if (primes[i] >= tail_t_ && !first_[i]) want_p_[primes[i] / 64] |= 1u << ((primes[i] / 2) & 31);
+        set_run_start(~0ull);                      // until set: only the bins never seen
     }
 
-    /// Bitset by p >> 1: tail bins without a campaign first occurrence yet.
+    /// Sets the run's first even and rebuilds want_p for it: a tail bin is
+    /// wanted while the campaign has no first occurrence for it at or below
+    /// @p start. A bin first seen only ABOVE the run (a range committed out
+    /// of order) stays wanted, so this run's smaller n can replace it
+    /// (commit keeps the minimum); excluding every seen bin silently kept
+    /// the higher n as "first".
+    /// @pre   called before the run's first segment is enqueued.
+    void set_run_start(uint64_t start)
+    {
+        std::fill(want_p_.begin(), want_p_.end(), 0u);
+        for (size_t i = 0; i < primes_.size(); ++i)
+            if (primes_[i] >= tail_t_ && (!first_[i] || first_[i] > start))
+                want_p_[primes_[i] / 64] |= 1u << ((primes_[i] / 2) & 31);
+    }
+
+    /// Bitset by p >> 1: tail bins without a campaign first occurrence at or
+    /// below the run start (set_run_start).
     const std::vector<uint32_t>& want_p() const { return want_p_; }
     uint32_t tail_t() const { return tail_t_; }
     size_t pbins() const { return primes_.back() / 2 + 1; }

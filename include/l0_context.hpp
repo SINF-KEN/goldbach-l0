@@ -99,6 +99,16 @@ private:
     ze_module_handle_t  module_ = nullptr;
 };
 
+/// Work-group count of a grid-stride kernel from the environment.
+/// A grid of 0 must never reach a launch: a driver may accept it as an empty
+/// dispatch, so the kernel's work (e.g. phase B's pending evens) would be
+/// skipped while the run still reports PASS.
+/// @param name  environment variable (unset: @p dflt).
+/// @return the value, >= 1.
+/// @throws std::runtime_error unless the variable is a whole number (decimal,
+///         0x hex or 0 octal, as strtoul) in [1, 2^32 - 1].
+uint32_t env_grid(const char* name, uint32_t dflt);
+
 /// The immediate list is not in-order (Context(true): the dense pipeline,
 /// unless GB_UNORDERED=0); Kernel::launch then appends a barrier first.
 extern bool g_unordered;
