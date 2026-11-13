@@ -1,0 +1,26 @@
+# Auto-merge Dependabot PRs. GitHub merges the PR (squash) only once the
+# required CI checks on main pass (ruleset "main: CI required"), so a bump
+# that breaks CI stays open for a human.
+#
+# Runs on a GitHub-hosted runner (public repo, free): pull_request events must
+# never reach the self-hosted runners on the production PC. It checks out
+# nothing and only calls the API.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'SINF-KEN/goldbach-l0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enable auto-merge (squash)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
