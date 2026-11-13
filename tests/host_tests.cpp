@@ -799,6 +799,25 @@ void test_stats_state()
     check(rs.size() == 3 && rs[1] == "range " + std::to_string(S + 10000) + " " + std::to_string(S + 11000) &&
           rs[2] == "range " + std::to_string(S + 20000) + " " + std::to_string(S + 21000),
           "concurrent commits both recorded (no lost update)");
+    {   // first occurrence of p(n) = 3001 recorded at S + 50014
+        GoldbachStats g(cands, plan, CHECK30_TAIL);
+        std::vector<uint32_t> fp(MAX_GB_PRIME / 2 + 1, ~0u);
+        fp[3001 / 2] = 7;
+        g.add_first(S + 50000, fp.data());
+        g.finish_run(S + 50000, S + 51000, 501);
+        g.commit("test", 0);
+    }
+    {   // want_p follows the run start: a bin first seen ABOVE the run stays wanted
+        const auto wanted = [](const GoldbachStats& g, uint32_t p) {
+            return ((g.want_p()[p / 64] >> ((p / 2) & 31)) & 1u) != 0;
+        };
+        GoldbachStats g(cands, plan, CHECK30_TAIL);
+        check(!wanted(g, 3001) && wanted(g, 3011), "want_p: seen tail bins excluded before set_run_start");
+        g.set_run_start(S + 40000);
+        check(wanted(g, 3001) && wanted(g, 3011), "want_p: bin first seen above the run start is wanted");
+        g.set_run_start(S + 60000);
+        check(!wanted(g, 3001) && wanted(g, 3011), "want_p: bin first seen below the run start is not");
+    }
     const std::string full = slurp(st);
     bool threw = false;
     try { GoldbachStats g(cands, plan, 1000); } catch (const std::exception&) { threw = true; }

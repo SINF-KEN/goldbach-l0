@@ -405,7 +405,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
                                                 0x7FFFFFFFu));
     I.pending_cap = uint32_t(env_u64("GB_SCM_PCAP", I.pending_cap));
     I.leftover_cap = uint32_t(env_u64("GB_SCM_LCAP", 1u << 20));
-    I.cb_groups = uint32_t(env_u64("GB_SCM_BGROUPS", 640));
+    I.cb_groups = env_grid("GB_SCM_BGROUPS", 640);   // >= 1: a zero grid would skip phase B
 
     // ---- L0 ----
     I.mod.reset(new Module(I.ctx, std::getenv("GB_SCM_SPV") ? std::string(std::getenv("GB_SCM_SPV"))
@@ -810,6 +810,7 @@ RunStats run_gpu_sparse(uint64_t limit, uint64_t segment_even, const std::string
                         const char* prime_cache_path, bool collect_segments)
 {
     require_supported_limit(limit);   // before Level Zero: fail closed with no GPU work
+    (void)env_grid("GB_SCM_BGROUPS", 640);   // likewise a zero phase-B grid (ScmEngine reads it again)
     RunStats stats;
     const auto t0 = clock_::now();
     if (start_even < 4) start_even = 4;

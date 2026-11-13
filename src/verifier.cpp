@@ -541,6 +541,17 @@ RunStats run_gpu(uint64_t limit,
                  bool collect_segments) {
     if (limit < 4) throw std::runtime_error("limit < 4: no even n >= 4 to verify");
     gb::require_supported_limit(limit);
+    // The last even n is limit rounded down (as run_gpu_sparse does). An odd
+    // limit left the segment and count30 ranges ending on an even q, so the
+    // statistics missed a prime at limit - 2 (and the twin pair below it)
+    // while the gap sum still included it.
+    limit &= ~uint64_t(1);
+    // Grid-stride work-group counts, validated before any GPU work: env_grid
+    // refuses 0, which would skip phase B (pending evens never checked) or the
+    // hit-list / bucket marks (composites left "prime") and still PASS.
+    const uint32_t phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK_PHASE_B_GROUPS);
+    const uint32_t stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
+    const uint32_t bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
     RunStats stats;
     stats.limit = limit;
     const auto t_start = clock_::now();
@@ -643,8 +654,6 @@ RunStats run_gpu(uint64_t limit,
     // a host-only change sizes the phase-A launch for a different width and
     // leaves evens unchecked.
     const uint32_t a_w64 = CHECK_PHASE_A_W64;
-    uint32_t phase_b_groups = CHECK_PHASE_B_GROUPS;
-    if (const char* e = std::getenv("GB_CHECK_BGROUPS")) phase_b_groups = uint32_t(std::strtoul(e, nullptr, 0));
     if (const char* e = std::getenv("GB_CHECK_CAP")) check_cap = uint32_t(std::strtoul(e, nullptr, 0));
     // Twin checker (v1.10.0): phase A reads the map as a twin map with the lower
     // members of twin pairs (two candidates per funnel); phase B then probes
@@ -728,7 +737,6 @@ RunStats run_gpu(uint64_t limit,
     RidgeTracker ridges(&gb_all);
     const char* ridge_file = std::getenv("GB_RIDGE_FILE");
     if (!ridge_file || !*ridge_file) ridge_file = "goldbach_ridges.csv";
-    if (ridges.active()) ridges.load(ridge_file);
     // Phase-A ceilings: every candidate a checker's phase A tests is below
     // its ceiling, so an even whose ridge reaches the ceiling fails phase A
     // and phase B records its exact ridge. Below it phase A may resolve the
@@ -744,6 +752,11 @@ RunStats run_gpu(uint64_t limit,
     const uint32_t ceil_c30 = c30chk ? plan30.member_lt : 0u;
     const uint32_t a_ceiling = c30chk ? ceil_c30 : split_on ? ceil_split : ceil_fallback;
     if (ridges.active() && a_ceiling) ridges.clamp_floor_above(a_ceiling - 1u);
+    // Load the store only after the clamp: load() filters by the floor, and
+    // entries below the clamped floor (a low GB_RIDGE_MIN) would otherwise
+    // stay in the top list and set the kernel threshold from a region the
+    // kernels no longer record completely.
+    if (ridges.active()) ridges.load(ridge_file);
     // ---- Exact statistics (include/gstats.hpp) -----------------------------
     // p(n) for every even, prime / twin counts. Needs the mod-30 checker and
     // a start far above MAX_GB_PRIME (futile-last candidate order); GB_STATS=0
@@ -768,11 +781,10 @@ RunStats run_gpu(uint64_t limit,
     std::unique_ptr<Kernel> k_cxs[4], k_cxb, k_cnt;
     uint32_t stats_sample = STATS_SAMPLE_DEFAULT;
     if (const char* e = std::getenv("GB_STATS_SAMPLE")) stats_sample = std::max(1u, uint32_t(std::strtoul(e, nullptr, 0)));
-    const uint32_t stats_b_groups = std::getenv("GB_STATS_BGROUPS")
-        ? uint32_t(std::strtoul(std::getenv("GB_STATS_BGROUPS"), nullptr, 0)) : 160u;
     if (stats_on) {
         splan = make_stats_plan(gb_all, stats_k, plan30.member_lt);
         gstats = std::make_unique<GoldbachStats>(gb_all, splan, plan30.member_lt);
+        gstats->set_run_start(start_even);   // before want_p reaches the device
         for (int v = 0; v < 4; ++v) k_cxs[v] = std::make_unique<Kernel>(mod, XS_KERNELS[v]);
         k_cxb = std::make_unique<Kernel>(mod, "check30_xb");
         k_cnt = std::make_unique<Kernel>(mod, "count30");
@@ -1207,8 +1219,8 @@ RunStats run_gpu(uint64_t limit,
     std::unique_ptr<Kernel> k_bproc, k_bact, k_cmp, k_large_full, k_hlh, k_hla;
     // Class map: 2048 groups (per 1e11: -0.2% at 4e18, -0.4% at 5e18); the
     // dense map measured 2048 no better than 1024.
-    uint32_t bucket_groups = class_mode ? 2 * BUCKET_GROUPS : BUCKET_GROUPS;
-    if (const char* e = std::getenv("GB_BUCKET_GROUPS")) bucket_groups = uint32_t(std::strtoul(e, nullptr, 0));
+    const uint32_t bucket_groups = bucket_groups_env ? bucket_groups_env
+                                                     : class_mode ? 2 * BUCKET_GROUPS : BUCKET_GROUPS;
     if (hitlist) {
         k_hlh = std::make_unique<Kernel>(mod, "hl_harvest");
         k_hla = std::make_unique<Kernel>(mod, hl_fuse ? "sieve_large_packed_hl" : "hl_apply");
@@ -2345,8 +2357,8 @@ RunStats run_gpu(uint64_t limit,
 
             if (n_left > 0)
                 resolve_leftovers(ctx, b.leftovers[prev], n_left, prev_seg_start,
-                                  prev_seg_evens, gb_primes, verbose, stats.segments, &ridges, gstats.get(),
-                                  sampled_slot[prev]);
+                                  prev_seg_evens, gb_primes, verbose, stats.segments - 1, &ridges,
+                                  gstats.get(), sampled_slot[prev]);
             ridges.save(ridge_file);
             coll_s = seconds_since(t_coll);
         }
@@ -2432,8 +2444,8 @@ RunStats run_gpu(uint64_t limit,
 
         if (n_left > 0)
             resolve_leftovers(ctx, b.leftovers[last], n_left, prev_seg_start,
-                              prev_seg_evens, gb_primes, verbose, stats.segments, &ridges, gstats.get(),
-                              sampled_slot[last]);
+                              prev_seg_evens, gb_primes, verbose, stats.segments - 1, &ridges,
+                              gstats.get(), sampled_slot[last]);
         ridges.save(ridge_file);
     }
 

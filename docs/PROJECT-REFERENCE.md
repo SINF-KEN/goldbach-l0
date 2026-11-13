@@ -216,13 +216,13 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_STATS_STATE=F` / `GB_STATS_LOG=F` | statistics files (default goldbach_stats.state / goldbach_stats.log in the cwd) |
 | `GB_RECORDS_FILE=F` / `GB_STATS_LIVE=F` | record events (p(n) > 9781, new S(p); CPU re-proven, appended at once; default goldbach_records.txt) / live snapshot for scripts/goldbach_live.py (default goldbach_live.json, every 2 s) |
 | `GB_RECORD_HOOK=cmd` | run `cmd KIND P N Q CHECK` in the background per record event (default scripts/notify_record.sh when present; empty: none). The script reads `GB_NOTIFY_WALL`, `GB_NTFY_TOPIC` / `GB_NTFY_SERVER`, `GB_NOTIFY_MAIL`, `GB_NOTIFY_CMD`, `GB_NOTIFY_SP` (README "The record hunt") |
-| `GB_STATS_BGROUPS=N` | check30_xb work-groups (sampled segments; default 160) |
+| `GB_STATS_BGROUPS=N` | check30_xb work-groups (sampled segments; default 160; N >= 1, else the run fails before GPU work) |
 | `GB_C30_PLAN=S` | mod-30 checker plan override; a leading `T:` bounds every funnel member below T (the statistics tail bound) |
 | `GB_SPARSE=1` / `GB_SCM_*` | sparse class map: select the path and its knobs (list in §9.2k); `GB_PHASE=1` prints per-segment tile / large / phase A / phase B times and the pending rate, `GB_INIT_TRACE=1` the init breakdown |
 | `GB_PHASE=1` | per-segment host-phase trace to stderr: prep (offsets/table), enqueue (args/l1/l2/l3), wait, collect + raw kernel start/end ticks and sieve->large / large->check gaps. Default off (a few clock reads per segment) |
 | `GB_WHEEL_W=W` | host side of the multiplier wheel (must match the kernel's -DWHEEL_W: 30, 210, 2310) |
 | `GB_BUCKET_VERIFY_DUMP=1` | with GB_BUCKET_VERIFY: on the first mismatch print the differing bits with Miller-Rabin truth |
-| `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid (§9.2b) |
+| `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid (§9.2b; n >= 1) |
 | `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |
 | `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, max 128, list buffer < 4 GiB) (§9.2t); GB_BUCKET_VERIFY checks either path |
 | `GB_HL_FUSE=0` | hit-list apply as its own launch (hl_apply) instead of fused into the packed kernel (§9.2u) |
@@ -231,7 +231,7 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_CHECK_CAP=K` | phase-A candidate count of the two-phase checker (default 160) |
-| `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640) |
+| `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
 | `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default: mod-30 class map + merge30) |
 | `GB_SPLIT_CAP=K` / `GB_SPLIT_STAGES=S` | class-split checker funnels per list / stage masks ("7/3", "3", "7:20/3" = at most 20 triplet funnels) |

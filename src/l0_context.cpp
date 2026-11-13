@@ -1,6 +1,7 @@
 #include <algorithm>
 #include "l0_context.hpp"
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -23,6 +24,18 @@ std::string ze_result_string(ze_result_t r) {
     case ZE_RESULT_ERROR_INVALID_SIZE: return "invalid size";
     default: return "error " + std::to_string(static_cast<int>(r));
     }
+}
+
+uint32_t env_grid(const char* name, uint32_t dflt) {
+    const char* e = std::getenv(name);
+    if (!e) return dflt;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(e, &end, 0);
+    if (*e == '\0' || *end != '\0' || errno != 0 || v < 1 || v > 0xFFFFFFFFull)
+        throw std::runtime_error(std::string(name) + "='" + e +
+                                 "': expected a work-group count >= 1");
+    return uint32_t(v);
 }
 
 // ---------------------------------------------------------------- Context --
