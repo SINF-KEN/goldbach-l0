@@ -257,16 +257,16 @@ jobs:
 
   gpu:
     # Pushes only (a pull request's head branch is tested by its push); one
-    # GPU job at a time across all branches, queued, never cancelled midway
-    # (a cancelled job is SIGTERMed: goldbach_ci.py still resumes production).
+    # GPU job at a time across all branches, never cancelled midway (a
+    # cancelled job is SIGTERMed: goldbach_ci.py still resumes production).
+    # Serialised by the single goldbach-gpu runner (+ ci.lock), NOT by a
+    # concurrency group: a group keeps one pending job and cancels the
+    # older ones, so a later push silently dropped a queued GPU run.
     name: GPU (production slice, promote)
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, goldbach-gpu]
     needs: [kernels, host, static]
     timeout-minutes: 300
-    concurrency:
-      group: goldbach-gpu
-      cancel-in-progress: false
     steps:
       - name: Local CI (ci/goldbach_ci.py run, the production tree's copy)
         run: |

@@ -25,9 +25,6 @@ jobs:
     name: Full benchmark (pauses production)
     runs-on: [self-hosted, goldbach-gpu]
     timeout-minutes: 360
-    concurrency:
-      group: goldbach-gpu
-      cancel-in-progress: false
     steps:
       - name: goldbach_ci.py benchmark
         env:
