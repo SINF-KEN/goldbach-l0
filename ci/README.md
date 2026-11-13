@@ -14,7 +14,7 @@ push
     -> build in ci-state/work/src (git worktree; cmake Release -Werror;      ~20 s
        goldbach-tools from its committed HEAD in ci-state/work/goldbach-tools,
        never the live checkout — the log names the tools commit)
-    -> same code fingerprint as the active release? -> IDENTICAL, promote, done
+    -> same code fingerprint as the active release? -> IDENTICAL, done (active unchanged)
     -> pause run_range: at the slice boundary (<= one 5e13 slice, ~7 min), production paused
        or at once if redoing the slice in progress is cheaper than waiting
     -> tests/gpu_validate.sh quick                                           ~1 min

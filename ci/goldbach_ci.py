@@ -5,7 +5,7 @@ One CI run per commit (GitHub Actions job `gpu`, or the daemon), see
 ci/README.md:
 
   build in a separate worktree (+ CPU tests unless Actions already ran them)
-    -> same code as the active release?  IDENTICAL: promote, done
+    -> same code as the active release?  IDENTICAL: done (active unchanged)
     -> pause run_range (slice boundary, or now if the slice just started)
     -> tests/gpu_validate.sh quick -> bench.py A/B vs the active release
     -> CI window (fixed 2e13 integers at the campaign start, production args
@@ -1252,9 +1252,12 @@ class Run:
                                                        "built and tested only; merge/rebase onto it to deploy")
             return "DIVERGED"
         if self.act and self.rec["fingerprint"] == self.ameta.get("fingerprint") and not self.force_gpu:
+            # no promotion: the code is the same, and moving the active commit to this
+            # (possibly unmerged) branch tip would make every sibling branch that
+            # lacks it DIVERGED. The older active commit is an ancestor of this one.
             self.check("artifact_identical", "ok", f"same code fingerprint as the active release "
-                                                   f"{self.ameta.get('id')}: no GPU stage needed")
-            promote(self.rel)
+                                                   f"{self.ameta.get('id')}: no GPU stage needed, active "
+                                                   "release unchanged")
             return "IDENTICAL"
         return None
 
