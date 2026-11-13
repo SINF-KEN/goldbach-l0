@@ -136,6 +136,24 @@ def read_t0(path):
     return ref
 
 
+def covered_to(ranges, start0=4000000000000000000):
+    """Largest x such that [start0, x] is covered without a gap (else None).
+    Ranges entirely below start0 (test runs, e.g. at 1e12) do not count."""
+    cov = None
+    for lo, hi in sorted(ranges):
+        if cov is None:
+            if hi < start0:
+                continue
+            if lo > start0:
+                return None
+            cov = hi
+        elif lo <= cov + 2:
+            cov = max(cov, hi)
+        else:
+            break
+    return cov
+
+
 def write_export(path, ref, tail, st, cov, T):
     """t0-style table for p >= T, extended to the campaign's covered limit."""
     rows = []
@@ -257,20 +275,7 @@ def main():
 
     if a.ref:
         ref = read_t0(a.ref)
-        cov = None
-        for lo, hi in sorted(st["range"]):
-            if cov is None:
-                if lo > 4000000000000000000:
-                    break
-                cov = hi
-            elif lo <= cov + 2:
-                cov = max(cov, hi)
-        tail = {}
-        for cls in st["tailcls"].values():
-            for p, c in cls.items():
-                tail[p] = tail.get(p, 0) + c
-        for p, c in st["tailagg"].items():
-            tail[p] = tail.get(p, 0) + c
+        cov = covered_to(st["range"])
         newS = {p: n for p, n in st["first"].items()
                 if p in ref and ref[p][0] is None and cov is not None and n <= cov}
         print(f"\n== vs T. Oliveira e Silva's table to 4e18 ({a.ref})")

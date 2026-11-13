@@ -459,6 +459,12 @@ def prod_paths(pc):
     return j, Path(base + ".log"), Path(base + ".stop")
 
 
+def prod_stats_log(pc):
+    """Production's goldbach_stats.log (GB_STATS_LOG, relative to ROOT where
+    run_range runs)."""
+    return ROOT / pc.get("env", {}).get("GB_STATS_LOG", "goldbach_stats.log")
+
+
 def prod_live(pc):
     """Production's goldbach_live.json if it is fresh (< 2 min old)."""
     p = Path(pc.get("env", {}).get("GB_STATS_LIVE", ROOT / "goldbach_live.json"))
@@ -768,14 +774,30 @@ def gpu_stack():
     return snap
 
 
-def gpu_stack_change():
+GPU_STACK_FAILED = "gpu-stack-failed.json"
+
+
+def gpu_stack_change(now=None):
     """{key: (verified, now)} since the active release was last verified."""
     ref = load_json(STATE / "gpu-stack.json", None)
-    now = gpu_stack()
+    now = gpu_stack() if now is None else now
     if ref is None:                      # first run: today's stack is the baseline
         save_json(STATE / "gpu-stack.json", now)
         return {}
     return {k: (ref.get(k), now.get(k)) for k in sorted(set(ref) | set(now)) if ref.get(k) != now.get(k)}
+
+
+def gpu_stack_check_due():
+    """The stack change still to verify: {} when there is none, or when the
+    re-verification already failed on exactly this stack (ci-state/
+    gpu-stack-failed.json; it is retried once the stack changes again, or
+    after that file is deleted). Without this, a failed check re-ran -- and
+    alerted -- on every daemon poll."""
+    now = gpu_stack()
+    change = gpu_stack_change(now)
+    if change and load_json(STATE / GPU_STACK_FAILED, None) == now:
+        return {}
+    return change
 
 
 # ------------------------------------------------------------------ build --
@@ -1273,7 +1295,7 @@ class Run:
         else the active release's cached result, run now if missing."""
         if mode == "journal":
             row = next(r for r in reversed(read_journal(prod_paths(self.pc)[0])) if r["tag"] == "PASS" and r["a"] == a)
-            return {"kv": row["kv"], "stats_line": stats_line(ROOT / "goldbach_stats.log", a, b),
+            return {"kv": row["kv"], "stats_line": stats_line(prod_stats_log(self.pc), a, b),
                     "source": f"journal row {row['ts']}", "release": row["kv"].get("release", "?")}
         key = ref_key(self.ameta["fingerprint"], a, b, self.seg, self.env)
         cache = STATE / "ref-cache" / f"{key}.json"
@@ -1395,6 +1417,13 @@ class Run:
             alert("GPU STACK CHANGE BREAKS RESULTS", f"{self.rec.get('reason')} after "
                   + ", ".join(self.stack_change) + " changed — production stopped; roll back the update "
                   "or re-validate (goldbach_ci.py production start once fixed)")
+        if self.stack_change:
+            if self.rec["status"] == "PASS":
+                (STATE / GPU_STACK_FAILED).unlink(missing_ok=True)
+            else:                               # not again on this stack (see gpu_stack_check_due)
+                save_json(STATE / GPU_STACK_FAILED, self.rec["gpu_stack"])
+                log(f"CI {self.id}: GPU stack check {self.rec['status']}; not retried on this stack "
+                    f"(delete ci-state/{GPU_STACK_FAILED} to retry)")
         if t_down is not None:
             self.rec["downtime_s"] = int(time.monotonic() - t_down)
         return self.finish()
@@ -1668,6 +1697,7 @@ def count_check(journal=None, only_new=True, limit_blocks=None, stop_on_mismatch
                 f.write(f"{r['a']} {r['b']} {now_iso()} count_mismatch gpu={o['gpu']} primecount={ref_r}\n")
     if bad and stop_on_mismatch and find_run_range():
         stop_production(reason="prime-count mismatch")
+        pc = prod_conf()                  # stop_production may have adopted / saved it
         pc["desired"] = "stopped"
         save_prod_conf(pc)
     return len(blocks), bad
@@ -1708,7 +1738,7 @@ def recheck(a=None, release=None):
                 count = primes_in(*k)
             except RuntimeError:
                 count = None
-            checks = compare(res, {"kv": ref["kv"], "stats_line": stats_line(ROOT / "goldbach_stats.log", *k)}, count)
+            checks = compare(res, {"kv": ref["kv"], "stats_line": stats_line(prod_stats_log(pc), *k)}, count)
             ok = not any(x["level"] == "fail" for x in checks)
             save_json(run_dir / "report.json", {"slice": k, "checks": checks, "ok": ok, "csv": res["csv"]})
             with open(STATE / "rechecked.txt", "a") as f:
@@ -1911,7 +1941,9 @@ def cmd_status(a):
               f"last event: {last_run_range_event(prod_paths(pc)[1])[26:150]}")
     print(f"CI        {progress_line()}")
     ch = {k: v for k, v in gpu_stack().items() if load_json(STATE / "gpu-stack.json", {}).get(k) != v}
-    print("GPU stack " + ("verified" if not ch else "CHANGED, verification pending: " + ", ".join(ch)))
+    failed = ch and load_json(STATE / GPU_STACK_FAILED, None) == gpu_stack()
+    print("GPU stack " + ("verified" if not ch else ("CHANGED, verification FAILED (not retried): " if failed
+                                                     else "CHANGED, verification pending: ") + ", ".join(ch)))
     q = load_json(STATE / "queue.json", [])
     if q:
         print("queue     " + ", ".join(f"{x['sha'][:10]} ({x['reason']})" for x in q))
@@ -1935,7 +1967,7 @@ def poll_once():
         except Exception as e:
             log(f"count-check error: {e}")
     ran = 0
-    change = gpu_stack_change() if active_release() else {}
+    change = gpu_stack_check_due() if active_release() else {}
     if change:
         log("GPU stack changed since the active release was verified: "
             + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in change.items()))

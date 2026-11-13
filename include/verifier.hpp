@@ -49,6 +49,8 @@ struct RunStats {
     double   table_seconds   = 0.0; // host per-tile first-mark table build
     uint64_t total_tiles      = 0;   // sum of tile work-groups over all segments
     uint64_t total_large_items = 0;  // sum of large-prime kernel work-items
+    uint32_t split_used       = 0;   // dense path: base-prime split index in force
+                                     // (--split 0 = auto resolved); 0 = not reported
     // Goldbach ridge tracking (include/ridge.hpp): dense path (kernel capture
     // + CPU fallback) and sparse CPU fallback. ridge_min = 0: tracking off.
     uint32_t ridge_min    = 0;       // effective recording floor

@@ -24,6 +24,7 @@ for bad in 4e18x 0x100 -5 99999999999999999999999 1e20 '' ' 7' 1e 1.5e9 010x; do
     expect_rc 2 "--limit '$bad'" --limit "$bad"
 done
 expect_rc 2 "--cpu-check 1e99" --cpu-check 1e99
+expect_rc 2 "--cpu-check 0 (used to start a GPU run)" --cpu-check 0
 
 echo "options missing their value -> exit 2"
 for opt in --limit --start --segment --split --cpu-check --spv --prime-cache; do

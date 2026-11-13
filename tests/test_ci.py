@@ -190,6 +190,26 @@ ch = g.gpu_stack_change()
 check(ch == {"intel-graphics-compiler": ("2.41.5", "2.42.0"), "mem_speed": ("20000", "19000")},
       "an IGC update and a VRAM speed change are detected")
 check(g.gpu_stack_change() == ch, "the change stays pending until a run verifies the new stack")
+check(g.gpu_stack_check_due() == ch, "a pending change is due for verification")
+g.save_json(Path(TMP) / g.GPU_STACK_FAILED, dict(stack))
+check(g.gpu_stack_check_due() == {}, "a stack whose re-verification failed is not re-run on every poll")
+stack["kernel"] = "7.2.10"
+check("kernel" in g.gpu_stack_check_due(), "... but a further change is verified again")
+(Path(TMP) / g.GPU_STACK_FAILED).unlink()
+
+# --- production's statistics log follows its GB_STATS_LOG ---------------------
+check(g.prod_stats_log({"env": {"GB_STATS_LOG": "x/s.log"}}) == g.ROOT / "x/s.log"
+      and g.prod_stats_log({}) == g.ROOT / "goldbach_stats.log", "prod_stats_log honours GB_STATS_LOG")
+
+# --- coverage from 4e18 ignores test ranges below it (gstats.py, goldbach_live.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import gstats  # noqa: E402
+import goldbach_live  # noqa: E402
+E = 4000000000000000000
+for name, fn in (("gstats", gstats.covered_to), ("goldbach_live", goldbach_live.covered_to)):
+    check(fn([(10**12, 10**12 + 10**7), (E, E + 10**7)]) == E + 10**7, f"{name}.covered_to skips a range below 4e18")
+    check(fn([(E, E + 10), (E + 12, E + 20), (E + 40, E + 50)]) == E + 20, f"{name}.covered_to stops at a gap")
+    check(fn([(E + 2, E + 10)]) is None, f"{name}.covered_to: not starting at 4e18 -> None")
 
 print(f"test_ci: {fails} failure(s) -> {'PASS' if not fails else 'FAIL'}")
 sys.exit(1 if fails else 0)

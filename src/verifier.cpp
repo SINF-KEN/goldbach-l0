@@ -638,9 +638,11 @@ RunStats run_gpu(uint64_t limit,
     Kernel  k_check(mod, "check_phase_a");
     Kernel  k_check_b(mod, "check_phase_b");
     uint32_t check_cap = CHECK_PHASE_A_CANDS;
-    // Phase A item width (64-bit words); must match the kernel's A_W64.
-    uint32_t a_w64 = CHECK_PHASE_A_W64;
-    if (const char* e = std::getenv("GB_A_W64")) a_w64 = uint32_t(std::strtoul(e, nullptr, 0));
+    // Phase A item width (64-bit words): the kernel's compiled-in A_W64
+    // (tests/check_constants.py). Deliberately not overridable at run time:
+    // a host-only change sizes the phase-A launch for a different width and
+    // leaves evens unchecked.
+    const uint32_t a_w64 = CHECK_PHASE_A_W64;
     uint32_t phase_b_groups = CHECK_PHASE_B_GROUPS;
     if (const char* e = std::getenv("GB_CHECK_BGROUPS")) phase_b_groups = uint32_t(std::strtoul(e, nullptr, 0));
     if (const char* e = std::getenv("GB_CHECK_CAP")) check_cap = uint32_t(std::strtoul(e, nullptr, 0));
@@ -2458,6 +2460,7 @@ RunStats run_gpu(uint64_t limit,
     stats.offset_seconds = offset_seconds;
     stats.table_seconds  = table_seconds;
     stats.start          = start_even;
+    stats.split_used     = sieve_split;
     stats.total_tiles       = sum_tiles;
     stats.total_large_items = sum_large_items;
     stats.ridge_min    = ridges.active() ? ridges.floor() : 0;
@@ -2477,8 +2480,8 @@ RunStats run_gpu(uint64_t limit,
     }
     if (ridges.overflowed())
         std::fprintf(stderr, "warning: ridge append buffer over capacity; excess appends were "
-                             "dropped by the kernel (2M per segment; should not happen at the "
-                             "default floor once the top list fills)\n");
+                             "dropped by the kernel (%u per segment; should not happen at the "
+                             "default floor once the top list fills)\n", RIDGE_CAP);
 
     ev.destroy();
 
