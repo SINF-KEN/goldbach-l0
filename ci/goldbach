@@ -21,6 +21,34 @@ desired() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("desired", ""))' "$ROOT/ci-state/production.json"
 }
 
+range_active() {
+    systemctl --user is-active --quiet goldbach-range.service
+}
+
+# Starts production unless it runs. `production start` takes ci.lock, which the
+# CI daemon holds while it recovers or polls (and its recover() may be starting
+# production itself right now): retry while the lock is busy, succeed if
+# production came up either way, give up at once on any other error (e.g. a
+# run_range FATAL: each attempt can wait 60 s for the resume line).
+start_production() {
+    local out
+    for _ in $(seq 1 36); do
+        range_active && return 0
+        if out=$("${CI[@]}" production start 2>&1); then
+            echo "$out"
+            return 0
+        fi
+        range_active && return 0
+        if ! grep -q 'is held by another process' <<<"$out"; then
+            echo "  production did not start: $(tail -1 <<<"$out")" >&2
+            return 1
+        fi
+        sleep 5
+    done
+    echo "  production did not start: ci.lock stayed busy for 3 min (a CI run? see goldbach_ci.py status)" >&2
+    return 1
+}
+
 status() {
     for u in "${UNITS[@]}" goldbach-range.service; do
         printf '  %-32s %-9s %s\n' "$u" "$(systemctl --user is-active "$u" 2>/dev/null || true)" \
@@ -41,9 +69,11 @@ print(f"  site: data {age:.0f} min old" + (f", backfill {pct} %, ~{eta} days lef
 case "${1:-up}" in
 up)
     systemctl --user enable --now "${UNITS[@]}" 2>/dev/null
-    if [ "$(desired)" != running ] && ! systemctl --user is-active --quiet goldbach-range.service; then
-        "${CI[@]}" production start
-    fi
+    # Whatever `desired` says: it stays "running" when production went down
+    # without `goldbach down` (a failed CI resume, a cancelled job, a run_range
+    # FATAL), and then nothing else restarts it (the daemon's recover() runs
+    # only when the daemon starts, and never after a failure).
+    start_production || true
     systemctl --user start goldbach-sync.service    # push to the site now
     status ;;
 down)
