@@ -1,0 +1,46 @@
+# Kernel / knob A/B experiments on the production machine (Intel Arc B580):
+# every push to an exp/** branch runs ci/experiment.py with the pushed
+# commit's .github/experiment.json (arms = git ref + ocloc -D options + GB_*
+# environment). Production is paused for the bench + exact checks and
+# resumed afterwards (the production tree's goldbach_ci.py helpers, ci.lock
+# and the GPU lock, as the Benchmark workflow). Nothing is promoted; the CI
+# workflow ignores exp/** pushes. Report = job summary; bench.csv, logs and
+# every compiled .spv = artifact.
+name: Experiment
+
+on:
+  push:
+    branches: ["exp/**"]
+
+permissions:
+  contents: read
+
+env:
+  PROD_DIR: /home/ken/coding/goldbach-l0     # production tree (as ci.yml)
+
+jobs:
+  experiment:
+    name: Experiment (pauses production)
+    runs-on: [self-hosted, goldbach-gpu]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Spec
+        run: |
+          test -f .github/experiment.json || { echo "::error::exp/** branch without .github/experiment.json"; exit 1; }
+          python3 -m json.tool .github/experiment.json
+
+      - name: ci/experiment.py
+        run: |
+          python3 ci/experiment.py .github/experiment.json --prod-dir "$PROD_DIR" \
+            --out "$RUNNER_TEMP/experiment" --summary "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: experiment-${{ github.sha }}
+          path: ${{ runner.temp }}/experiment
+          if-no-files-found: ignore
