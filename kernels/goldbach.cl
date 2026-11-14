@@ -4191,6 +4191,13 @@ __kernel void sieve_large_packed_hl(
     const cmap g = {cm, phi1, phi5, off5};
     hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
                   get_global_id(0), get_global_size(0));
+#ifdef ABL_HL2      // timing only, map EXACT: the list marks twice (atomic AND is idempotent)
+    hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
+                  get_global_id(0), get_global_size(0));
+#endif
     large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+#ifdef ABL_PACK2    // timing only, map EXACT: the packed marks twice
+    large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+#endif
 }
 #endif

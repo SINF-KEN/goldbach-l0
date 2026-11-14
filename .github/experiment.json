@@ -1,0 +1,15 @@
+{
+  "note": "K3 decomposition + verify placement. All arms keep the map exact (atomic AND is idempotent). hl2 = the hit-list marks twice, pack2 = the packed medium-prime marks twice: each delta vs base is that half's cost inside sieve_large_packed_hl. v1 / v1late = bucket verify on EVERY segment (amplified), enqueued before the checkers (as production) or after them (GB_VERIFY_LATE=1, scratch map cannot evict the production map from L2 before the checkers read it); v1late - v1 is the eviction cost per verified segment.",
+  "windows": "long,long-end",
+  "runs": 8,
+  "run_timeout": 90,
+  "ref_arm": "base",
+  "exact_window": "4000000000000000000:4000000200000000000",
+  "arms": [
+    {"label": "base"},
+    {"label": "hl2", "ocloc": "-DABL_HL2"},
+    {"label": "pack2", "ocloc": "-DABL_PACK2"},
+    {"label": "v1", "env": {"GB_BUCKET_VERIFY": "1"}},
+    {"label": "v1late", "env": {"GB_BUCKET_VERIFY": "1", "GB_VERIFY_LATE": "1"}}
+  ]
+}

@@ -409,7 +409,7 @@ void* stage_upload(Context& ctx, const void* data, size_t bytes, void* dst) {
 // Per-slot kernel-timestamp events: sieve/large/check for each of the two
 // pipeline slots. One pool per event so each can be reset independently.
 struct SlotEvents {
-    ze_event_pool_handle_t pool[20] = {};
+    ze_event_pool_handle_t pool[22] = {};
     ze_event_handle_t sieve[2] = {};
     ze_event_handle_t large[2] = {};
     ze_event_handle_t check[2] = {};   // last checker kernel (host waits on it)
@@ -418,11 +418,12 @@ struct SlotEvents {
     ze_event_handle_t splitk[2] = {};  // split_map (timing only; counted in check_s)
     ze_event_handle_t xv[3][2] = {};   // check30_xs8 / 6 / 4 (timing only; counted in check_s)
     ze_event_handle_t hl[2] = {};      // hl_harvest (timing only; counted in large_s)
+    ze_event_handle_t verify[2] = {};  // map_compare under GB_VERIFY_LATE=1 (host waits on it)
 
-    /// Creates the twenty pools and events.
+    /// Creates the twenty-two pools and events.
     /// @throws std::runtime_error on failure; destroy() is safe afterwards.
     void create(ze_context_handle_t ctx) {
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < 22; ++i) {
             ze_event_pool_desc_t pd{};
             pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
             pd.count = 1;
@@ -440,7 +441,8 @@ struct SlotEvents {
                                  : (i < 10) ? &bucket[i - 8]
                                  : (i < 12) ? &splitk[i - 10]
                                  : (i < 18) ? &xv[(i - 12) / 2][(i - 12) % 2]
-                                            : &hl[i - 18];
+                                 : (i < 20) ? &hl[i - 18]
+                                            : &verify[i - 20];
             ZE_CHECK(zeEventCreate(pool[i], &ed, e));
         }
     }
@@ -455,8 +457,9 @@ struct SlotEvents {
             if (splitk[i]) zeEventDestroy(splitk[i]);
             for (int v = 0; v < 3; ++v) if (xv[v][i]) zeEventDestroy(xv[v][i]);
             if (hl[i]) zeEventDestroy(hl[i]);
+            if (verify[i]) zeEventDestroy(verify[i]);
         }
-        for (int i = 0; i < 20; ++i)
+        for (int i = 0; i < 22; ++i)
             if (pool[i]) zeEventPoolDestroy(pool[i]);
     }
 };
@@ -1243,6 +1246,14 @@ RunStats run_gpu(uint64_t limit,
         ? std::max<uint32_t>(1u, uint32_t(std::strtoul(std::getenv("GB_BUCKET_VERIFY"), nullptr, 0)))
         : 0u;
     const bool bucket_verify = bucket_on && bucket_verify_every > 0;
+    // GB_VERIFY_LATE=1 (experiment): enqueue the verify rebuild + compare
+    // AFTER the checkers instead of between the large-prime kernel and them,
+    // so its scratch map cannot evict the production map from L2 before the
+    // checkers read it. The host then also waits on the compare's event
+    // before it reads verify_diff.
+    const bool verify_late = bucket_verify && std::getenv("GB_VERIFY_LATE") &&
+                             std::string(std::getenv("GB_VERIFY_LATE")) == "1";
+    bool verify_ran[2] = {false, false};
     PackedLarge packed_full;
     uint32_t* d_full_bases = nullptr;
     uint32_t* d_full_gaps = nullptr;
@@ -1795,6 +1806,7 @@ RunStats run_gpu(uint64_t limit,
         ZE_CHECK(zeEventHostReset(ev.large[slot]));
         ZE_CHECK(zeEventHostReset(ev.check[slot]));
         ZE_CHECK(zeEventHostReset(ev.checka[slot]));
+        if (verify_late) ZE_CHECK(zeEventHostReset(ev.verify[slot]));
         ZE_CHECK(zeEventHostReset(ev.bucket[slot]));
         ZE_CHECK(zeEventHostReset(ev.hl[slot]));
         ZE_CHECK(zeEventHostReset(ev.splitk[slot]));
@@ -1983,7 +1995,8 @@ RunStats run_gpu(uint64_t limit,
                 kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
                                ev.large[slot]);
         }
-        if (bucket_verify && stats.segments % bucket_verify_every == 0) {
+        verify_ran[slot] = bucket_verify && stats.segments % bucket_verify_every == 0;
+        const auto enqueue_verify = [&] {
             // Rebuild this segment's map without buckets into the scratch map
             // and count differing words (checked at collection).
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
@@ -2009,7 +2022,7 @@ RunStats run_gpu(uint64_t limit,
             k_cmp->set_arg(1, sizeof(d_verify_map), &d_verify_map);
             k_cmp->set_arg(2, sizeof(nwords), &nwords);
             k_cmp->set_arg(3, sizeof(verify_diff), &verify_diff);
-            k_cmp->launch(ctx.list(), 512);
+            k_cmp->launch(ctx.list(), 512, verify_late ? ev.verify[slot] : nullptr);
             if (std::getenv("GB_BUCKET_VERIFY_DUMP")) {
                 // Diagnostics: on the first differing segment, show which map
                 // is wrong by checking the differing bits with Miller-Rabin.
@@ -2037,7 +2050,8 @@ RunStats run_gpu(uint64_t limit,
                     throw std::runtime_error("GB_BUCKET_VERIFY_DUMP: mismatch dumped");
                 }
             }
-        }
+        };
+        if (verify_ran[slot] && !verify_late) enqueue_verify();
         const double l2_s = seconds_since(t_launch0);
 
         // --- check_numbers args
@@ -2362,6 +2376,12 @@ RunStats run_gpu(uint64_t limit,
             k_check_b.set_arg(14, 4, &ridge_thresh_u32);
             k_check_b.launch(ctx.list(), phase_b_groups, ev.check[slot]);  // grid-stride
         }
+        if (verify_ran[slot] && verify_late) {
+            // The checkers only read the map (const), so comparing it after
+            // them checks the same bits; the barrier orders the rebuild after
+            // their reads of the shared kernel arguments.
+            enqueue_verify();
+        }
         const double enq_s = seconds_since(t_enq);
         const double launch_s = seconds_since(t_launch0);
         const double l3_s = seconds_since(t_launch0);
@@ -2385,6 +2405,8 @@ RunStats run_gpu(uint64_t limit,
             large_seconds  += dl;
             verify_seconds += dv;
 
+            if (verify_late && verify_ran[prev])
+                ZE_CHECK(zeEventHostSynchronize(ev.verify[prev], UINT64_MAX));
             if (bkt_err && *bkt_err)
                 throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
             if (verify_diff && *verify_diff)
@@ -2476,6 +2498,8 @@ RunStats run_gpu(uint64_t limit,
         large_seconds  += dl;
         verify_seconds += dv;
 
+        if (verify_late && verify_ran[last])
+            ZE_CHECK(zeEventHostSynchronize(ev.verify[last], UINT64_MAX));
         if (bkt_err && *bkt_err)
             throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
         if (verify_diff && *verify_diff)
