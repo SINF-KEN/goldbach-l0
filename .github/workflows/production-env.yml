@@ -1,0 +1,50 @@
+# Production's GB_* knobs as code: when a push to main changes
+# ci/production-env.json, ci/production_env.py (this checkout) applies it to
+# the production environment with the production tree's goldbach_ci.py
+# helpers — stop at the next slice boundary, save, restart (resume point and
+# release verified; the previous env is restored if the restart fails).
+# Merging a knob PR is the decision; reverting it reverts the knob.
+# workflow_dispatch re-applies main's file (dry_run: only print the change).
+name: Production env
+
+on:
+  push:
+    branches: [main]
+    paths: [ci/production-env.json]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: print the change only
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-env
+  cancel-in-progress: false
+
+env:
+  PROD_DIR: /home/ken/coding/goldbach-l0     # production tree (as ci.yml)
+
+jobs:
+  apply:
+    name: Apply ci/production-env.json
+    if: github.ref == 'refs/heads/main'
+    # the GPU runner: serialised with the CI's GPU job (and ci.lock)
+    runs-on: [self-hosted, goldbach-gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate
+        run: python3 ci/production_env.py ci/production-env.json --check
+
+      - name: Apply
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          python3 ci/production_env.py ci/production-env.json --prod-dir "$PROD_DIR" \
+            --summary "$GITHUB_STEP_SUMMARY" $DRY_RUN
