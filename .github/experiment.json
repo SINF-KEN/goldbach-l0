@@ -1,0 +1,14 @@
+{
+  "note": "Host-side USM changes, each stacked on the previous: `stats1` packs the seven per-slot statistics buffers into one shared allocation (PR #12, already measured by the push CI: +0.02%); `ridge` adds the ridge append buffers in host USM. No kernel change in any arm. The exact window is 2e12 integers so that it holds a few dozen ridge records (the CI compare excludes the ridge fields; they are compared by hand from the artifact).",
+  "windows": "long,long-end",
+  "runs": 8,
+  "run_timeout": 60,
+  "ref_arm": "base",
+  "exact_window": "4000000000000000000:4000002000000000000",
+  "arms": [
+    {"label": "active", "release": "active"},
+    {"label": "base", "ref": "35b3569d"},
+    {"label": "stats1", "ref": "fd20841"},
+    {"label": "ridge", "ref": "262788e"}
+  ]
+}
