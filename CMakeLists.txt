@@ -59,6 +59,7 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME check_constants COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/check_constants.py)
     add_test(NAME campaign_queue COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/test_campaign_queue.py)
+    add_test(NAME production_env COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/test_production_env.py)
 endif()
 add_test(NAME cli_tests COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_tests.sh $<TARGET_FILE:goldbach_l0>)
 # Exact Goldbach statistics (v2.2): stats_ref is the independent CPU

@@ -209,6 +209,11 @@ jobs:
       - name: Local CI logic (journal chain, reference cache, exact gates, ledger)
         run: python3 tests/test_ci.py
 
+      - name: Production knobs (ci/production-env.json valid, env plan, apply flow)
+        run: |
+          python3 ci/production_env.py ci/production-env.json --check
+          python3 tests/test_production_env.py
+
   full:
     name: Full build with tools + figures
     runs-on: [self-hosted, goldbach-cpu]

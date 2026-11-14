@@ -93,6 +93,7 @@ python3 ci/goldbach_ci.py count-check          # banked slices' prime counts vs 
 python3 ci/goldbach_ci.py recheck [START]      # re-run queued (or one) banked slice(s), compare
 python3 ci/goldbach_ci.py poll | daemon        # retry queue, branch watching, count checks
 python3 ci/goldbach_ci.py bootstrap            # first time: HEAD -> active release
+python3 ci/production_env.py ci/production-env.json --prod-dir . [--dry-run]   # apply the GB_* knobs
 ```
 
 ## Production control
@@ -129,6 +130,21 @@ python3 ci/goldbach_ci.py bootstrap            # first time: HEAD -> active rele
   journal chain and the active release. This happens on every path out of a
   run — PASS, FAIL, ERROR, SIGTERM (a cancelled job).
 - Every PASS row names its `release=<id>`.
+- **Knobs as code**: `ci/production-env.json` lists the `GB_*` settings the
+  repository manages in production's environment (`production.json`
+  `"env"`). A push to main that changes it runs the `Production env`
+  workflow (`ci/production_env.py`, goldbach-gpu runner, under `ci.lock`):
+  production is stopped at the next slice boundary, the env saved and
+  production restarted (resume point and release verified); if the restart
+  is refused the previous env is restored and production restarted with it
+  (the job fails, an alert is sent). Changes are of the effective value —
+  writing down a default (`GB_BUCKET_VERIFY=100`, run_range's; `GB_GAPS=exact`,
+  goldbach_l0's) restarts nothing. A key the file managed and no longer lists
+  is removed, so reverting a knob commit reverts the knob; keys it never
+  listed are left alone. Merging a knob PR is the decision. The knobs sit on
+  separate lines with a blank line between them so knob PRs merge
+  independently. `workflow_dispatch` re-applies main's file (`dry_run`
+  prints the change only).
 
 ## Releases, rollback, reboots
 
