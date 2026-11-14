@@ -39,6 +39,10 @@ Spec (.github/experiment.json):
             {"label": "tile4k", "ocloc": "-DTILE_WORDS=4096",
              "cmake": ["-DCMAKE_CXX_FLAGS=-DGB_TILE_WORDS=4096"]},
             {"label": "main", "ref": "origin/main"}]}
+"run_timeout" (s, default 120) caps every goldbach_l0 run, 10x for the exact
+window. A timing-only ablation must keep the map exact enough that the
+checker does not fall back to the CPU (or run with GB_STATS=0 and still be
+capped): an invalid map costs minutes per run.
 Arm keys: label, ref (default HEAD), release ("active"), ocloc, cmake (list),
 env, spv ("shipped": the ref's committed module), timing_only, expect_diff
 (results may differ by design, e.g. GB_GAPS=sampled: reported, not failed).
@@ -188,6 +192,10 @@ def main():
     # ---- GPU: bench, exact windows, validation (production paused) --------
     windows = spec.get("windows", "long,long-end")
     runs = int(spec.get("runs", 5))
+    # hard cap per goldbach_l0 run: a broken variant (e.g. an invalid-map
+    # ablation that sends every even to the CPU fallback) must not hold
+    # production paused for hours; a 1e11 window takes ~2 s
+    run_timeout = int(spec.get("run_timeout", 120))
     bench_csv = out / "bench.csv"
     exact = {}
     gv = {}
@@ -205,7 +213,7 @@ def main():
                             live="")
                 cmd = [sys.executable, a.prod_dir / "tools/bench.py", "--windows", windows, "--runs", str(runs),
                        "--warmup", str(spec.get("warmup", 1)), "--segment", seg, "--split", "0",
-                       "--ref", ref_arm, "--out", bench_csv]
+                       "--ref", ref_arm, "--out", bench_csv, "--timeout", str(run_timeout)]
                 for x in arms:
                     env = ",".join(f"{k}={v}" for k, v in x.get("env", {}).items())
                     d = staged[x["label"]]["dir"]
@@ -225,7 +233,7 @@ def main():
                             continue
                         env = dict(base_env, **x.get("env", {}))
                         runs_x[x["label"]] = g.run_slice(staged[x["label"]]["dir"], ea, eb, seg, out,
-                                                        env, 3600, name=f"exact-{x['label']}")
+                                                        env, 10 * run_timeout, name=f"exact-{x['label']}")
                     try:
                         pcount = g.primes_in(ea, eb)
                     except Exception as e:
