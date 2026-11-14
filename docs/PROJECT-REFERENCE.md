@@ -1426,6 +1426,25 @@ L1S_L3UC (LARGE_GAPS_CC 5, as bkt_load): large 433.8 -> 431.2 ms per 1e11,
 Segment sweep with it (long, 5 rounds): 440M / 485M within ±0.15% of
 467.5M; 500M +0.5% but 10M short of the 510M L3 cliff (-34%), not adopted.
 
+### 9.2w Host-side USM: statistics block, ridge buffers in host USM (2026-11-14)
+The segment loop is GPU-bound (sync 0.0 ms, gpu = sieve + large + check), so
+the shared-USM migrations of the per-segment host reads can only matter
+through what they cost the device. Two host-only changes, no kernel change,
+measured stacked (Experiment workflow, bench.py, 8 paired rounds, production
+statistics on, 1e11 windows):
+- The seven per-slot statistics buffers as sub-ranges of one shared block
+  (one migration each way per segment instead of seven): NULL. Push CI
+  (5 rounds): long +0.016% (CI ±0.032%), long-end +0.026% (±0.074%);
+  experiment: long +0.031% (±0.035%).
+- On top of it, the two ridge append buffers (1 MB each) in host USM
+  (zeMemAllocHost; the 4-byte count read no longer pulls the megabyte to the
+  host and back every segment): long 768.0 -> 767.4 ms, +0.098% (±0.036%);
+  long-end 775.7 -> 774.9 ms, +0.089% (±0.052%). Kept.
+Both keep the original allocations, unused, so no device allocation moves.
+Exact on 2e12 at 4e18 in every arm: all compared fields and the statistics
+line identical to the active release, primecount OK, ridge_found 352,
+ridge_dropped 0, the same top-30 ridge records.
+
 ### 9.3 prep_large_fb — present in the module, NOT launched by run_gpu
 Kept (and validated by debug_fb); the host no longer calls it. Do not
 confuse its presence with an active stage.
