@@ -568,6 +568,9 @@ inline void mark_local_w30(volatile __local u32* t32, u32 bit, const u32 end,
 #ifndef LARGE_OH_BM
 #define LARGE_OH_BM 1               // one-hit primes: 15015-bit coprimality bitmap (+1.45%)
 #endif
+#ifndef LARGE_FEW_F
+#define LARGE_FEW_F 0               // primes ceil(q_odds / F) <= p < q_odds (<= F hits): the bitmap
+#endif                              // per hit instead of the wheel setup (0 = off; §9.2s LARGE_FEW_K)
 #if LARGE_OH_BM
 // One-hit primes (p >= q_odds): the only odd multiple first = p m0 in the
 // segment is marked iff m0 is coprime to 30030; p is coprime to 30030 and
@@ -729,6 +732,12 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
     if (fb >= tile_bit0) {
         bit = fb - tile_bit0;
     } else {
+#ifdef ABL_MEDNOSETUP    // timing only (INVALID map): no per-tile modulo, same mark count (p > 512)
+        bit = (tile_bit0 ^ fb) & 511u;
+        for (; bit < (u32)TILE_BITS; bit += p)
+            atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+        return;
+#endif
         const float df = (float)(tile_bit0 - fb);
         const float pf = (float)p;
         const float qf = trunc(df * (1.0f / pf));
@@ -1483,6 +1492,10 @@ inline void large_packed_body(
     // beyond the segment is rejected by the mark loop (first > q_last).
     const bool hi_range = (q_first >> 60) != 0;
     const ff_x qf_split = ff_split(q_first);
+#if LARGE_FEW_F && LARGE_OH_BM && WHEEL_W == 30030
+    // ceil(q_odds / F): p >= few_min has p F >= q_odds, so at most F hits
+    const u32 few_min = (u32)((q_odds + (LARGE_FEW_F - 1u)) / LARGE_FEW_F);
+#endif
     #pragma unroll
     for (u32 lane = 0; lane < LARGE_PACK_PPI; ++lane) {
         const u64 p = pv[lane];
@@ -1529,6 +1542,34 @@ inline void large_packed_body(
                 }
                 continue;
             }
+#if LARGE_FEW_F
+            if (p32 >= few_min) {                        // 2..F hits: no wheel setup
+                u32 b = t >> 1;                          // < p < 2^30
+                if (b < (u32)q_odds) {
+                    // x = (q_first + 2b) mod 15015 as the one-hit path; each
+                    // next hit adds 2p (mod 15015). The mark rule is the
+                    // wheel's: q = p m with m coprime to 30030 <=> q coprime
+                    // to 15015 (p coprime to 30030, q odd).
+                    const u32 y = qf15 + 2u * b;
+                    const u32 qy = (u32)((float)y * (1.0f / 15015.0f));
+                    int xi = (int)(y - qy * 15015u);
+                    xi += (xi < 0) ? 15015 : 0;
+                    xi -= (xi >= 15015) ? 15015 : 0;
+                    u32 x = (u32)xi;
+                    const u32 s2 = (2u * p32) % 15015u;
+                    #pragma unroll
+                    for (u32 h = 0; h < LARGE_FEW_F; ++h) {
+                        if (b >= (u32)q_odds) break;
+                        if ((CP15015[x >> 5] >> (x & 31u)) & 1u)
+                            map_clear_w((volatile __global u32*)prime_map, b, g);
+                        b += p32;
+                        x += s2;
+                        x -= (x >= 15015u) ? 15015u : 0u;
+                    }
+                }
+                continue;
+            }
+#endif
 #endif
             mark_multiples_whl(prime_map, (u64)(t >> 1), p32, q_odds, qfw, g);
             continue;

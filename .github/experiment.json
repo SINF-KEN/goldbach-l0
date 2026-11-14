@@ -1,0 +1,20 @@
+{
+  "note": "Round 1: reviewer step 2 (few-hit primes by the coprimality bitmap, F = 2/4/8/16), the upper bound of step 1 (medium-stage per-tile modulo removed, timing only), a 32 KB tile re-check, and the two knobs (GB_GAPS=sampled, GB_BUCKET_VERIFY 500 / 1000).",
+  "windows": "long,long-end",
+  "runs": 6,
+  "ref_arm": "base",
+  "exact_window": "4000000000000000000:4000000200000000000",
+  "arms": [
+    {"label": "active", "release": "active"},
+    {"label": "base"},
+    {"label": "few2", "ocloc": "-DLARGE_FEW_F=2"},
+    {"label": "few4", "ocloc": "-DLARGE_FEW_F=4"},
+    {"label": "few8", "ocloc": "-DLARGE_FEW_F=8"},
+    {"label": "few16", "ocloc": "-DLARGE_FEW_F=16"},
+    {"label": "ablmed", "ocloc": "-DABL_MEDNOSETUP", "timing_only": true},
+    {"label": "tile4k", "ocloc": "-DTILE_WORDS=4096", "cmake": ["-DCMAKE_CXX_FLAGS=-DGB_TILE_WORDS=4096"]},
+    {"label": "gapsS", "env": {"GB_GAPS": "sampled"}, "expect_diff": true},
+    {"label": "bv500", "env": {"GB_BUCKET_VERIFY": "500"}},
+    {"label": "bv1000", "env": {"GB_BUCKET_VERIFY": "1000"}}
+  ]
+}
