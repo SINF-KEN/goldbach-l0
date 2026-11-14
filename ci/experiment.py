@@ -54,6 +54,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import statistics as st
 import subprocess
 import sys
@@ -80,6 +81,9 @@ def main():
 
     sys.path.insert(0, str(a.prod_dir / "ci"))
     import goldbach_ci as g                              # the production tree's copy
+    # a cancelled Actions job gets SIGINT, then SIGTERM: both must unwind
+    # through production_paused (resume run_range), as in goldbach_ci.main
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     spec = json.loads(a.spec.read_text())
     out = a.out.resolve()
