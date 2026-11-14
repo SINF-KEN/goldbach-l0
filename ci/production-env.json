@@ -1,6 +1,6 @@
 {
   "env": {
-    "GB_BUCKET_VERIFY": "100",
+    "GB_BUCKET_VERIFY": "500",
 
     "GB_GAPS": "exact"
   }
