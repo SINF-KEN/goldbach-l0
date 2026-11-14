@@ -85,7 +85,7 @@ struct GpuBuffers {
     uint32_t* group_y[2] = {};     // class modes: per class x group canonical-table word offsets
     uint32_t* pending[2]    = {};  // two-phase checker: evens left by phase A
     uint32_t* pending_n[2]  = {};  // their count (shared: host-checked for overflow)
-    uint64_t* ridge[2]      = {};  // Goldbach ridge appends (shared; count + (n, p) pairs)
+    uint64_t* ridge[2]      = {};  // Goldbach ridge appends (host USM; count + (n, p) pairs)
     // Exact statistics (gstats.hpp): per-slot p(n) histogram / first-even
     // index per candidate-list entry, count30 limits + output (all shared).
     uint32_t* x_hist[2]     = {};      // sampled segments: counts per stats-plan entry
@@ -937,7 +937,9 @@ RunStats run_gpu(uint64_t limit,
         b.pending[s]   = static_cast<uint32_t*>(ctx.alloc_device(size_t(pending_cap) * 4));
         b.pending_n[s] = static_cast<uint32_t*>(ctx.alloc_shared(4));
         // Ridge append buffer: u32 count in word 0 (low half) + RIDGE_CAP
-        // (n, p) pairs; shared so the host merges it without a D2H copy.
+        // (n, p) pairs. This shared allocation only keeps its place in the
+        // device-memory layout: the buffer the kernels use is the host USM
+        // one made after the uploads (below).
         b.ridge[s]     = static_cast<uint64_t*>(ctx.alloc_shared((1 + 2 * size_t(RIDGE_CAP)) * 8));
         b.p_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
         b.p_first[s] = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
@@ -1398,6 +1400,21 @@ RunStats run_gpu(uint64_t limit,
     // are sensitive to where the device allocations land (see the split_s1 /
     // split_s5 note above), so the block is added after every other buffer
     // and nothing that exists today moves.
+    // Ridge append buffers in host USM, not shared. The host reads the count
+    // every segment, and as a shared allocation that one read pulled the
+    // whole 1 MB buffer to the host and the next append pushed it back. In
+    // system memory nothing migrates: the device pays a bus access only for
+    // the per-segment 4-byte count reset and for an append, and the kernels
+    // append only above the recording threshold (rare once the top list has
+    // filled). Records are validated on the host exactly as before. The
+    // shared allocations made above stay, unused (device-memory layout).
+    void* ridge_unused[2] = {b.ridge[0], b.ridge[1]};
+    for (int s = 0; s < 2; ++s) {
+        const size_t ridge_bytes = (1 + 2 * size_t(RIDGE_CAP)) * 8;
+        b.ridge[s] = static_cast<uint64_t*>(ctx.alloc_host(ridge_bytes));
+        std::memset(b.ridge[s], 0, ridge_bytes);
+    }
+
     void* stats_block[2] = {nullptr, nullptr};
     std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
     if (stats_on) {
@@ -2572,6 +2589,7 @@ RunStats run_gpu(uint64_t limit,
         if (b.pending[s]) Context::free_mem(ctx.context(), b.pending[s]);
         if (b.pending_n[s]) Context::free_mem(ctx.context(), b.pending_n[s]);
         if (b.ridge[s]) Context::free_mem(ctx.context(), b.ridge[s]);
+        Context::free_mem(ctx.context(), ridge_unused[s]);
         if (b.split_s1[s]) Context::free_mem(ctx.context(), b.split_s1[s]);
         if (b.split_s5[s]) Context::free_mem(ctx.context(), b.split_s5[s]);
         Context::free_mem(ctx.context(), stats_block[s]);

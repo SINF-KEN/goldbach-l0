@@ -1747,7 +1747,7 @@ engineering notes:
   the smallest witness (the lists are ascending: useful residues first, then
   the futile q = 3/5 tail — exact for n > MAX_GB_PRIME + 5; the host-side
   minimality check drops the rare tiny-n exceptions).
-- Buffer: 1 + 2*RIDGE_CAP u64 per slot (shared), u32 append count in word 0
+- Buffer: 1 + 2*RIDGE_CAP u64 per slot (host USM), u32 append count in word 0
   (atomic_add), entries (n, p) — same lifecycle as pending_n (4-byte fill at
   enqueue, host merge after the check event).
 - A dedicated second check30_a launch ("floor pass") over sub-floor funnels
