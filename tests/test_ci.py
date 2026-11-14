@@ -66,7 +66,10 @@ check(not g.is_prime(3825123056546413051) and g.is_prime(18446744073709551557),
 env = {"GB_NTFY_TOPIC": "secret", "GB_RANGE_TIMEOUT": "5000", "GB_NOTIFY_SP": "1"}
 k0 = g.ref_key("fp", 4, 10, "425000000", env)
 check(k0 == g.ref_key("fp", 4, 10, "425000000", {}), "notification / GB_RANGE_* settings do not change the key")
-check(k0 == g.ref_key("fp", 4, 10, "425000000", {"GB_BUCKET_VERIFY": "100"}), "GB_BUCKET_VERIFY=100 is the default")
+check(k0 == g.ref_key("fp", 4, 10, "425000000", {"GB_BUCKET_VERIFY": "1000", "GB_GAPS": "sampled"}),
+      "GB_BUCKET_VERIFY=1000 and GB_GAPS=sampled are the defaults")
+check(k0 != g.ref_key("fp", 4, 10, "425000000", {"GB_BUCKET_VERIFY": "100"}), "GB_BUCKET_VERIFY=100 changes the key")
+check(k0 != g.ref_key("fp", 4, 10, "425000000", {"GB_GAPS": "exact"}), "GB_GAPS=exact changes the key")
 check(len({k0, g.ref_key("fp2", 4, 10, "425000000", {}), g.ref_key("fp", 4, 12, "425000000", {}),
            g.ref_key("fp", 4, 10, "350000000", {}), g.ref_key("fp", 4, 10, "425000000", {"GB_STATS": "0"})}) == 5,
       "code, window, segment and result-relevant GB_* settings all change the key")

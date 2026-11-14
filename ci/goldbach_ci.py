@@ -117,6 +117,12 @@ STATS_STATEFUL = {"version", "new_first"}     # GBSTATS keys that depend on the 
 STATS_NEW_OK = {"gaps", "gd1", "gmax", "gtail", "gwalk", "gsmom", "gsamp"}     # v2.4 prime gaps (gstats.hpp gap_fields)
 NOTIFY_ENV = ("GB_NTFY_TOPIC", "GB_NOTIFY_MAIL", "GB_NOTIFY_CMD", "GB_NOTIFY_WALL",
               "GB_NOTIFY_SP", "GB_RECORD_HOOK")
+# run_range.sh's defaults for the result-relevant GB_* settings (goldbach-tools
+# keeps the authoritative copy): every CI slice, reference key and "prod"
+# benchmark arm runs as production does. GB_GAPS=sampled: +4.9% (gap histogram
+# and moments from the sampled segments only); GB_BUCKET_VERIFY=1000: +1.1%
+# (PR #13's B580 runs, 2026-11-14).
+PROD_ENV = {"GB_BUCKET_VERIFY": "1000", "GB_GAPS": "sampled"}
 FINAL = ("PASS", "FAIL", "IDENTICAL", "DIVERGED", "SKIPPED")
 RESULT_COLS = (["run_id", "ts_start", "ts_end", "status", "reason", "refs", "commit", "version", "release",
                 "previous_active", "segment", "window_start", "window_limit", "reference"]
@@ -971,7 +977,8 @@ def run_slice(rel, a, b, seg, run_dir, base_env, timeout, name="slice"):
     tmp = run_dir / f"{name}-files"
     shutil.rmtree(tmp, ignore_errors=True)
     env = isolated_env(tmp, base_env)
-    env.setdefault("GB_BUCKET_VERIFY", "100")            # as run_range.sh
+    for k, v in PROD_ENV.items():                        # as run_range.sh
+        env.setdefault(k, v)
     cmd = [rel / "goldbach_l0", "--start", a, "--limit", b, "--segment", seg, "--split", "0",
            "--spv", rel / "kernels/goldbach_bmg.spv", "--csv"]
     t0 = time.monotonic()
@@ -1001,7 +1008,9 @@ def ref_key(fp, a, b, seg, env):
     setting that can change the outcome."""
     rel_env = {k: v for k, v in sorted(env.items())
                if k.startswith("GB_") and k not in NOTIFY_ENV and not k.startswith("GB_RANGE_")}
-    rel_env.setdefault("GB_BUCKET_VERIFY", "100")
+    for k, v in PROD_ENV.items():
+        rel_env.setdefault(k, v)
+    rel_env = dict(sorted(rel_env.items()))
     return hashlib.sha256(json.dumps([fp, int(a), int(b), str(seg), rel_env]).encode()).hexdigest()[:20]
 
 
@@ -1130,7 +1139,7 @@ def benchmark_session(out_dir, profile="full", pause=True, state=None):
     logf = out_dir / "benchmark.log"
     act, prev = active_release(), link_target("previous")
     cur = "v" + release_meta(act).get("version", "?")
-    arms = {"cur": (cur, {}, act), "prod": (cur + "-prod", {"GB_BUCKET_VERIFY": "100"}, act),
+    arms = {"cur": (cur, {}, act), "prod": (cur + "-prod", dict(PROD_ENV), act),
             "nostats": (cur + "-nostats", {"GB_STATS": "0"}, act)}
     if prev:
         pv = "v" + release_meta(prev).get("version", "?")
@@ -1379,7 +1388,8 @@ class Run:
             if final:
                 self.rec["status"] = final
                 return self.finish()
-            self.rec["config"] = {"segment": self.seg, "split": 0, "bucket_verify": self.env.get("GB_BUCKET_VERIFY", "100"),
+            self.rec["config"] = {"segment": self.seg, "split": 0, "bucket_verify": self.env.get("GB_BUCKET_VERIFY", PROD_ENV["GB_BUCKET_VERIFY"]),
+                                  "gaps": self.env.get("GB_GAPS", PROD_ENV["GB_GAPS"]),
                                   "env_keys": sorted(k for k in self.env if k not in NOTIFY_ENV),
                                   "ci_slice": self.c["ci_slice"], "bench_windows": self.c["bench_windows"]}
             with production_paused(f"CI {self.id}", self.state) as info:
@@ -1735,7 +1745,9 @@ def recheck(a=None, release=None):
             run_dir = STATE / "runs" / f"{stamp()}-recheck-{k[0]}"
             run_dir.mkdir(parents=True)
             log(f"recheck [{k[0]}, {k[1]}] with release {rel.name}")
-            res = run_slice(rel, k[0], k[1], seg, run_dir, pc.get("env", {}),
+            # the gap walk as the slice was banked (rows before gap_mode= walked every segment)
+            env = dict(pc.get("env", {}), GB_GAPS=ref["kv"].get("gap_mode", "exact"))
+            res = run_slice(rel, k[0], k[1], seg, run_dir, env,
                             max(600, int(3 * float(ref["kv"].get("total_s", 1800)))))
             try:
                 count = primes_in(*k)

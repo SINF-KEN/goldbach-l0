@@ -10,7 +10,7 @@ largest primes; `run_range.sh` does not pass `--sparse`). Live stats
 flowchart TD
     %% ================= BASH =================
     subgraph SH["run_range.sh (bash, CPU)"]
-        A1["Parse START LIMIT SLICE JOURNAL<br/>set SEG=467.5M, GB_BUCKET_VERIFY=100<br/>check: integers, even, START < LIMIT < 2^63<br/>binary: GB_RANGE_BIN / ci-state/active / ./build<br/>flock .goldbach-gpu.lock, no other goldbach_l0"]
+        A1["Parse START LIMIT SLICE JOURNAL<br/>set SEG=467.5M, GB_BUCKET_VERIFY=1000, GB_GAPS=sampled<br/>check: integers, even, START < LIMIT < 2^63<br/>binary: GB_RANGE_BIN / ci-state/active / ./build<br/>flock .goldbach-gpu.lock, no other goldbach_l0"]
         A2["Resume: walk the PASS chain in the journal<br/>next = last contiguous slice end + 2"]
         A3{"next > LIMIT?"}
         A3s{"stop file?"}
@@ -53,7 +53,7 @@ flowchart TD
         G2["Every 128th segment: hl_harvest<br/>each hit-list prime's hits in the next 128 segments<br/>→ per-segment u32 offset lists (overflow → bkt_err)"]
         G3["hl_apply<br/>streams this segment's list, atomic AND-clear"]
         G4["sieve_large_packed<br/>one item per packed large prime, atomic AND-clear"]
-        G5["Every 100th segment: GB_BUCKET_VERIFY<br/>make_prime_map + sieve_large_packed over ALL primes<br/>→ scratch map, map_compare → verify_diff"]
+        G5["Every 1000th segment: GB_BUCKET_VERIFY<br/>make_prime_map + sieve_large_packed over ALL primes<br/>→ scratch map, map_compare → verify_diff"]
         G6["count30<br/>prime + twin-prime counts"]
         G7{"sampled segment?<br/>every 256th"}
         G8["check30_a: phase A<br/>1024 evens per item, tests n-p in the class map<br/>for the first candidates; unresolved → pending"]
