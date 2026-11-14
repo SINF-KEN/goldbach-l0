@@ -136,6 +136,14 @@ void* Context::alloc_shared(size_t bytes, size_t align) const {
     return ptr;
 }
 
+void* Context::alloc_host(size_t bytes, size_t align) const {
+    void* ptr = nullptr;
+    ze_host_mem_alloc_desc_t hdesc{};
+    hdesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+    ZE_CHECK(zeMemAllocHost(context_, &hdesc, bytes, align, &ptr));
+    return ptr;
+}
+
 void Context::free_mem(ze_context_handle_t ctx, void* ptr) {
     if (ptr) zeMemFree(ctx, ptr);
 }

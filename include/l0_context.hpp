@@ -64,7 +64,17 @@ public:
     /// @return       a non-null pointer usable on host and device.
     /// @throws std::runtime_error on allocation failure.
     void* alloc_shared(size_t bytes, size_t align = 64) const;
-    /// Frees USM from alloc_device / alloc_shared. A null @p ptr is a no-op.
+    /// Allocates host USM: system memory the device reads and writes in
+    /// place. It never migrates, so a host access costs nothing, but every
+    /// device access crosses the bus: only for buffers the kernels touch
+    /// rarely. Caller-owned, released with free_mem().
+    /// @param bytes  size in bytes.
+    /// @param align  minimum alignment in bytes (power of two).
+    /// @return       a non-null pointer usable on host and device.
+    /// @throws std::runtime_error on allocation failure.
+    void* alloc_host(size_t bytes, size_t align = 64) const;
+    /// Frees USM from alloc_device / alloc_shared / alloc_host. A null
+    /// @p ptr is a no-op.
     /// @pre  no enqueued GPU work still references @p ptr.
     static void free_mem(ze_context_handle_t ctx, void* ptr);
 
