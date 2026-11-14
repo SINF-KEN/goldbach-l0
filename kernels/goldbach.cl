@@ -746,6 +746,17 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
         rf -= (rf >= pf) ? pf : 0.0f;
         const u32 rmu = (u32)rf;
         bit = rmu ? p - rmu : 0u;
+#ifdef ABL_MEDSETUP2     // timing only, map EXACT: the per-tile setup a second time
+        {                // (divisor p + (tile_bit0 >> 31) = p at run time, not foldable)
+            const float df2 = (float)(tile_bit0 - fb + 1u);
+            const float pf2 = (float)(p + (tile_bit0 >> 31));
+            const float qf2 = trunc(df2 * (1.0f / pf2));
+            float rf2 = fma(-qf2, pf2, df2);
+            rf2 += (rf2 < 0.0f) ? pf2 : 0.0f;
+            rf2 -= (rf2 >= pf2) ? pf2 : 0.0f;
+            if ((u32)rf2 > p) return;                // never: rf2 in [0, p)
+        }
+#endif
     }
     for (; bit < (u32)TILE_BITS; bit += p)
         atomic_and(&t32[bit >> 5], CLR_MASK(bit));

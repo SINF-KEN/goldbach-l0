@@ -1,15 +1,13 @@
 {
-  "note": "Round 2: the step-1 upper bound (medium-stage per-tile modulo removed, timing only) against a base with statistics off (the invalid map trips count30's gap flags with statistics on); the two knobs combined.",
+  "note": "Round 3: cost of the medium stage's per-tile setup (reviewer step 1 upper bound), measured by doing it twice with the map exact (ABL_MEDSETUP2), instead of the invalid-map ablation of round 2.",
   "windows": "long,long-end",
-  "runs": 6,
+  "runs": 8,
+  "run_timeout": 60,
   "ref_arm": "base",
   "exact_window": "4000000000000000000:4000000200000000000",
   "arms": [
     {"label": "active", "release": "active"},
     {"label": "base"},
-    {"label": "nostats", "env": {"GB_STATS": "0"}, "timing_only": true},
-    {"label": "ablmed0", "ocloc": "-DABL_MEDNOSETUP", "env": {"GB_STATS": "0"}, "timing_only": true},
-    {"label": "gapsS_bv500", "env": {"GB_GAPS": "sampled", "GB_BUCKET_VERIFY": "500"}, "expect_diff": true},
-    {"label": "gapsS_bv1000", "env": {"GB_GAPS": "sampled", "GB_BUCKET_VERIFY": "1000"}, "expect_diff": true}
+    {"label": "setup2", "ocloc": "-DABL_MEDSETUP2"}
   ]
 }
