@@ -29,8 +29,10 @@ name: CI
 # Pushes only: a pull request's head branch is tested by its push (the
 # checks show on the PR); pull_request runs only repeated the CPU jobs on
 # the one CPU runner.
+# exp/** branches are kernel / knob experiments (workflow Experiment): no CI.
 on:
   push:
+    branches-ignore: ["exp/**"]
   workflow_dispatch:
 
 permissions:

@@ -1380,6 +1380,65 @@ RunStats run_gpu(uint64_t limit,
         if (stage9) Context::free_mem(ctx.context(), stage9);
     }
 
+    // Statistics buffers: one shared allocation per slot instead of seven.
+    // collect_stats reads and resets them on the host once per segment; as
+    // separate shared allocations each one paid its own migration to the host
+    // and its own migration back at the next kernel append (a fixed cost per
+    // allocation, not per byte). Re-pointed into one block they migrate once
+    // each way per segment.
+    //
+    // Why this is safe: the host touches a slot's block only between that
+    // slot's collect (after its check event) and the first append that
+    // references it. count30's launch is that first append, and x_lim — the
+    // one buffer here the host writes during enqueue — is written before it.
+    // Nothing on the host reads or writes the block again until the slot's
+    // next collect, so a queued kernel never sees the block leave the device.
+    //
+    // The seven original allocations stay, unused: the large-prime kernels
+    // are sensitive to where the device allocations land (see the split_s1 /
+    // split_s5 note above), so the block is added after every other buffer
+    // and nothing that exists today moves.
+    void* stats_block[2] = {nullptr, nullptr};
+    std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
+    if (stats_on) {
+        const size_t ph_bytes = (size_t(MAX_GB_PRIME) / 2 + 1) * 4;
+        size_t block_bytes = 0;
+        const auto take = [&block_bytes](size_t bytes) {   // 64-byte aligned sub-buffer offset
+            const size_t at = block_bytes;
+            block_bytes += (bytes + 63) & ~size_t(63);
+            return at;
+        };
+        const size_t at_p_hist  = take(ph_bytes);
+        const size_t at_p_first = take(ph_bytes);
+        const size_t at_x_lim   = take(32 * 4);
+        const size_t at_x_cnt   = take(16 * 4);
+        const size_t at_g_part  = take(size_t(GAPS30_GROUPS_MAX) * 8);
+        const size_t at_g_tail  = take((2 + 2 * size_t(GAPS30_TCAP)) * 4);
+        const size_t at_g_hist  = take(size_t(GAPS30_HBINS) * 4);
+        for (int s = 0; s < 2; ++s) {
+            unsigned char* base = static_cast<unsigned char*>(ctx.alloc_shared(block_bytes));
+            stats_block[s] = base;
+            std::memset(base, 0, block_bytes);
+            for (void* p : {static_cast<void*>(b.p_hist[s]), static_cast<void*>(b.p_first[s]),
+                            static_cast<void*>(b.x_lim[s]), static_cast<void*>(b.x_cnt[s]),
+                            static_cast<void*>(b.g_part[s]), static_cast<void*>(b.g_tail[s]),
+                            static_cast<void*>(b.g_hist[s])})
+                stats_unpacked.push_back(p);
+            b.p_hist[s]  = static_cast<uint32_t*>(static_cast<void*>(base + at_p_hist));
+            b.p_first[s] = static_cast<uint32_t*>(static_cast<void*>(base + at_p_first));
+            b.x_lim[s]   = static_cast<uint32_t*>(static_cast<void*>(base + at_x_lim));
+            b.x_cnt[s]   = static_cast<uint32_t*>(static_cast<void*>(base + at_x_cnt));
+            b.g_part[s]  = static_cast<uint64_t*>(static_cast<void*>(base + at_g_part));
+            b.g_tail[s]  = static_cast<uint32_t*>(static_cast<void*>(base + at_g_tail));
+            b.g_hist[s]  = static_cast<uint32_t*>(static_cast<void*>(base + at_g_hist));
+            // the state the kernels expect before a slot's first segment (as
+            // the original buffers had it): p_hist / x_cnt zero, p_first all
+            // ones, count30's gap outputs reset
+            std::memset(b.p_first[s], 0xFF, ph_bytes);
+            reset_gaps(s);
+        }
+    }
+
     uint32_t gb_count    = uint32_t(gb_primes.size());
     // Measurement-only: GB_CHECK_NCAND=K hands the GPU checker only the first
     // K candidates (everything else lands on the CPU fallback) to measure
@@ -2515,7 +2574,9 @@ RunStats run_gpu(uint64_t limit,
         if (b.ridge[s]) Context::free_mem(ctx.context(), b.ridge[s]);
         if (b.split_s1[s]) Context::free_mem(ctx.context(), b.split_s1[s]);
         if (b.split_s5[s]) Context::free_mem(ctx.context(), b.split_s5[s]);
+        Context::free_mem(ctx.context(), stats_block[s]);
     }
+    for (void* p : stats_unpacked) Context::free_mem(ctx.context(), p);
     if (b.split_cands) Context::free_mem(ctx.context(), b.split_cands);
     if (b.split_meta) Context::free_mem(ctx.context(), b.split_meta);
     if (b.split_rest) Context::free_mem(ctx.context(), b.split_rest);
