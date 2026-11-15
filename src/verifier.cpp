@@ -643,24 +643,19 @@ RunStats run_gpu(uint64_t limit,
     Module  mod(ctx, spv_path);
     Kernel  k_sieve(mod, "make_prime_map");
     Kernel  k_large(mod, "sieve_large_packed");
-    // Two-phase checker: check_phase_a (32-bit register-window word checker
-    // capped at the first CHECK_PHASE_A_CANDS candidates) + check_phase_b
-    // (per-even sparse continuation).
+    // Two-phase checker (twin form, the fallback of the class-split and
+    // mod-30 checkers): check_phase_a (32-bit register-window word checker
+    // over twin pairs) + check_phase_b (per-even sparse continuation).
     Kernel  k_check(mod, "check_phase_a");
     Kernel  k_check_b(mod, "check_phase_b");
-    uint32_t check_cap = CHECK_PHASE_A_CANDS;
     // Phase A item width (64-bit words): the kernel's compiled-in A_W64
     // (tests/check_constants.py). Deliberately not overridable at run time:
     // a host-only change sizes the phase-A launch for a different width and
     // leaves evens unchecked.
     const uint32_t a_w64 = CHECK_PHASE_A_W64;
-    if (const char* e = std::getenv("GB_CHECK_CAP")) check_cap = uint32_t(std::strtoul(e, nullptr, 0));
     // Twin checker (v1.10.0): phase A reads the map as a twin map with the lower
     // members of twin pairs (two candidates per funnel); phase B then probes
-    // ALL candidates of the pending evens. GB_TWIN=0 restores the plain
-    // two-phase checker; GB_TWIN_CAP caps the twin funnels.
-    const bool twin_on =
-        !(std::getenv("GB_TWIN") && std::string(std::getenv("GB_TWIN")) == "0");
+    // ALL candidates of the pending evens. GB_TWIN_CAP caps the twin funnels.
     uint32_t twin_cap = CHECK_TWIN_CANDS;
     if (const char* e = std::getenv("GB_TWIN_CAP")) twin_cap = uint32_t(std::strtoul(e, nullptr, 0));
     // Phase B of the twin checker probes only the candidates the first
@@ -682,12 +677,12 @@ RunStats run_gpu(uint64_t limit,
     // twin checker; GB_SPLIT_CAP = funnels per class list, GB_SPLIT_STAGES =
     // stage masks ("7/3": p, p+6, p+12 then p, p+6). Used per segment only
     // where the geometry allows it (split_segment().ok), else twin.
-    const bool split_on = twin_on &&
+    const bool split_on =
         !(std::getenv("GB_SPLIT") && std::string(std::getenv("GB_SPLIT")) == "0");
     SplitPlan split_plan;
     // checked[] is validation output only (tools/debug_check_hi runs the
-    // kernels itself); GB_WRITE_CHECKED=1 still writes it here.
-    const uint32_t split_write_checked = std::getenv("GB_WRITE_CHECKED") ? 1u : 0u;
+    // kernels itself): the production checkers do not write it.
+    const uint32_t split_write_checked = 0u;
     std::unique_ptr<Kernel> k_split, k_sa, k_sb, k_merge;
     if (split_on) {
         uint32_t cap = CHECK_SPLIT_CANDS;
@@ -745,9 +740,7 @@ RunStats run_gpu(uint64_t limit,
     // GB_C30_PLAN without a bound prefix gets 9782, i.e. no kernel ridges)
     // and segments on a fallback checker record from that one's ceiling.
     const size_t twin_n = std::min<size_t>(twin_cap, twin_primes.size());
-    const size_t plain_n = std::min<size_t>(check_cap, gb_primes.size());
-    const uint32_t ceil_fallback = twin_on ? (twin_n ? twin_primes[twin_n - 1] + 3u : 0u)
-                                           : (plain_n ? gb_primes[plain_n - 1] + 1u : 0u);
+    const uint32_t ceil_fallback = twin_n ? twin_primes[twin_n - 1] + 3u : 0u;
     const uint32_t ceil_split = split_on ? split_plan.max_member + 1u : 0u;
     const uint32_t ceil_c30 = c30chk ? plan30.member_lt : 0u;
     const uint32_t a_ceiling = c30chk ? ceil_c30 : split_on ? ceil_split : ceil_fallback;
@@ -971,9 +964,8 @@ RunStats run_gpu(uint64_t limit,
     }
     b.gb_primes    = static_cast<uint16_t*>(ctx.alloc_device(
         gb_primes.size() * 2));
-    if (twin_on)
-        b.twin_primes = static_cast<uint16_t*>(ctx.alloc_device(twin_primes.size() * 2));
-    if (twin_on && !rest_primes.empty())
+    b.twin_primes = static_cast<uint16_t*>(ctx.alloc_device(twin_primes.size() * 2));
+    if (!rest_primes.empty())
         b.rest_primes = static_cast<uint16_t*>(ctx.alloc_device(rest_primes.size() * 2));
     if (split_on) {
         b.split_cands = static_cast<uint16_t*>(ctx.alloc_device(std::max<size_t>(split_plan.cands.size(), 1) * 2));
@@ -1049,16 +1041,12 @@ RunStats run_gpu(uint64_t limit,
     const uint64_t q_first0 = g_first.q_first;
     const bool bucket_env_off = std::getenv("GB_BUCKET") && std::string(std::getenv("GB_BUCKET")) == "0";
     uint32_t bucket_begin = sieve_count;   // B: first bucketed prime index
-    const bool bucket_wheel = !(std::getenv("GB_BUCKET_WHEEL") &&
-                                std::string(std::getenv("GB_BUCKET_WHEEL")) == "0");
-    // Multiplier wheel of the bucket kernel: MUST match WHEEL_W in the kernel
-    // (GB_WHEEL_W overrides for experiments). Max step (in p) and kept
-    // fraction of odd multipliers per wheel.
-    uint64_t wheel_w = WHEEL_W;
-    if (const char* e = std::getenv("GB_WHEEL_W")) wheel_w = std::strtoull(e, nullptr, 0);
-    const uint64_t wheel_max_step = wheel_w == 30030 ? 11 : wheel_w == 2310 ? 7 : wheel_w == 210 ? 5 : 3;
-    const double wheel_keep = wheel_w == 30030 ? 5760.0 / 15015 : wheel_w == 2310 ? 480.0 / 1155
-                            : wheel_w == 210 ? 48.0 / 105 : 8.0 / 15;
+    // Multiplier wheel of the bucket kernel (WHEEL_W = 30030, the only wheel
+    // the kernel module has): max step (in p) and kept fraction of odd
+    // multipliers.
+    static_assert(WHEEL_W == 30030, "kernels/goldbach.cl only has the 30030 wheel tables");
+    constexpr uint64_t wheel_max_step = 11;
+    constexpr double wheel_keep = 5760.0 / 15015;
     uint32_t bucket_R = 0;
     uint32_t bucket_cap = 0;
     double bucket_lam = 0.0;   // expected bucketed hits per segment
@@ -1080,9 +1068,8 @@ RunStats run_gpu(uint64_t limit,
                                                  uint32_t(std::min<uint64_t>(minp, UINT32_MAX))) -
                                 sieve_primes);
         const uint64_t pmax = sieve_primes[sieve_count - 1];
-        // Farthest next hit: the wheel step is up to wheel_max_step * p (kernel
-        // BUCKET_WHEEL30; GB_BUCKET_WHEEL=0 must match a kernel built without).
-        const uint64_t x = q_odds_full - 1 + (bucket_wheel ? wheel_max_step : 1) * pmax;
+        // Farthest next hit: the wheel step is up to wheel_max_step * p.
+        const uint64_t x = q_odds_full - 1 + wheel_max_step * pmax;
         const uint64_t max_rel = (x < q_odds_full) ? 0 : (x - q_odds_full) / delta + 1;
         bucket_R = uint32_t(max_rel + 2);
         // bucket_process does its filing arithmetic in 32 bits: needs
@@ -1104,7 +1091,7 @@ RunStats run_gpu(uint64_t limit,
         const double lambda = double(q_odds_full) *
             std::max(0.0, std::log(std::log(hi)) - std::log(std::log(lo))) + 1.0;
         // with the wheel only multipliers coprime to 30 are hits: 8/15
-        const double lam = bucket_wheel ? lambda * wheel_keep : lambda;
+        const double lam = lambda * wheel_keep;
         bucket_lam = lam;
         bucket_cap = uint32_t(lam * 1.10 + 8.0 * std::sqrt(lam) + 65536.0);
         // Round the bucket stride to 64 entries (512 B): bucket_process reads
@@ -1173,10 +1160,9 @@ RunStats run_gpu(uint64_t limit,
     init_mark("bucket-geom+lambda");
     const uint32_t packed_count = packed_end - sieve_split;
     // hl_apply fused into the packed kernel (sieve_large_packed_hl): the two
-    // mark sets commute, and alone hl_apply was latency-bound. GB_HL_FUSE=0
-    // restores the separate launch (A/B).
-    const bool hl_fuse = hitlist && packed_count > 0 &&
-                         !(std::getenv("GB_HL_FUSE") && std::string(std::getenv("GB_HL_FUSE")) == "0");
+    // mark sets commute, and alone hl_apply was latency-bound. hl_apply runs
+    // as its own launch only when no prime is packed.
+    const bool hl_fuse = hitlist && packed_count > 0;
     PackedLarge packed;
     uint32_t* d_large_bases = nullptr;
     uint32_t* d_large_gaps = nullptr;
@@ -1315,8 +1301,7 @@ RunStats run_gpu(uint64_t limit,
     {
         void* stage1 = stage_upload(ctx,
             gb_primes.data(), gb_primes.size() * 2, b.gb_primes);
-        void* stage_tw = twin_on ? stage_upload(ctx, twin_primes.data(),
-                                                twin_primes.size() * 2, b.twin_primes) : nullptr;
+        void* stage_tw = stage_upload(ctx, twin_primes.data(), twin_primes.size() * 2, b.twin_primes);
         void* stage_rest = b.rest_primes ? stage_upload(ctx, rest_primes.data(),
                                                         rest_primes.size() * 2, b.rest_primes) : nullptr;
         void* stage_sc = (split_on && !split_plan.cands.empty())
@@ -1345,18 +1330,14 @@ RunStats run_gpu(uint64_t limit,
         // verify kernels (everything). Copy only the ranges that are read —
         // at 4e18 that is ~192 MB instead of 437 MB — and DMA them straight
         // from the mmap'd cache (host pages stay valid until the sync below),
-        // skipping the staging memcpy. GB_UPLOAD_STAGED=1: old staged path.
-        void* stage2 = nullptr;
-        const bool staged = std::getenv("GB_UPLOAD_STAGED") != nullptr;
+        // skipping the staging memcpy.
         const auto copy_primes = [&](uint32_t lo, uint32_t hi) {
             if (hi <= lo) return;
             ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), b.sieve_primes + lo,
                                                    sieve_primes + lo, size_t(hi - lo) * 4,
                                                    nullptr, 0, nullptr));
         };
-        if (staged) {
-            stage2 = stage_upload(ctx, sieve_primes, size_t(sieve_count) * 4, b.sieve_primes);
-        } else if (bucket_verify) {
+        if (bucket_verify) {
             copy_primes(0, sieve_count);
         } else {
             copy_primes(0, sieve_split);
@@ -1375,14 +1356,13 @@ RunStats run_gpu(uint64_t limit,
         void* stage5 = stage_upload(ctx, ms32v.data(), size_t(sieve_split) * 8, b.ms32);
         ctx.host_sync();
         Context::free_mem(ctx.context(), stage1);
-        if (stage_tw) Context::free_mem(ctx.context(), stage_tw);
+        Context::free_mem(ctx.context(), stage_tw);
         if (stage_rest) Context::free_mem(ctx.context(), stage_rest);
         if (stage_sc) Context::free_mem(ctx.context(), stage_sc);
         if (stage_sm) Context::free_mem(ctx.context(), stage_sm);
         if (stage_sr) Context::free_mem(ctx.context(), stage_sr);
         for (void* p : stage_c30) if (p) Context::free_mem(ctx.context(), p);
         for (void* p : stage_x) if (p) Context::free_mem(ctx.context(), p);
-        if (stage2) Context::free_mem(ctx.context(), stage2);
         Context::free_mem(ctx.context(), stage3);
         Context::free_mem(ctx.context(), stage4);
         Context::free_mem(ctx.context(), stage5);
@@ -1451,13 +1431,7 @@ RunStats run_gpu(uint64_t limit,
         }
     }
 
-    uint32_t gb_count    = uint32_t(gb_primes.size());
-    // Measurement-only: GB_CHECK_NCAND=K hands the GPU checker only the first
-    // K candidates (everything else lands on the CPU fallback) to measure
-    // how many evens each candidate budget resolves. Verification stays
-    // complete (fallback is exact); never use for production runs.
-    if (const char* e = std::getenv("GB_CHECK_NCAND"))
-        gb_count = std::min<uint32_t>(gb_count, uint32_t(std::strtoul(e, nullptr, 0)));
+    const uint32_t gb_count = uint32_t(gb_primes.size());
     // The mask-table kernel arg is set per segment (the table CONTENT is
     // q_first-dependent and rewritten into the slot's shared buffer each
     // iteration, alongside first_bits).
@@ -1940,7 +1914,7 @@ RunStats run_gpu(uint64_t limit,
             k_bproc->set_arg(9, sizeof(inv_delta), &inv_delta);
             k_bproc->set_arg(10, sizeof(is_last), &is_last);
             k_bproc->set_arg(11, sizeof(bkt_err), &bkt_err);
-            const uint32_t qfw = uint32_t(q_first % wheel_w);
+            const uint32_t qfw = uint32_t(q_first % WHEEL_W);
             k_bproc->set_arg(12, sizeof(qfw), &qfw);
             k_bproc->set_arg(13, sizeof(d_bkt_entries1), &d_bkt_entries1);
             k_bproc->set_arg(14, sizeof(bkt_split), &bkt_split);
@@ -1953,10 +1927,9 @@ RunStats run_gpu(uint64_t limit,
             // activation on (horizon k+R); the next segment's barriers order
             // this reset before any such push. The reset is a write after
             // bucket_process's read of the same counter; the in-order list
-            // serializes them, so no barrier is needed here
-            // (GB_BUCKET_RESET_BARRIER=1 restores it for A/B). The unordered
+            // serializes them, so no barrier is needed there. The unordered
             // list does not: there the barrier is required.
-            if (g_unordered || std::getenv("GB_BUCKET_RESET_BARRIER"))
+            if (g_unordered)
                 ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             const uint32_t zero_count = 0;
             ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), d_bkt_counts + bslot, &zero_count, 4, 4,
@@ -2057,17 +2030,17 @@ RunStats run_gpu(uint64_t limit,
         const uint32_t twin_count = uint32_t(twin_primes.size());
         k_check.set_arg(0, sizeof(b.prime_map[slot]),  &b.prime_map[slot]);
         k_check.set_arg(1, sizeof(b.checked[slot]),    &b.checked[slot]);
-        k_check.set_arg(2, sizeof(b.gb_primes),    twin_on ? &b.twin_primes : &b.gb_primes);
-        k_check.set_arg(3, sizeof(gb_count),       twin_on ? &twin_count : &gb_count);
+        k_check.set_arg(2, sizeof(b.twin_primes),  &b.twin_primes);
+        k_check.set_arg(3, sizeof(twin_count),     &twin_count);
         k_check.set_arg(4, sizeof(b.pending[slot]),   &b.pending[slot]);
         k_check.set_arg(5, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
         k_check.set_arg(6, sizeof(q_first),        &q_first);
         k_check.set_arg(7, sizeof(q_odds),         &q_odds);
         k_check.set_arg(8, sizeof(seg_start),      &seg_start);
         k_check.set_arg(9, sizeof(seg_evens),      &seg_evens);
-        k_check.set_arg(10, sizeof(check_cap),   twin_on ? &twin_cap : &check_cap);
+        k_check.set_arg(10, sizeof(twin_cap),    &twin_cap);
         k_check.set_arg(11, sizeof(pending_cap), &pending_cap);
-        const uint32_t twin_u32 = twin_on ? 1u : 0u;
+        const uint32_t twin_u32 = 1u;
         k_check.set_arg(12, sizeof(twin_u32),    &twin_u32);
 
         // The check kernel must SEE the completed map from BOTH sieve
@@ -2357,7 +2330,7 @@ RunStats run_gpu(uint64_t limit,
             k_check_b.set_arg(1, sizeof(b.checked[slot]),    &b.checked[slot]);
             // Twin checker: phase B probes the uncovered candidates only.
             const uint32_t rest_count = uint32_t(rest_primes.size());
-            const bool use_rest = twin_on && b.rest_primes;
+            const bool use_rest = b.rest_primes != nullptr;
             k_check_b.set_arg(2, sizeof(b.gb_primes),        use_rest ? &b.rest_primes : &b.gb_primes);
             k_check_b.set_arg(3, sizeof(gb_count),           use_rest ? &rest_count : &gb_count);
             k_check_b.set_arg(4, sizeof(b.pending[slot]),    &b.pending[slot]);
@@ -2367,7 +2340,7 @@ RunStats run_gpu(uint64_t limit,
             k_check_b.set_arg(8, sizeof(q_first),            &q_first);
             k_check_b.set_arg(9, sizeof(q_odds),             &q_odds);
             k_check_b.set_arg(10, sizeof(seg_start),         &seg_start);
-            const uint32_t b_from = twin_on ? 0u : check_cap;   // twin: probe all candidates
+            const uint32_t b_from = 0u;   // twin: probe all candidates
             k_check_b.set_arg(11, sizeof(b_from),            &b_from);
             k_check_b.set_arg(12, sizeof(pending_cap),       &pending_cap);
             k_check_b.set_arg(13, sizeof(b.ridge[slot]),     &b.ridge[slot]);

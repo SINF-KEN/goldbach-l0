@@ -81,8 +81,7 @@ inline constexpr uint32_t LARGE_WG_SIZE = 128;
 // Multiplier wheel of the large-prime / bucket marking (v1.9.0; 30030 since
 // v1.10.1): a prime p > 61 only marks p*m for m coprime to WHEEL_W; every
 // other multiple is divisible by a prime <= 13 and cleared by the small-prime
-// mask stage. MUST match WHEEL_W in kernels/goldbach.cl (GB_WHEEL_W overrides
-// the host).
+// mask stage. MUST match WHEEL_W in kernels/goldbach.cl (30030 only).
 inline constexpr uint64_t WHEEL_W = 30030;
 // bucket_process grid-stride work-groups (GB_BUCKET_GROUPS overrides).
 inline constexpr uint32_t BUCKET_GROUPS = 1024;
@@ -98,10 +97,6 @@ inline constexpr uint32_t BUCKET_GROUPS = 1024;
 // 3 x +1.6/+1.6/+1.4/+1.2%, 2.5 x +1.3/+1.4/+1.1/+1.1%. Cost: the ring is
 // R x cap entries, ~6.9 GiB of VRAM at 3 x with the 30030 wheel (R ~199).
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
-// Two-phase checker: candidates handled by the word-level phase A before the
-// remaining evens go to the per-even phase B (GB_CHECK_CAP overrides), and
-// phase B's grid-stride work-group count.
-inline constexpr uint32_t CHECK_PHASE_A_CANDS  = 160;
 // Phase-A item width in 64-bit words (768 evens per item) of every word
 // checker. MUST match A_W64 in kernels/goldbach.cl. v1.13.0: 16 -> 14 (the
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
@@ -110,8 +105,8 @@ inline constexpr uint32_t CHECK_PHASE_A_W64    = 12;
 inline constexpr uint32_t CHECK_PHASE_B_GROUPS = 640;
 // Twin checker (v1.10.0): phase A funnels over the lower members of twin
 // pairs (two candidates per funnel, kernels/goldbach.cl tw32), then phase B
-// probes the candidates those pairs did not cover (GB_TWIN_CAP; GB_TWIN=0 =
-// the v1.9.0 checker). 2e10 window: 80 +0.4%, 90 +1.4%, 100 +1.1%, 120 +0.3%
+// probes the candidates those pairs did not cover (GB_TWIN_CAP overrides;
+// the plain v1.9.0 checker, cap 160, was removed). 2e10 window: 80 +0.4%, 90 +1.4%, 100 +1.1%, 120 +0.3%
 // over the plain checker with the rest list; plain cap 160 re-checked.
 inline constexpr uint32_t CHECK_TWIN_CANDS = 100;
 

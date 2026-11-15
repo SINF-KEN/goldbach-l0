@@ -29,7 +29,6 @@ typedef ushort u16;
 #define WPT (TILE_WORDS / WG_SIZE)          // 8 u64 words per thread
 #define BITS_PER_THREAD (WPT * 64u)
 #define MAX_GROUPS 8u
-#define NONE32 0xFFFFFFFFu
 
 __constant u32 SCM_RES[SCM_K] = {SCM_RES_LIST};
 
@@ -67,7 +66,7 @@ inline u32 mod32(const u32 x, const u32 p)
 /// @param T         valid bits per class array; bits >= T are written as 0.
 /// @param primes    base primes; [j_own0, split) are walked here.
 /// @param fbt       [k * split + j] first hit of prime j in class k, segment-
-///                  local, in [0, p) (NONE32 for primes dividing M).
+///                  local, in [0, p) (0xFFFFFFFF for primes dividing M).
 /// @param j_own0,own_end,split  stage boundaries (see above).
 /// @param gmask,gdesc,n_groups,gy  mask-group tables (host make_groups_scm /
 ///                  scm_group_offsets); n_groups <= MAX_GROUPS.
@@ -261,9 +260,7 @@ inline u32 mod_big(const u64 x, const u32 p)
     return (u32)r;
 }
 
-#ifndef LARGE_PACK_SG
 #define LARGE_PACK_SG 32
-#endif
 #ifndef LARGE_PACK_PPI
 #define LARGE_PACK_PPI 16
 #endif
@@ -342,15 +339,7 @@ __kernel void scm_large(
     for (u32 l = 0; l < LARGE_PACK_PPI; ++l) {
         const u32 p = pv[l];
         if (c0 + l >= large_count) break;
-#ifdef ABLL_DECODE
-        if (p == 0xFFFFFFFFu) cmap32[0] = 0u;
-        continue;
-#endif
         const u32 R = (p < (1u << 30)) ? mod_ff(qs, p) : mod_big(Q, p);
-#ifdef ABLL_MOD
-        if (R == 0xFFFFFFFFu) cmap32[0] = 0u;
-        continue;
-#endif
         const u32 rho = R ? p - R : 0u;
         const u32 a = p / SCM_M;
         const u32 b = p - a * SCM_M;
@@ -364,15 +353,11 @@ __kernel void scm_large(
             u32 t = a * dl + (rho + b * dl - c) / SCM_M;
             volatile __global u32* S = cmap32 + k * stride32;
 
-#ifdef ABLL_NOMARK   // timing only (INVALID map): setup without marks
-            if (t == 0xFFFFFFFFu) S[0] = 0u;
-#else
             // (reading the word first and marking only set bits, or a mark
             // filter for multiples of 13..61, measured slower: the kernel is
             // bound by random L3 line accesses, reads and atomics alike)
             for (; t < T; t += p)
                 atomic_and(S + (t >> 5), ~(1u << (t & 31u)));
-#endif
         }
     }
 }
@@ -380,9 +365,7 @@ __kernel void scm_large(
 // ---------------------------------------------------------------------------
 // Checker (mod-2310 form of check30_a / check30_b; include/sparse.hpp).
 // ---------------------------------------------------------------------------
-#ifndef SCM_MAXD
 #define SCM_MAXD 4               // largest pattern shift (host-checked)
-#endif
 /// @return S[w] when 0 <= w < n, else 0 (negative w wraps out of range).
 inline u32 ld_guard(const __global u32* S, const int w, const u32 n)
 {
@@ -398,9 +381,7 @@ inline u32 ld_guard(const __global u32* S, const int w, const u32 n)
 #ifndef A3_SPAN
 #define A3_SPAN 12
 #endif
-#ifndef A3_WPL
 #define A3_WPL 32u                                 // u32 words (32 evens each) per lane: 28 -> 32 -6% phase A; 36, 40 slower
-#endif
 #define A3_TOT (A3_WPL + A3_SPAN + 1 + 3)             // window + 3 words below (pattern OR)
 /// Funnel shift left of the 64-bit pair (a:b) by d.
 /// @pre    1 <= d <= 31 (a shift by 32 wraps to 0 on Xe).
@@ -466,11 +447,7 @@ __kernel void scm_check_a(
         }
     }
 
-#ifdef ABL3_NOSEG
-    if (0) {
-#else
     if (live) {
-#endif
         const u32 ns = meta[mo];
         for (u32 st = 0; st < ns; ++st) {
             const u32 jb = meta[mo + 1u + 3u * st];
@@ -480,11 +457,7 @@ __kernel void scm_check_a(
             const __global u32* S = cmap32 + k * stride32;
             const u32 Ul = cands[je - 1u];
             // window word 0 = class word (k0 + Ul) >> 5; x[0..2] = words -3..-1
-#ifdef ABL3_HOTWIN
-            const int wb = 64 + (int)(cr & 7u) * 64;   // timing only: every window from one hot spot
-#else
             const int wb = (int)(k0 >> 5) + (int)(Ul >> 5) - 3;
-#endif
             u32 x[A3_TOT];
             if (wb >= 0 && wb + 8 * ((A3_TOT + 7) / 8) <= (int)stride32) {
                 const __global u32* P_ = S + wb;
@@ -705,12 +678,7 @@ __kernel void scm_check_a(
             // mask of bit q - d): prefix doubling for the contiguous masks
 #define A3_STEP(D, LO) do { _Pragma("unroll") for (u32 t = A3_TOT; t > (LO); --t) \
                 x[t - 1u] |= fsl(x[t - 1u], x[t - 2u], (D)); } while (0)
-#ifdef ABL3_NOOR
             if (0) {}
-#else
-            if (0) {}
-#endif
-#ifndef ABL3_NOOR
             else if (mask == 3u) { A3_STEP(1u, 1u); }
             else if (mask == 7u) { A3_STEP(1u, 1u); A3_STEP(1u, 2u); }
             else if (mask == 15u) { A3_STEP(1u, 1u); A3_STEP(2u, 2u); }
@@ -723,12 +691,7 @@ __kernel void scm_check_a(
             else if (mask == 29u) A3_DIRECT3(2u, 3u, 4u);
             else if (mask == 27u) A3_DIRECT3(1u, 3u, 4u);
             else if (mask == 23u) A3_DIRECT3(1u, 2u, 4u);
-#endif
-#ifndef ABL3_NOOR
             else if (mask != 1u) {
-#else
-            else if (0) {
-#endif
                 u32 y[A3_TOT];
                 #pragma unroll
                 for (u32 t = 1; t < A3_TOT; ++t) {
@@ -741,11 +704,7 @@ __kernel void scm_check_a(
                 #pragma unroll
                 for (u32 t = 1; t < A3_TOT; ++t) x[t] = y[t];
             }
-#ifdef ABL3_ONEF   // timing only (INVALID): one funnel per segment
-            for (u32 j = jb; j < jb + 1u; ++j) {
-#else
             for (u32 j = jb; j < je; ++j) {
-#endif
                 const u32 U = cands[j];
                 const u32 o = (U >> 5) - (Ul >> 5);            // uniform, <= A3_SPAN (plan)
                 const u32 rr = U & 31u;
@@ -913,11 +872,7 @@ __kernel void scm_check_a(
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
-#ifdef ABL_NOPEND
-    if (cnt == 0xFFFFFFFFu) {                          // timing only: no pending extraction
-#else
     if (cnt) {
-#endif
         const u64 hi = ((u64)cr << pshift) | ((u64)(k0 >> 5) << 32);
         #pragma unroll
         for (u32 i = 0; i < A3_WPL; ++i) {
