@@ -140,6 +140,16 @@ jobs:
           done <<<"$KERNEL_MODULES"
           exit $bad
 
+      - name: Upload the fresh pinned-ocloc modules (stale binary)
+        # so a stale .spv can be replaced without a machine that has the
+        # pinned toolchain: download this artifact and commit its files
+        if: failure() && env.OCLOC_PINNED == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernels-fresh-spv
+          path: ${{ runner.temp }}/kernels/*_bmg.spv
+          if-no-files-found: ignore
+
   host:
     name: Host ${{ matrix.name }}
     runs-on: [self-hosted, goldbach-cpu]
