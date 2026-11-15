@@ -226,6 +226,7 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |
 | `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, max 128, list buffer < 4 GiB) (§9.2t); GB_BUCKET_VERIFY checks either path |
 | `GB_HL_FUSE=0` | hit-list apply as its own launch (hl_apply) instead of fused into the packed kernel (§9.2u) |
+| `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` (§9.2w) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest (§9.2v) |
 | `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32) |
@@ -1425,6 +1426,97 @@ L1S_L3UC (LARGE_GAPS_CC 5, as bkt_load): large 433.8 -> 431.2 ms per 1e11,
 +0.36% on 2e12; stats.state identical on 2e11. L1UC_L3UC (1) lost 1.35%.
 Segment sweep with it (long, 5 rounds): 440M / 485M within ±0.15% of
 467.5M; 500M +0.5% but 10M short of the 510M L3 cliff (-34%), not adopted.
+
+### 9.2w SLM contention round: atomic owned marks, gap-histogram columns, round-robin arbitration (2026-11-15)
+Four changes, all exact, found by timing ablations of the tile sieve and of
+count30 (per 1e11 at 4e18, base 89140a2: gpu 755 ms, sieve 197, large 429,
+check 143):
+- **OWN_ATOMIC** (make_prime_map). Ablations of the owned walk (primes
+  64..512, ~61 ms): table loads ~3, setup ~9, mark-loop ALU ~15, the SLM
+  load + store of each plain read-modify-write ~34. In the medium stage the
+  reverse experiment (plain RMW instead of `atomic_and`) was 46 ms SLOWER: a
+  posted SLM atomic is cheaper than a load / store pair. So the owned walk
+  marks with `atomic_and` although each thread owns its words (OWN_ATOMIC 1:
+  sieve 197.0 -> 175.5 ms, +2.5%). Every write after the stage-2 barrier is
+  then an atomic AND, they commute, and the barrier between the owned walk
+  and the medium stage goes (OWN_ATOMIC 2: sieve 170.5 ms, +3.4%). The two
+  other stages that can follow stage 2 (per-prime masks with
+  GB_MASK_GROUPS=0, the q = p restore at q_first <= 64) are atomic too with
+  OWN_ATOMIC 2 (two 32-bit `atomic_and`s per mask word, an `atomic_or`), so
+  no barrier depends on a copy of their entry conditions; neither runs in
+  the production geometry. Any new SLM write after stage 2 must be atomic
+  as well, or bring the medium-stage barrier back. GB_MED_P re-checked
+  with it: 384 / 768 / 1024 all -0.6..-0.8% vs 512.
+- **G30_COLS** (count30 gap walk, 39 ms). Ablations: without the walk loop
+  -37 ms; without the histogram's `atomic_inc` -13 ms; with every lane on
+  bins of its own -10.4 ms — so 10 of the 13 ms were lanes queueing on the
+  same few SLM words (the common gaps). The low bins (d < 64, ~94% of the
+  gaps) are now kept once per SIMD lane position (16 columns x 64 bins,
+  +4 KB SLM) and summed at the flush: check 143.2 -> 130.4 ms, +1.44% /
+  +1.42%. Per-sub-group bins and 32 x 32 columns measured the same.
+  Review follow-up: count30 is pinned to SIMD16
+  (`intel_reqd_sub_group_size(G30_SIMD)`) and the column is the sub-group
+  lane (`get_sub_group_local_id()`, was `lid & 15`), so the lanes of one
+  SIMD instruction never share a column whatever the compiler picks; column
+  0 is the base histogram's bins 0..63 (no dead region, +3.75 KB SLM).
+- **GAPS30_GROUPS 320 -> 64**: fewer grid-stride groups leave hardware
+  threads to phase A, which overlaps count30 (§9.2v). gpu ms for 16 / 24 /
+  32 / 48 / 64 / 80 / 96 / 160 / 320 groups: 756.3 / 724.3 / 715.3 / 712.8 /
+  712.0 / 712.8 / 714.4 / 713.9 / 716.0. +0.55%. The default is scaled by
+  the device's EU count (64 per 160 EUs, the B580's 20 Xe2 cores x 8), so
+  a larger part keeps the same share; GB_GAPS_GROUPS still overrides.
+- **Round-robin EU thread arbitration** (`zeKernelSchedulingHintExp` on
+  every kernel; GB_SCHED=0 / 1 / 2 / off): round-robin +0.58% / +0.59% over
+  the Xe2 default (stall-based round-robin), oldest-first -0.6% (large
+  +10 ms, check -6 ms). Per-kernel mixes lose: a launch whose policy differs
+  from its neighbours' slows the neighbours (checker oldest-first with the
+  sieves round-robin: large 435 -> 445 ms; -0.4..-2.1% for four mixes), so
+  one policy for all. The NEO debug key OverrideThreadArbitrationPolicy
+  gives the same numbers; the API needs no debug key. GB_SCHED is parsed
+  once per Context; each kernel's `zeKernelSchedulingHintExp` decides
+  support. Do not gate on `ze_scheduling_hint_exp_properties_t`: the B580
+  driver (26.40) reports no supported flags there yet applies round-robin;
+  a review fix that gated on it silently dropped the hint (CI 8aff77f:
+  sched=driver(hint-unsupported), check +9.6 ms, -0.53%). A policy GB_SCHED
+  asks for must be accepted (else an error, with no kernel handle leaked);
+  the default falls back to the driver's arbitration with a warning. The
+  policy in force is in the run output (`sched=` in --csv, `"sched"` in
+  --json, "EU arbitration" in the text summary): round-robin,
+  oldest-first, stall-based, driver or driver(hint-failed).
+Final (bench.py, 10 paired rounds, before the grid change): long 66.19 ->
+69.85 G evens/s (+5.53%, CI +-0.05%), long-end 65.64 -> 69.16 (+5.37%,
++-0.03%); with the 64-group grid +6.0% on long. A full production slice
+(4140600000000000000, 5e13, GB_BUCKET_VERIFY=500): 376.00 -> 354.44 s
+(+6.08%), sieve 98.5 -> 84.0 s, check 71.6 -> 84.0 s (count30 now overlaps
+phase A, both are counted), large unchanged.
+Validation: statistics state, gap state and log byte-identical to the base
+on 2e10 at 4e18, at 4.5e18, ending at 5e18, at 1e12 and at 1e9, and on the
+full slice (its log line equals the production campaign's banked line
+except the history-dependent new_first); debug_map 40 cases OK, debug_sieve
+OK; GB_BUCKET_VERIFY=1 over 122 segments at both ends, GB_MASK_GROUPS=0 at
+4e18 and from 4; gpu_validate quick: 0 failures. A wrong histogram fails
+the host's gap cross-check (the timing ablations had to bypass it).
+Measured and dropped in the same round:
+- count30 block refill with an in-place bit test + select, or one rotate
+  per class, instead of shift / and / shift / or: +-0.0% (the walk is not
+  bound by that arithmetic).
+- **Running the large kernel beside a tile sieve** (the idea of a fused
+  launch, or a background sieve for the next segment). The packed kernel
+  as a grid-stride loop (LARGE_STRIDE, fewer work-groups = fewer hardware
+  threads): large 432 ms with all groups, 441 / 463 / 516 / 535 / 612 / 726
+  for 2560 / 1280 / 640 / 480 / 320 / 160 groups. A duplicate ("shadow")
+  tile sieve launched behind it without a barrier costs +177 ms beside the
+  unthrottled kernel (it runs after it) and +89 ms beside 640 groups, but
+  640 groups alone are 87 ms slower: 896 vs 897 ms in total. Throughput is
+  additive — the kernels are bound by hardware thread slots, not by
+  disjoint resources — so a fused kernel or a three-slot pipeline has
+  nothing to win.
+- Not built, leads: hl_harvest takes one returning `atomic_inc` per hit on
+  128 SLM counters shared by 256 lanes (the pattern G30_COLS removed; the
+  harvest is ~35 ms per 1e11); the medium stage's mark-loop ALU (~38 ms)
+  and table loads (~18 ms); the packed kernel's setup floor (decode +
+  modulo + hit lists: 125 ms of 429) with a modulo chained across the 16
+  primes of a work-item.
 
 ### 9.3 prep_large_fb — present in the module, NOT launched by run_gpu
 Kept (and validated by debug_fb); the host no longer calls it. Do not
