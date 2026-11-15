@@ -413,18 +413,32 @@ inline void mark_multiples_u32(volatile __global u64* prime_map, const u64 bit0,
 }
 
 
+#ifndef OWN_ATOMIC
+#define OWN_ATOMIC 2            // owned-walk marks as posted SLM atomic ANDs (1: +2.5%), and no
+#endif                          // barrier between the owned walk and the medium stage (2: +3.4%)
+
 // ----------------------------------------------------------------------------
 // Thread-owned tile marks: clear bit0, bit0 + p, ... (< end) in SLM with
 // 32-bit words and 32-bit arithmetic (the u64 form — 64-bit shift of 1UL,
 // u64 add/compare — compiled to ~37 instructions per mark on Xe2). The
-// calling thread owns every word in [bit0, end), so plain RMWs are safe.
+// calling thread owns every word in [bit0, end), so a plain RMW would be
+// safe; with OWN_ATOMIC (default) each mark is a posted SLM atomic AND
+// anyway (cheaper than load + store), and OWN_ATOMIC >= 2 relies on it:
+// the medium stage's cross-thread atomics then run without a barrier.
 // Overflow-free loop condition (end - bit > p), no headroom assumed.
 // ----------------------------------------------------------------------------
 /// @pre    the calling thread owns every SLM word of [bit0, end); end < 2^32.
-/// @post   tile bits bit0, bit0 + p, ... < end are cleared.
-#ifndef OWN_ATOMIC
-#define OWN_ATOMIC 2            // owned-walk marks as posted SLM atomic ANDs (1: +2.5%), and no
-#endif                          // barrier between the owned walk and the medium stage (2: +3.4%)
+/// @post   tile bits bit0, bit0 + p, ... < end are cleared (atomic ANDs
+///         unless OWN_ATOMIC == 0).
+// AND a 64-bit mask into tile word w as two 32-bit SLM atomics (little
+// endian, as the t32 views above); halves that clear nothing are skipped.
+inline void tile_and64_atomic(__local u64* tile, const u32 w, const u64 m)
+{
+    volatile __local u32* t = (volatile __local u32*)tile + 2u * w;
+    if ((u32)m != 0xffffffffu) atomic_and(t, (u32)m);
+    if ((u32)(m >> 32) != 0xffffffffu) atomic_and(t + 1, (u32)(m >> 32));
+}
+
 inline void mark_owned_u32(__local u64* tile, const u64 bit0, const u64 end, const u64 p)
 {
     if (bit0 >= end) return;
@@ -758,8 +772,10 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
 // fma(-trunc(d / p), p, d) is the exact remainder in (-p, 2p) (as
 // med_prime_f32). Replaces the 64-bit mul_hi / k * p jump of the table path.
 /// @pre    p < TILE_BITS; b0 <= b1 <= TILE_BITS; tf < TILE_BITS or 0xffffffff.
-/// @post   my bits of p's marks in this tile are cleared (plain RMWs: the
-///         range is owned by this thread).
+/// @post   my bits of p's marks in this tile are cleared: posted SLM atomic
+///         ANDs unless OWN_ATOMIC == 0 (then plain RMWs, safe because the
+///         range is owned by this thread). OWN_ATOMIC >= 2 depends on the
+///         atomics: no barrier separates them from the medium stage.
 inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
                           const u32 b0, const u32 b1)
 {
@@ -967,7 +983,11 @@ __kernel void make_prime_map(
             const __global u64* masks = mask_table + (u64)j * 64UL;
             u32 w = my_word0;
             for (u32 i = 0; i < WORDS_PER_THREAD; ++i, ++w) {
+#if OWN_ATOMIC >= 2
+                tile_and64_atomic(tile, w, masks[phase]);
+#else
                 tile[w] &= masks[phase];
+#endif
                 // The table is indexed by the WORD INDEX mod p: consecutive
                 // words advance the phase by exactly 1. (The historical
                 // `phase += 64 % p` conflated this with the bit-phase inside
@@ -982,7 +1002,10 @@ __kernel void make_prime_map(
         // Stage 3.5: restore q = p (1*p is prime, not composite). The mask
         // path clears it whenever q_first <= p < MASK_MAX_P. Only tile 0 can
         // contain it; exactly one thread owns the word, so a plain SLM RMW
-        // is race-free.
+        // is race-free against the other stage-3a writers. With OWN_ATOMIC
+        // >= 2 it is an atomic OR: the medium stage's atomic ANDs on the
+        // same word may already be running (they never clear q = p itself,
+        // and OR / AND of different bits commute).
         if (tile_id == 0 && q_first <= (u64)MASK_MAX_P) {
             for (u32 j = 0; j < mask_count; ++j) {
                 const u64 p = sieve_primes[j];
@@ -994,20 +1017,17 @@ __kernel void make_prime_map(
                 }
                 if (bit < TILE_BITS) {
                     const u32 owner = (u32)(bit >> 6);
-                    if (owner >= my_word0 && owner < my_word0 + WORDS_PER_THREAD)
+                    if (owner >= my_word0 && owner < my_word0 + WORDS_PER_THREAD) {
+#if OWN_ATOMIC >= 2
+                        atomic_or((volatile __local u32*)tile + (u32)(bit >> 5), 1u << (u32)(bit & 31UL));
+#else
                         tile[owner] |= 1UL << (bit & 63UL);
+#endif
+                    }
                 }
             }
         }
     }
-#endif
-#if OWN_ATOMIC >= 2
-    // The plain RMWs of this stage (per-prime masks, the q = p restore) must
-    // be done before any cross-thread atomic: with atomic owned marks the
-    // medium stage no longer waits behind a barrier of its own. Not taken in
-    // the production geometry (fused mask groups, q_first > MASK_MAX_P).
-    if (mask_count > 0 && (n_groups == 0 || (tile_id == 0 && q_first <= (u64)MASK_MAX_P)))   // uniform
-        barrier(CLK_LOCAL_MEM_FENCE);
 #endif
 
     // ---- Stage 3: sieve -----------------------------------------------------
@@ -1216,8 +1236,10 @@ __kernel void make_prime_map(
     // global-memory atomics out of sieve_large_primes into SLM.
     // Barriers: with plain owned RMWs (OWN_ATOMIC < 2) the owned walk must be
     // finished before any cross-thread atomic touches its words (OWN_ATOMIC
-    // 2: every write after stage 2 is an atomic AND, they commute, and the
-    // rare plain stages take their own barrier above); and stage 4 reads
+    // 2: every SLM write after stage 2 is atomic -- owned walk, per-prime
+    // masks, the q = p restore -- and they commute, so no barrier is
+    // needed; a new plain write after stage 2 must be atomic too, or
+    // restore this barrier); and stage 4 reads
     // words other threads cleared, so every atomic must be done before it.
     // The first bit per tile comes from the segment-global fb_global (host,
     // ~0 = no mark in the segment) with one exact 32-bit modulo; d < 2^32 by
@@ -3625,11 +3647,23 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 #define G30T_ERR_FULL 4u
 #define G30_HBINS 1024u
 #define G30_MAX_SG 32u           // sub-groups per work-group (256 / 8)
+// Gap walk: the low bins (d < G30_CBINS, ~94% of the gaps) are kept once per
+// SIMD lane (+1.4%), so the lanes of one SIMD instruction never queue on the
+// same SLM word. count30 is compiled at G30_SIMD (required sub-group size)
+// and G30_COLS = G30_SIMD: lane l of every sub-group uses column l. Column 0
+// is the base histogram's own bins 0..G30_CBINS-1; columns 1.. follow it at
+// G30_HBINS and are summed into the base bins at the flush. G30_COLS=0: off.
+#ifndef G30_SIMD
+#define G30_SIMD 16u
+#endif
 #ifndef G30_COLS
-#define G30_COLS 16u             // gap walk: the low bins (d < G30_CBINS, ~94% of the gaps) are kept
-#endif                           // once per SIMD lane position (power of two; 0 = off), so the lanes
-#define G30_CBINS 64u            // of a work-group stop queueing on the same few SLM words; the
-#define G30_LH (G30_HBINS + G30_COLS * G30_CBINS)   // columns are summed at the flush (+1.4%)
+#define G30_COLS G30_SIMD
+#endif
+#if G30_COLS && G30_COLS != G30_SIMD
+#error "G30_COLS must equal G30_SIMD (one column per SIMD lane) or be 0"
+#endif
+#define G30_CBINS 64u
+#define G30_LH (G30_HBINS + (G30_COLS ? G30_COLS - 1u : 0u) * G30_CBINS)
 inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, __global const u32* restrict lim,
                            const u32 ord, const u32 phis, const u32 pos_lo, const u32 tb,
                            __global u32* restrict gt, const u32 tcap)
@@ -3671,6 +3705,7 @@ inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, 
     if (30u * 32u * (wi >= 2u ? wi - 2u : 0u) >= pos_lo) atomic_or(gt + 1, G30T_ERR_LOOK);
 }
 
+__attribute__((intel_reqd_sub_group_size(G30_SIMD)))
 __kernel void count30(
         __global const u32* restrict cmap32,
         const u32 cw32,
@@ -3705,7 +3740,8 @@ __kernel void count30(
     u32 err = 0u, dmax = 0u, dpos = 0u;       // walk: flags, largest gap / 2 and its upper h
     const u32 nlanes = cw32 / C30_CW;
 #if G30_COLS
-    const u32 gcol = G30_HBINS + (lid & (G30_COLS - 1u)) * G30_CBINS;   // my column of low bins
+    const u32 scol = get_sub_group_local_id();   // < G30_SIMD = G30_COLS: one column per lane
+    const u32 gcol = scol ? G30_HBINS + (scol - 1u) * G30_CBINS : 0u;   // my column of low bins
 #endif
     // grid-stride: walked segments use a fixed grid (one histogram flush per
     // work-group), the others one chunk per lane
@@ -3860,7 +3896,7 @@ __kernel void count30(
             u32 t = lh[i];
 #if G30_COLS
             if (i < G30_CBINS)
-                for (u32 k = 0; k < G30_COLS; ++k) t += lh[G30_HBINS + k * G30_CBINS + i];
+                for (u32 k = 1; k < G30_COLS; ++k) t += lh[G30_HBINS + (k - 1u) * G30_CBINS + i];
 #endif
             if (t) atomic_add(hist + i, t);
         }

@@ -2,6 +2,7 @@
 #include "l0_context.hpp"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -40,6 +41,50 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 
 // ---------------------------------------------------------------- Context --
 
+// EU thread arbitration hint for every Kernel: round-robin measured +0.6%
+// over the Xe2 default (stall-based round-robin), oldest-first -0.6%; mixing
+// policies between the kernels of a segment loses (2026-11-15,
+// PROJECT-REFERENCE 9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
+// 2 stall-based, off = the driver's default. Parsed and checked against the
+// device's supported hints once per Context, before any kernel exists. A
+// policy GB_SCHED asked for must be supported (else an error); the default
+// falls back to the driver's arbitration with a warning. The policy in force
+// is reported by sched_policy_name() (run output: sched=).
+static void sched_setup(ze_device_handle_t dev) {
+    const char* se = std::getenv("GB_SCHED");
+    const std::string sv = se ? se : "1";
+    SchedPolicy p;
+    p.requested = se != nullptr;
+    if (sv == "off") {
+        p.name = "driver";
+        g_sched = p;
+        return;
+    }
+    if (sv == "0")      { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_OLDEST_FIRST; p.name = "oldest-first"; }
+    else if (sv == "1") { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_ROUND_ROBIN; p.name = "round-robin"; }
+    else if (sv == "2") { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_STALL_BASED_ROUND_ROBIN; p.name = "stall-based"; }
+    else throw std::runtime_error("GB_SCHED='" + sv + "': must be 0, 1, 2 or off");
+
+    ze_scheduling_hint_exp_properties_t hp{};
+    hp.stype = ZE_STRUCTURE_TYPE_SCHEDULING_HINT_EXP_PROPERTIES;
+    ze_device_module_properties_t mp{};
+    mp.stype = ZE_STRUCTURE_TYPE_DEVICE_MODULE_PROPERTIES;
+    mp.pNext = &hp;
+    const ze_result_t r = zeDeviceGetModuleProperties(dev, &mp);
+    if (r != ZE_RESULT_SUCCESS || !(hp.schedulingHintFlags & p.flag)) {
+        const std::string why = r != ZE_RESULT_SUCCESS
+            ? "scheduling-hint query failed: " + ze_result_string(r)
+            : std::string("device does not support the ") + p.name + " scheduling hint";
+        if (p.requested)
+            throw std::runtime_error("GB_SCHED=" + sv + ": " + why);
+        std::fprintf(stderr, "warning: %s; using the driver's default EU arbitration "
+                     "(set GB_SCHED=off to silence)\n", why.c_str());
+        p.flag = 0;
+        p.name = "driver(hint-unsupported)";
+    }
+    g_sched = p;
+}
+
 Context::Context(bool unordered) {
     ZE_CHECK(zeInit(ZE_INIT_FLAG_GPU_ONLY));
 
@@ -68,6 +113,8 @@ Context::Context(bool unordered) {
         if (device_) break;
     }
     if (!device_) throw std::runtime_error("no GPU device found");
+
+    sched_setup(device_);
 
     ze_context_desc_t cdesc{};
     cdesc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
@@ -172,26 +219,28 @@ Kernel::Kernel(const Module& mod, const std::string& name) {
     desc.stype       = ZE_STRUCTURE_TYPE_KERNEL_DESC;
     desc.pKernelName = name.c_str();
     ZE_CHECK(zeKernelCreate(mod.handle(), &desc, &kernel_));
-    // EU thread arbitration: round-robin measured +0.6% over the Xe2 default
-    // (stall-based round-robin), oldest-first -0.6%; mixing policies between
-    // the kernels of a segment loses (2026-11-15, PROJECT-REFERENCE 9.2w).
-    // GB_SCHED=0 oldest-first, 1 round-robin (default), 2 stall-based, off =
-    // the driver's default. A driver without the hint keeps its default,
-    // unless GB_SCHED asked for a policy (then it is an error).
-    const char* se = std::getenv("GB_SCHED");
-    const std::string sv = se ? se : "1";
-    if (sv != "off") {
-        if (sv != "0" && sv != "1" && sv != "2")
-            throw std::runtime_error("GB_SCHED must be 0, 1, 2 or off");
-        ze_scheduling_hint_exp_desc_t hint{};
-        hint.stype = ZE_STRUCTURE_TYPE_SCHEDULING_HINT_EXP_DESC;
-        hint.flags = sv == "0" ? ZE_SCHEDULING_HINT_EXP_FLAG_OLDEST_FIRST
-                   : sv == "1" ? ZE_SCHEDULING_HINT_EXP_FLAG_ROUND_ROBIN
-                               : ZE_SCHEDULING_HINT_EXP_FLAG_STALL_BASED_ROUND_ROBIN;
-        const ze_result_t r = zeKernelSchedulingHintExp(kernel_, &hint);
-        if (r != ZE_RESULT_SUCCESS && se)
-            throw std::runtime_error("zeKernelSchedulingHintExp(" + name + ") failed: " + std::to_string(int(r)));
+    // EU thread arbitration (policy parsed and support-checked once by the
+    // Context, see sched_setup).
+    if (g_sched.flag == 0) return;
+    ze_scheduling_hint_exp_desc_t hint{};
+    hint.stype = ZE_STRUCTURE_TYPE_SCHEDULING_HINT_EXP_DESC;
+    hint.flags = g_sched.flag;
+    const ze_result_t r = zeKernelSchedulingHintExp(kernel_, &hint);
+    if (r == ZE_RESULT_SUCCESS) return;
+    if (g_sched.requested) {
+        // The destructor does not run for a throwing constructor.
+        zeKernelDestroy(kernel_);
+        kernel_ = nullptr;
+        throw std::runtime_error("zeKernelSchedulingHintExp(" + name + ") failed: " +
+                                 ze_result_string(r) + " (GB_SCHED=" + g_sched.name + ")");
     }
+    // Default policy: keep going on the driver's arbitration, but say so
+    // (once) and report it in the run output.
+    if (!g_sched.failed)
+        std::fprintf(stderr, "warning: EU scheduling hint %s rejected for %s (%s); "
+                     "using the driver default (set GB_SCHED=off to silence)\n",
+                     g_sched.name, name.c_str(), ze_result_string(r).c_str());
+    g_sched.failed = true;
 }
 
 Kernel::~Kernel() {
@@ -213,6 +262,11 @@ void Kernel::set_local_arg(uint32_t index, size_t size) {
 }
 
 bool g_unordered = false;
+SchedPolicy g_sched;
+
+const char* sched_policy_name() {
+    return g_sched.failed ? "driver(hint-failed)" : g_sched.name;
+}
 
 void Kernel::launch(ze_command_list_handle_t list, uint32_t gx,
                     ze_event_handle_t event) {

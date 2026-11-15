@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "l0_context.hpp"
 #include "verifier.hpp"
 #include "sparse_run.hpp"
 
@@ -105,6 +106,7 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
     std::printf("  \"segment\": %llu,\n", (unsigned long long)segment);
     std::printf("  \"split\": %u,\n", split);
     if (s.split_used) std::printf("  \"split_used\": %u,\n", s.split_used);
+    std::printf("  \"sched\": \"%s\",\n", gb::sched_policy_name());
     std::printf("  \"spv\": \"%s\",\n", json_escape(spv.c_str()).c_str());
     std::printf("  \"segments\": %llu,\n", (unsigned long long)s.segments);
     std::printf("  \"leftovers\": %llu,\n", (unsigned long long)s.leftovers);
@@ -177,7 +179,7 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         "tiles=%llu large_items=%llu "
         "ridge_min=%u ridge_found=%llu ridge_dropped=%llu ridge_max=%llu "
         "stats=%d stats_tail=%llu stats_sampled=%llu stats_pmax=%llu primes=%llu twins=%llu "
-        "split_used=%u\n",
+        "split_used=%u sched=%s\n",
         gb::VERSION,
         (unsigned long long)s.limit, (unsigned long long)s.start,
         (unsigned long long)segment, split,
@@ -192,7 +194,7 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         (unsigned long long)(s.ridge_top.empty() ? 0 : s.ridge_top.front().p),
         s.stats_on ? 1 : 0, (unsigned long long)s.stats_tail, (unsigned long long)s.stats_sampled,
         (unsigned long long)s.stats_pmax, (unsigned long long)s.stats_primes,
-        (unsigned long long)s.stats_twins, s.split_used);
+        (unsigned long long)s.stats_twins, s.split_used, gb::sched_policy_name());
 }
 
 /// Prints the per-segment table (header + one row per s.per_segment entry).
@@ -358,6 +360,7 @@ int main(int argc, char** argv) {
                 "    sync/other   : %.3f s\n"
                 "  total          : %.3f s\n"
                 "  evens/second   : %.3g\n"
+                "  EU arbitration : %s\n"
                 "  result         : PASS\n",
                 gb::VERSION, sparse ? " (sparse)" : "",
                 (unsigned long long)s.limit,
@@ -368,7 +371,7 @@ int main(int argc, char** argv) {
                 s.sieve_seconds, s.large_seconds, s.verify_seconds,
                 s.offset_seconds, s.sync_seconds,
                 s.total_seconds,
-                s.evens_per_second);
+                s.evens_per_second, gb::sched_policy_name());
         }
         if (s.stats_on && !csv && !json)
             std::printf("\nGoldbach statistics (exact; log %s, state %s)\n"

@@ -113,12 +113,29 @@ uint32_t env_grid(const char* name, uint32_t dflt);
 /// unless GB_UNORDERED=0); Kernel::launch then appends a barrier first.
 extern bool g_unordered;
 
+/// EU thread-arbitration hint every Kernel gets (GB_SCHED), set by each
+/// Context before any kernel is created.
+struct SchedPolicy {
+    uint32_t    flag = 0;            ///< ZE_SCHEDULING_HINT_EXP_FLAG_*, 0 = none (driver default)
+    const char* name = "driver";     ///< policy in force, for the run output
+    bool requested = false;          ///< GB_SCHED set: a failed hint is an error
+    bool failed = false;             ///< the default hint was rejected by a kernel
+};
+extern SchedPolicy g_sched;
+
+/// The arbitration policy in force for the run output (sched=): round-robin,
+/// oldest-first, stall-based, driver, driver(hint-unsupported) or
+/// driver(hint-failed).
+const char* sched_policy_name();
+
 /// One compiled kernel inside a Module. Non-copyable.
 class Kernel {
 public:
     /// @param mod   module containing the kernel; must outlive the Kernel.
     /// @param name  kernel entry-point name.
-    /// @throws std::runtime_error if the module has no such kernel.
+    /// @post  the kernel carries the g_sched arbitration hint (if any).
+    /// @throws std::runtime_error if the module has no such kernel, or the
+    ///         hint GB_SCHED asked for is rejected (the kernel is destroyed).
     Kernel(const Module& mod, const std::string& name);
     ~Kernel();
     Kernel(const Kernel&)            = delete;

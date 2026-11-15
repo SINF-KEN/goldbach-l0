@@ -771,9 +771,21 @@ RunStats run_gpu(uint64_t limit,
     // sampled segments (count30's exact count / tail / maximum everywhere).
     const bool gaps_exact = gaps_on && !(gaps_env && std::string(gaps_env) == "sampled");
     // count30 grid on walked segments (work-groups striding over the segment;
-    // GB_GAPS_GROUPS tunes it)
+    // GB_GAPS_GROUPS tunes it). The default keeps the B580-tuned share of the
+    // device: GAPS30_GROUPS per GAPS30_REF_EUS EUs, scaled by this device's
+    // EU count (the walk / phase-A overlap optimum moves with it).
+    uint32_t gaps_default = GAPS30_GROUPS;
+    {
+        ze_device_properties_t dp{};
+        dp.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+        if (zeDeviceGetProperties(ctx.device(), &dp) == ZE_RESULT_SUCCESS) {
+            const uint64_t eus = uint64_t(dp.numSlices) * dp.numSubslicesPerSlice * dp.numEUsPerSubslice;
+            if (eus) gaps_default = uint32_t(std::clamp<uint64_t>(
+                (uint64_t(GAPS30_GROUPS) * eus + GAPS30_REF_EUS / 2) / GAPS30_REF_EUS, 1, GAPS30_GROUPS_MAX));
+        }
+    }
     const uint32_t gaps_groups = std::clamp<uint32_t>(std::getenv("GB_GAPS_GROUPS")
-        ? uint32_t(std::strtoul(std::getenv("GB_GAPS_GROUPS"), nullptr, 0)) : GAPS30_GROUPS, 1u, GAPS30_GROUPS_MAX);
+        ? uint32_t(std::strtoul(std::getenv("GB_GAPS_GROUPS"), nullptr, 0)) : gaps_default, 1u, GAPS30_GROUPS_MAX);
     uint32_t stats_k = STATS_K_DEFAULT;
     if (const char* e = std::getenv("GB_STATS_K")) stats_k = uint32_t(std::strtoul(e, nullptr, 0));
     StatsPlan splan;
