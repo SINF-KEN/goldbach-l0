@@ -124,8 +124,7 @@ struct SchedPolicy {
 extern SchedPolicy g_sched;
 
 /// The arbitration policy in force for the run output (sched=): round-robin,
-/// oldest-first, stall-based, driver, driver(hint-unsupported) or
-/// driver(hint-failed).
+/// oldest-first, stall-based, driver or driver(hint-failed).
 const char* sched_policy_name();
 
 /// One compiled kernel inside a Module. Non-copyable.

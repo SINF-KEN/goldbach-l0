@@ -45,12 +45,15 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 // over the Xe2 default (stall-based round-robin), oldest-first -0.6%; mixing
 // policies between the kernels of a segment loses (2026-11-15,
 // PROJECT-REFERENCE 9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
-// 2 stall-based, off = the driver's default. Parsed and checked against the
-// device's supported hints once per Context, before any kernel exists. A
-// policy GB_SCHED asked for must be supported (else an error); the default
-// falls back to the driver's arbitration with a warning. The policy in force
-// is reported by sched_policy_name() (run output: sched=).
-static void sched_setup(ze_device_handle_t dev) {
+// 2 stall-based, off = the driver's default. Parsed once per Context, before
+// any kernel exists. Support is decided by zeKernelSchedulingHintExp itself
+// (Kernel::Kernel), NOT by ze_scheduling_hint_exp_properties_t: the B580
+// driver (26.40) reports no supported hint flags there although it accepts
+// and applies round-robin (+0.6%; gating on the query cost exactly that,
+// 2026-11-15). A policy GB_SCHED asked for must be accepted (else an error);
+// the default falls back to the driver's arbitration with a warning. The
+// policy in force is reported by sched_policy_name() (run output: sched=).
+static void sched_setup() {
     const char* se = std::getenv("GB_SCHED");
     const std::string sv = se ? se : "1";
     SchedPolicy p;
@@ -65,23 +68,6 @@ static void sched_setup(ze_device_handle_t dev) {
     else if (sv == "2") { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_STALL_BASED_ROUND_ROBIN; p.name = "stall-based"; }
     else throw std::runtime_error("GB_SCHED='" + sv + "': must be 0, 1, 2 or off");
 
-    ze_scheduling_hint_exp_properties_t hp{};
-    hp.stype = ZE_STRUCTURE_TYPE_SCHEDULING_HINT_EXP_PROPERTIES;
-    ze_device_module_properties_t mp{};
-    mp.stype = ZE_STRUCTURE_TYPE_DEVICE_MODULE_PROPERTIES;
-    mp.pNext = &hp;
-    const ze_result_t r = zeDeviceGetModuleProperties(dev, &mp);
-    if (r != ZE_RESULT_SUCCESS || !(hp.schedulingHintFlags & p.flag)) {
-        const std::string why = r != ZE_RESULT_SUCCESS
-            ? "scheduling-hint query failed: " + ze_result_string(r)
-            : std::string("device does not support the ") + p.name + " scheduling hint";
-        if (p.requested)
-            throw std::runtime_error("GB_SCHED=" + sv + ": " + why);
-        std::fprintf(stderr, "warning: %s; using the driver's default EU arbitration "
-                     "(set GB_SCHED=off to silence)\n", why.c_str());
-        p.flag = 0;
-        p.name = "driver(hint-unsupported)";
-    }
     g_sched = p;
 }
 
@@ -114,7 +100,7 @@ Context::Context(bool unordered) {
     }
     if (!device_) throw std::runtime_error("no GPU device found");
 
-    sched_setup(device_);
+    sched_setup();
 
     ze_context_desc_t cdesc{};
     cdesc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;

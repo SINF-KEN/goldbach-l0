@@ -226,7 +226,7 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |
 | `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, max 128, list buffer < 4 GiB) (§9.2t); GB_BUCKET_VERIFY checks either path |
 | `GB_HL_FUSE=0` | hit-list apply as its own launch (hl_apply) instead of fused into the packed kernel (§9.2u) |
-| `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy the device lacks is an error; an unsupported default warns and runs on the driver default. Reported as `sched=` (§9.2w) |
+| `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` (§9.2w) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest (§9.2v) |
 | `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32) |
@@ -1473,13 +1473,16 @@ check 143):
   sieves round-robin: large 435 -> 445 ms; -0.4..-2.1% for four mixes), so
   one policy for all. The NEO debug key OverrideThreadArbitrationPolicy
   gives the same numbers; the API needs no debug key. GB_SCHED is parsed
-  once per Context and checked against the device's supported hints
-  (`ze_scheduling_hint_exp_properties_t`): a policy GB_SCHED asks for must
-  be supported (else an error, with no kernel handle leaked); the default
-  falls back to the driver's arbitration with a warning. The policy in
-  force is in the run output (`sched=` in --csv, `"sched"` in --json,
-  "EU arbitration" in the text summary): round-robin, oldest-first,
-  stall-based, driver, driver(hint-unsupported) or driver(hint-failed).
+  once per Context; each kernel's `zeKernelSchedulingHintExp` decides
+  support. Do not gate on `ze_scheduling_hint_exp_properties_t`: the B580
+  driver (26.40) reports no supported flags there yet applies round-robin;
+  a review fix that gated on it silently dropped the hint (CI 8aff77f:
+  sched=driver(hint-unsupported), check +9.6 ms, -0.53%). A policy GB_SCHED
+  asks for must be accepted (else an error, with no kernel handle leaked);
+  the default falls back to the driver's arbitration with a warning. The
+  policy in force is in the run output (`sched=` in --csv, `"sched"` in
+  --json, "EU arbitration" in the text summary): round-robin,
+  oldest-first, stall-based, driver or driver(hint-failed).
 Final (bench.py, 10 paired rounds, before the grid change): long 66.19 ->
 69.85 G evens/s (+5.53%, CI +-0.05%), long-end 65.64 -> 69.16 (+5.37%,
 +-0.03%); with the 64-group grid +6.0% on long. A full production slice
