@@ -29,7 +29,6 @@ typedef ushort u16;
 #define WPT (TILE_WORDS / WG_SIZE)          // 8 u64 words per thread
 #define BITS_PER_THREAD (WPT * 64u)
 #define MAX_GROUPS 8u
-#define NONE32 0xFFFFFFFFu
 
 __constant u32 SCM_RES[SCM_K] = {SCM_RES_LIST};
 
@@ -67,7 +66,7 @@ inline u32 mod32(const u32 x, const u32 p)
 /// @param T         valid bits per class array; bits >= T are written as 0.
 /// @param primes    base primes; [j_own0, split) are walked here.
 /// @param fbt       [k * split + j] first hit of prime j in class k, segment-
-///                  local, in [0, p) (NONE32 for primes dividing M).
+///                  local, in [0, p) (0xFFFFFFFF for primes dividing M).
 /// @param j_own0,own_end,split  stage boundaries (see above).
 /// @param gmask,gdesc,n_groups,gy  mask-group tables (host make_groups_scm /
 ///                  scm_group_offsets); n_groups <= MAX_GROUPS.
@@ -261,9 +260,7 @@ inline u32 mod_big(const u64 x, const u32 p)
     return (u32)r;
 }
 
-#ifndef LARGE_PACK_SG
 #define LARGE_PACK_SG 32
-#endif
 #ifndef LARGE_PACK_PPI
 #define LARGE_PACK_PPI 16
 #endif
@@ -368,9 +365,7 @@ __kernel void scm_large(
 // ---------------------------------------------------------------------------
 // Checker (mod-2310 form of check30_a / check30_b; include/sparse.hpp).
 // ---------------------------------------------------------------------------
-#ifndef SCM_MAXD
 #define SCM_MAXD 4               // largest pattern shift (host-checked)
-#endif
 /// @return S[w] when 0 <= w < n, else 0 (negative w wraps out of range).
 inline u32 ld_guard(const __global u32* S, const int w, const u32 n)
 {
@@ -386,9 +381,7 @@ inline u32 ld_guard(const __global u32* S, const int w, const u32 n)
 #ifndef A3_SPAN
 #define A3_SPAN 12
 #endif
-#ifndef A3_WPL
 #define A3_WPL 32u                                 // u32 words (32 evens each) per lane: 28 -> 32 -6% phase A; 36, 40 slower
-#endif
 #define A3_TOT (A3_WPL + A3_SPAN + 1 + 3)             // window + 3 words below (pattern OR)
 /// Funnel shift left of the 64-bit pair (a:b) by d.
 /// @pre    1 <= d <= 31 (a shift by 32 wraps to 0 on Xe).

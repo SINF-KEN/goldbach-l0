@@ -128,7 +128,6 @@ Validators depend on the `kernels` target.
 | `MAX_GB_PRIME` | 9781 | largest candidate prime needed (published 4e18 verification); ~1,206 primes, u16 (2.4 KB) |
 | `LARGE_PACK_PPI` / `LARGE_PACK_GROUP` | 4 / 128 | sieve_large_packed: primes per work-item / per packing group (host); MUST match LARGE_PACK_PPI / LARGE_PACK_SG in goldbach.cl |
 | `LARGE_WG_SIZE` | 64 | large-kernel work-group size |
-| `CHECK_PHASE_A_CANDS` | 160 | two-phase checker: candidates handled word-level by check_phase_a before leftovers go to check_phase_b (`GB_CHECK_CAP` overrides; 144-160 flat, 128 -0.3 ms, 192 +1 ms) |
 | `CHECK_PHASE_B_GROUPS` | 640 | check_phase_b grid-stride work-groups (`GB_CHECK_BGROUPS` overrides) |
 | `MED_MIN_P` / `MED_MIN_P_CLASS` | 256 / 512 | tile-kernel primes >= this (and < split) use the prime-parallel SLM-atomic stage 3m (dense map / class map); `GB_MED_P=N` overrides |
 | `CHECK30_PLAN` (include/check30.hpp) | 15 classes x 3-4 segments | mod-30 checker (production since v1.13.0, §9.2j): per n mod 30 the (candidate class s, pattern mask, funnels) segments of phase A; `GB_C30_PLAN` overrides, `GB_C30=0` = the v1.12.0 merge30 + class-split checker |
@@ -149,12 +148,23 @@ OWN_F32, LARGE_GAPS_CC, BKT_ST_CC, BKT_LD_CC, W32_PREFETCH, W32_EXIT_EVERY,
 C30_UDIV, C30_ROT, SPLIT_EXIT, A_SIMD, the WHEEL_W 30 / 210 / 2310 tables, the
 A_W64 8 / 10 / 14 / 16 windows, and the timing-only ablations (ABL_*,
 LARGE_NOMARK; sparse.cl ABLL_* / ABL3_* / ABL_NOPEND). The host's GB_WHEEL_W
-and GB_BUCKET_WHEEL (usable only with such a rebuilt module) went with them.
+and GB_BUCKET_WHEEL (usable only with such a rebuilt module) went with them,
+as did the run-time switches that only restored a superseded path or served
+one measurement: GB_TWIN=0 (plain v1.9.0 checker; CHECK_PHASE_A_CANDS /
+GB_CHECK_CAP with it), GB_HL_FUSE=0, GB_UPLOAD_STAGED, GB_BUCKET_RESET_BARRIER,
+GB_WRITE_CHECKED and GB_CHECK_NCAND. Host-mirrored kernel constants without a
+host override (WG_SIZE, WORDS_PER_ITEM, LARGE_PRIMES_PER_ITEM, MASK_MAX_P,
+SPLIT_MAXD, C30_MAXD, X_KMAX, C30_CW, XS_W*, HL_MAX_K, BKT_E, LARGE_PACK_SG,
+sparse.cl SCM_MAXD / A3_WPL) are plain #defines: a -D on the kernel alone
+could only desync it from the host. G30_COLS (count30 lane columns) is folded
+on, and the dead helpers mark_multiples_w30 / bkt_div32 are gone.
 The sections below still name them as history; the git history has the code.
-Proof of no change: the optimized LLVM IR (clang -x cl -target spir64 -O2) of
-all three modules is byte-identical before and after. The numeric tunables
-(TILE_WORDS, WG_SIZE, LARGE_PACK_PPI, MED_BATCH, TABLE_BATCH, PROBE_BATCH,
-BKT_E, XS_W*, G30_SIMD / G30_COLS, ...) stay overridable with ocloc -D.
+Proof of no kernel change: the -O0 and -O2 LLVM IR (clang -x cl -target
+spir64) of all three modules is byte-identical before and after. The numeric tunables
+that stay overridable with ocloc -D (experiment arms) are TILE_WORDS and
+LARGE_PACK_PPI (each with its host GB_ override) and the kernel-only
+TABLE_BATCH, TILE_WHEEL_MAXP, MED_BATCH, PROBE_BATCH, G30_SIMD (sparse.cl:
+SCM_M / SCM_K / SCM_RES_LIST / A3_SPAN select its module variant).
 
 Device assumptions in config.hpp header comment: 20 Xe-cores, 160 vector
 engines, 128 KB SLM per Xe-core, 256 KB L1, 18 MB shared L3, subgroup
@@ -240,19 +250,15 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid (§9.2b; n >= 1) |
 | `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |
 | `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, max 128, list buffer < 4 GiB) (§9.2t); GB_BUCKET_VERIFY checks either path |
-| `GB_HL_FUSE=0` | hit-list apply as its own launch (hl_apply) instead of fused into the packed kernel (§9.2u) |
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` (§9.2w) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest (§9.2v) |
 | `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
-| `GB_CHECK_CAP=K` | phase-A candidate count of the two-phase checker (default 160) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
 | `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default: mod-30 class map + merge30) |
 | `GB_SPLIT_CAP=K` / `GB_SPLIT_STAGES=S` | class-split checker funnels per list / stage masks ("7/3", "3", "7:20/3" = at most 20 triplet funnels) |
-| `GB_WRITE_CHECKED=1` | class-split checker: also write checked[] (validation output; off in production, ~1%) |
-| `GB_CHECK_NCAND=K` | measurement only: GPU sees only the first K candidates, the CPU fallback settles the rest (leftover count = evens unresolved after K) |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
 | `ZET_ENABLE_METRICS=1` | driver-side metrics enablement (+ `sysctl dev.xe.observation_paranoid=0`, Metrics Library; see §14) |
 

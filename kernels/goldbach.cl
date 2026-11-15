@@ -26,9 +26,7 @@
 // Tunables: overridable via `ocloc ... -options "-DNAME=value"` for
 // systematic benchmarking. Defaults = measured optimum on B580 @ 1e10
 // (see experiment log at the bottom of this file).
-#ifndef WG_SIZE
 #define WG_SIZE           256
-#endif
 // 2048 words = 16 KB SLM per tile (v1.8.1). With the prime-parallel medium
 // stage, more resident work-groups beat fewer per-tile setups: sieve_s per
 // 2e10 window 0.109 (64 KB) -> 0.100 (32 KB) -> 0.087 (16 KB); 8 KB and
@@ -44,21 +42,15 @@
 // low half = u32 append count (atomic), then RIDGE_CAP pairs
 // (even n, smallest witness p). MUST match gb::RIDGE_CAP (include/config.hpp).
 #define RIDGE_CAP         65536
-#ifndef WORDS_PER_ITEM
 #define WORDS_PER_ITEM    4
-#endif
-#ifndef LARGE_PRIMES_PER_ITEM
 #define LARGE_PRIMES_PER_ITEM 4
-#endif
 // Small-prime mask sieve: primes < MASK_MAX_P are applied as whole-word ANDs
 // from a precomputed host table (mask[p][phase]) instead of per-bit RMWs.
 // 0 disables the path (falls back to the scalar loop for ALL primes).
 // Primes below this bound use the mask table. 64 -> 17 odd primes
 // (3..61; 2 is not in the list), 17*64 = 1088 mask words of 8 B =
 // 8.5 KB device memory. Tunable.
-#ifndef MASK_MAX_P
 #define MASK_MAX_P        64
-#endif
 // Primes per load batch in the per-tile-table path. The prime walk is
 // latency-bound on its broadcast loads (table entry, prime, magic); the batch
 // feeds a two-stage software pipeline (two live batches), so 16 independent
@@ -411,42 +403,10 @@ __constant uchar W30_INV[30] = {
     0, 11, 0, 7, 0, 0, 0, 23, 0, 19,
     0, 0,  0, 17, 0, 0, 0, 0, 0, 29 };
 
-// Marks the multiples p*m, m coprime to 30, from bit0 (= multiplier m0,
-// the first odd multiple: first = m0*p) up to q_odds. qf30 = q_first mod 30.
-// Requires 5 < p < 2^30 (steps <= 3p < 2^32); callers fall back otherwise.
-/// @param bit0  map bit of the first odd multiple first = m0 p.
-/// @param qf30  q_first mod 30.
-/// @pre    5 < p < 2^30; the small-prime stage clears every multiple of 3, 5.
-/// @post   bits of p m, m coprime to 30, from bit0 up to q_odds are cleared.
-inline void mark_multiples_w30(volatile __global u64* prime_map, const u64 bit0,
-                               const u32 p, const u64 q_odds, const u32 qf30, const cmap g)
-{
-    volatile __global u32* m32 = (volatile __global u32*)prime_map;
-    const u32 n = (u32)q_odds;
-    u32 bit = (u32)bit0;
-    if (bit >= n) return;
-    // first = q_first + 2*bit  =>  first mod 30 = qf30 + 2*(bit mod 15)
-    u32 m = (qf30 + 2u * (bit % 15u)) % 30u;          // first mod 30
-    m = (m * W30_INV[p % 30u]) % 30u;                 // m0 mod 30 (m0 odd)
-    while (W30_IDX[m] == 0xFFu) {                     // <= 2 steps to a coprime m
-        if (n - bit <= p) return;
-        bit += p;
-        m += 2u; if (m >= 30u) m -= 30u;
-    }
-    u32 w = W30_IDX[m];
-    for (;;) {
-        map_clear(m32, bit, g);
-        const u32 step = p * ((W30_STEPS >> (4u * w)) & 0xFu);
-        if (n - bit <= step) break;
-        bit += step;
-        w = (w + 1u) & 7u;
-    }
-}
-
-
-// Wheel-30 marks in an SLM tile (see mark_multiples_w30): clears p*m for m
-// coprime to 30 from tile-local bit `bit` (global bit gbit = tile_bit0 +
-// bit, the first odd multiple) up to `end`, with SLM atomics.
+// Wheel-30 marks in an SLM tile: clears p*m for m coprime to 30 (the odd
+// multipliers step 6,4,2,4,2,4,6,2: W30_STEPS) from tile-local bit `bit`
+// (global bit gbit = tile_bit0 + bit, the first odd multiple) up to `end`,
+// with SLM atomics.
 /// @param bit   tile-local bit of the first odd multiple.
 /// @param gbit  its segment-global bit (for the residue); qf30 = q_first mod 30.
 /// @pre    5 < p < 2^30; concurrent callers (SLM atomics).
@@ -481,8 +441,8 @@ inline void mark_local_w30(volatile __local u32* t32, u32 bit, const u32 end,
 __constant uint CP15015[470] = { 0xA08B0116u, 0x6C20CA65u, 0x524C9699u, 0x94522CA2u, 0x61B44B49u, 0x912C30D8u, 0x845844A6u, 0x4912932Cu, 0x1A65B0C3u, 0x36894532u, 0x2D025948u, 0xC92186D2u, 0x121264B4u, 0x48B29168u, 0xC10DA652u, 0x30C92984u, 0x6502DA05u, 0x0B4C3499u, 0x92932D06u, 0x05B44A61u, 0x196930CAu, 0xA6590826u, 0x6894D324u, 0x52618489u, 0xB4184D32u, 0x29A60B04u, 0xCB2916C0u, 0x30CA6504u, 0x4494992Cu, 0x5209A253u, 0xA4C34892u, 0x2D22D861u, 0x5B44A291u, 0x961320A4u, 0x2530C369u, 0x884D125Au, 0x24590896u, 0x6186432Du, 0x9264B48Bu, 0xA2914D12u, 0x0DA25A4Cu, 0x816196C1u, 0x22CA2434u, 0x4C941961u, 0xD32D841Au, 0x944A6990u, 0x6832CA41u, 0x190C3681u, 0x90D325A6u, 0x65908B48u, 0x086D2292u, 0x86434C36u, 0x2916D028u, 0x5A65A44Bu, 0x96992830u, 0x2D82524Cu, 0xCB490650u, 0x329841B0u, 0x44A69925u, 0x932C204Bu, 0xB0C06986u, 0x4C305225u, 0x5948B609u, 0x84D32C26u, 0x64A4C921u, 0x914D129Au, 0xA60A4432u, 0x6116830Du, 0xDA0514C9u, 0xA4992522u, 0x2986194Cu, 0x426892D3u, 0x224841B4u, 0x0C309969u, 0x9225A65Bu, 0x148B6894u, 0x6D12C265u, 0x4B04B618u, 0x125109A4u, 0x64A4CB29u, 0x916C30D0u, 0xA2534C86u, 0x41965209u, 0xC821B48Bu, 0x86982D32u, 0x2C245A44u, 0x03699483u, 0x325A61B0u, 0x48B2814Cu, 0xD12D2659u, 0xB4C34182u, 0x69129A64u, 0x5A4C3201u, 0x96C20D84u, 0x2514C829u, 0x8961225Au, 0x86134CB4u, 0x4982D125u, 0xCA45B04Au, 0x36996122u, 0x2426430Cu, 0x0A6894D3u, 0x30D22594u, 0x48B6182Du, 0xD128864Au, 0xA4C92916u, 0x44309A65u, 0x13449699u, 0x06422DA2u, 0x6194C949u, 0x992C32D0u, 0xA45B40A4u, 0x28949328u, 0x5865B0C3u, 0x32894D02u, 0x25264948u, 0xCB618693u, 0x129A4434u, 0x0CA2906Du, 0x430DA458u, 0x34C96896u, 0x65225220u, 0x1B0CA499u, 0x92D20D82u, 0x45340A61u, 0x996932CAu, 0xA65A0416u, 0x6890D305u, 0xD061840Bu, 0xB6106C32u, 0x29A6494Cu, 0xCB091251u, 0x309A25A4u, 0x4C16886Cu, 0x422D0253u, 0xB48B0996u, 0x09325861u, 0x5344A299u, 0x86912CA4u, 0x44B0C369u, 0x0941325Au, 0x244948B6u, 0x6186D32Du, 0x9A2494CAu, 0xB2016D10u, 0x04A61A48u, 0xC94996C3u, 0x22DA2520u, 0x44B49945u, 0xC32C8613u, 0x944A6912u, 0x2930CA45u, 0x5A0C3499u, 0x14D32186u, 0x65948368u, 0x18652290u, 0xA24B4CB2u, 0x29069121u, 0xD26524C9u, 0x96986C10u, 0x2DA05308u, 0xCB099452u, 0x12D060B4u, 0x4426992Du, 0x930CA04Bu, 0xB0836196u, 0x4D324A45u, 0x58488689u, 0x84D32D26u, 0x60B44B60u, 0x916C121Au, 0xA6580CB0u, 0x4992C20Du, 0x8A2534C9u, 0x34896522u, 0x0D861B44u, 0x4A2992D2u, 0x324845A4u, 0x0C369169u, 0x5121A653u, 0x908B6884u, 0x6532D205u, 0x4B4C9618u, 0x16C12926u, 0x25A48A29u, 0x194C30DAu, 0xA2534892u, 0x4996502Cu, 0xD860A4C1u, 0xA6190932u, 0x2CA41B44u, 0xC2691683u, 0x325A6590u, 0x48B4890Du, 0xD3212619u, 0xB0C34086u, 0x6D029864u, 0x524CB291u, 0x968304A6u, 0x25344969u, 0x982500DAu, 0x841A0CB4u, 0x6912532Du, 0x8244B44Au, 0x26996132u, 0x05A25B0Cu, 0x896084D3u, 0x32C26594u, 0x4896186Cu, 0xD129A64Au, 0xA44B2914u, 0x6C10DA61u, 0x414C1691u, 0x92122DA2u, 0x41B4CB41u, 0x892D3298u, 0x84594426u, 0x2896922Cu, 0x5A61B0C3u, 0xB4894932u, 0x2D265108u, 0xCB6186D0u, 0x128A4430u, 0x44B29165u, 0xC30D264Au, 0x24C86992u, 0x6520D825u, 0x1B48B411u, 0x92532886u, 0x05A44869u, 0x984932CAu, 0x261B0416u, 0x6814C325u, 0xD265948Bu, 0xB0180D32u, 0x29A64B4Cu, 0xC32816D1u, 0x20D864A4u, 0x4C921968u, 0x1225A053u, 0x14CA4996u, 0x2D12D861u, 0x1B04A688u, 0x961324A4u, 0x64B0C349u, 0x894D2252u, 0x225148A6u, 0x6186D30Cu, 0x8A64B40Bu, 0x92912D10u, 0x0D865A4Cu, 0x496914C3u, 0x229A2134u, 0x4CB49164u, 0xD32D8219u, 0xB4484982u, 0x68328245u, 0x5B083689u, 0x94D22586u, 0x65948B28u, 0x18691252u, 0xA6434C36u, 0x21069129u, 0xDA45A0CBu, 0x86996430u, 0x2D22414Cu, 0xCA489652u, 0x305821B4u, 0x00A4192Du, 0x922CA45Bu, 0x20C16996u, 0x4D324A65u, 0x1940B689u, 0x02C30D26u, 0x6484CB61u, 0x912D1298u, 0xA65A4CB0u, 0x68964309u, 0xD82534C1u, 0x90986522u, 0x25061B4Cu, 0x0A699283u, 0x12CA4534u, 0x0C329849u, 0x5125A45Bu, 0x94836894u, 0x6932D264u, 0x4B4CA618u, 0x16D109A0u, 0x65848A21u, 0x896C30CAu, 0xA2124C96u, 0x49945225u, 0xD861B04Bu, 0xA6912C22u, 0x2CA45144u, 0x43499293u, 0x301A65B0u, 0x4836890Du, 0xD22D0658u, 0xB4CB2106u, 0x61121A64u, 0x524CB291u, 0x86C10DA2u, 0x0530C969u, 0x996422D2u, 0x060B48B4u, 0x2990D32Du, 0xCA05B44Au, 0x36196910u, 0x24A64B08u, 0x89609493u, 0x32D24584u, 0x44A6184Du, 0xC129A609u, 0x84CB2816u, 0x2C305A61u, 0x530C9499u, 0x965229A2u, 0x6134C348u, 0x992D22C8u, 0xA45B44A2u, 0x69929304u, 0x586520C3u, 0xB6804D12u, 0x29245908u, 0xCB618653u, 0x129224B4u, 0x4C82906Du, 0xC30D225Au, 0x34896196u, 0x4522CA25u, 0x1A4C9099u, 0x90D12D86u, 0x40B44269u, 0x116832CAu, 0xA4590C36u, 0x4890D325u, 0x9265948Au, 0x36086D32u, 0x21860B4Cu, 0xCB0916D0u, 0x205A65A0u, 0x4C969968u, 0x502CA253u, 0xB04B4986u, 0x2530D841u, 0x4A44A699u, 0x16932C04u, 0x25B0C269u, 0x0945301Au, 0x225948B6u, 0x6186D32Cu, 0x9264A4C9u, 0xB2914C12u, 0x0DA61A40u, 0xC92914C3u, 0x02DA2514u, 0x4C349925u, 0x9329860Bu, 0xB4426092u, 0x6922C845u, 0x590C2299u, 0x949325A6u, 0x61148B68u, 0x186D1252u, 0xA44B0CB4u, 0x29165029u, 0xC26424CBu, 0x86996C30u, 0x0DA25344u, 0x8B419252u, 0x32C861A4u, 0x4486912Du, 0x1328A45Au, 0xB0436994u, 0x4C325A21u, 0x59489680u, 0x82C32D26u, 0x64B48B41u, 0x814D129Au, 0x865A4C32u, 0x2996C00Du, 0x5A2434C1u, 0xB4196122u, 0x2D84134Cu, 0x4A6982D1u, 0x32CA4590u, 0x0C368961u, 0xD325260Bu, 0x908A4894u, 0x6D20D225u, 0x4348B618u, 0x16D128A6u, 0x65A44929u, 0x990C30DAu, 0x82124496u, 0x4916422Du, 0x986194CBu, 0xA4992532u, 0x28A05B44u, 0xC1688693u, 0x225065B0u, 0x48B2894Cu, 0x93252659u, 0x34CB2184u, 0x6D129A64u, 0x4A0C3290u, 0x96030DA4u, 0x0434C961u, 0x996522D2u, 0x82194CA4u, 0x6092D30Du, 0x4A41B40Au, 0x14996932u, 0x25A65A0Cu, 0x0B6894D2u, 0x32C26114u, 0x44B6106Cu, 0xD109A649u, 0xA4CB0912u, 0x6C309865u, 0x534C1681u, 0x96522982u, 0x21B4CB09u, 0x98293258u, 0x24534486u, 0x6986812Cu, 0x5A45B083u, 0xB2894532u, 0x2D264948u, 0xC26186D1u, 0x109A24B4u, 0x48B21169u, 0xC30CA45Au, 0x04C86996u, 0x4522DA25u, 0x1B44B489u, 0x12C32586u, 0x45904A49u, 0x992922CAu, 0xA6530C34u, 0x6894D320u, 0xD0659403u, 0xB2182D20u, 0x21864A4Cu, 0xCB291691u, 0x109A6524u, 0x0C969864u, 0x522DA053u, 0xB4C94986u, 0x2C32D060u, 0x5B40A699u, 0x94930CA0u, 0x65B08321u, 0x894D124Au, 0x26484816u, 0x6184932Du, 0x9A40B44Bu, 0xA2916C12u, 0x0DA6584Cu, 0xC94892C3u, 0x221A2134u, 0x0C348965u, 0xD22D861Bu, 0x344A2992u, 0x69324A45u, 0x53043699u, 0x80D105A6u, 0x00000068u };
 
 
-// Multiplier wheel WHEEL_W (30030): same contract as
-// mark_multiples_w30 with the step table in constant memory. Requires the
+// Multiplier wheel WHEEL_W (30030) marks of one prime in the global map,
+// the step table in constant memory. Requires the
 // small-prime stage to clear EVERY multiple of each prime dividing WHEEL_W
 // (all are < 64: mask groups) and p > the largest of them.
 /// @param qfw  q_first mod WHEEL_W.
@@ -1219,9 +1179,7 @@ __kernel void sieve_large_primes(
 // Subgroup width of the packed decode and primes per work-item; one packing
 // group = LARGE_PACK_PPI * width primes (MUST match gb::LARGE_PACK_GROUP and
 // gb::LARGE_PACK_PPI on the host).
-#ifndef LARGE_PACK_SG
 #define LARGE_PACK_SG 32        // SIMD32 measured ~5% faster than 16
-#endif
 #ifndef LARGE_PACK_PPI
 #define LARGE_PACK_PPI 16       // primes per work-item (multiple of 4; gap bytes = PPI/4 u32s): 4 -> 8 -> 16 = large_s -2.5% then -1%
 #endif
@@ -1432,9 +1390,7 @@ __kernel void unpack_large_test(__global const u32* restrict bases,
 // counts differing words).
 // ----------------------------------------------------------------------------
 #define BKT_MAX_R 256           // ring size limit (wheel-30030 lookahead up to 11p/delta)
-#ifndef BKT_E
 #define BKT_E 8                 // entries per lane per chunk
-#endif
 #define BKT_ERR_ENTRY     1u    // entry beyond a non-last segment
 #define BKT_ERR_OVERFLOW  2u    // bucket capacity exceeded
 #define BKT_ERR_LOOKAHEAD 4u    // target bucket >= R ahead
@@ -1461,19 +1417,6 @@ inline u32 bkt_first_seg_rel(const u64 x, const u64 q_odds_full, const u64 delta
 {
     return (x < q_odds_full) ? 0u
          : (u32)bkt_div(x - q_odds_full, delta, inv_delta) + 1u;
-}
-
-// 32-bit forms for bucket_process (host guarantees p_max + q_odds_full <
-// 2^32, so off + p and every quotient fit): Xe2 emulates u64 multiply and
-// compare, which dominated the per-entry filing arithmetic.
-/// @pre    d >= 1, inv_d ~ 1/d.
-/// @return floor(x / d).
-inline u32 bkt_div32(const u32 x, const u32 d, const float inv_d)
-{
-    u32 q = (u32)((float)x * inv_d);
-    while (q > 0u && q * d > x) --q;          // q*d <= x < 2^32: no overflow
-    while (x - q * d >= d) ++q;
-    return q;
 }
 
 // Bucket entries are written once and read once, 3..125 segments later:
@@ -2405,9 +2348,7 @@ __kernel void merge30(__global const u32* restrict cmap32, const u32 cw32,
         if (w0 + q < s_words) out[w0 + q] = o[q];
 }
 
-#ifndef SPLIT_MAXD
 #define SPLIT_MAXD 2             // largest pattern shift (units of 6; host-checked)
-#endif
 // Pattern OR of split-map word a (b = the word below it): bit j = OR over
 // d in mask of S bit 32 w + j - d (bit 0 of mask = d 0 is always set).
 /// @pre    bit 0 of mask set; shifts d <= SPLIT_MAXD < 32.
@@ -2674,9 +2615,7 @@ __kernel void check_split_b(
 // funnel is the class-split one on array k. Pattern bit d = candidate p + 30d.
 // meta per class (stride 32): n_seg, (begin | end << 16, s | mask << 8) x n_seg.
 // ----------------------------------------------------------------------------
-#ifndef C30_MAXD
 #define C30_MAXD 4               // largest pattern shift (host-checked)
-#endif
 /// @pre    bit 0 of mask set; shifts d <= C30_MAXD < 32.
 /// @return bit j = OR over d in mask of bit j - d of (a:b).
 inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
@@ -2999,9 +2938,7 @@ __kernel void check30_b(
 // Exact for every even n > MAX_GB_PRIME + 5 (futile-last ordering; the host
 // only enables statistics far above that).
 // ----------------------------------------------------------------------------
-#ifndef X_KMAX
 #define X_KMAX 128               // max K_r (SLM histogram span; host-checked)
-#endif
 #define XB_SPAN 32               // phase-B SLM bins per class (beyond: global)
 
 /// Exact phase B: one lane per pending even, probing the rest of its class
@@ -3132,9 +3069,7 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 ///         primes without a counted predecessor (the segment's first only),
 ///         part[group] = max(g << 32 | ~(upper pos)) of the group's gaps (0:
 ///         none). The map is unchanged. Exactness vs stats_ref: §9.2l.
-#ifndef C30_CW
 #define C30_CW 4                 // words per lane (host: cw32 % C30_CW == 0; 8: slower)
-#endif
 // Exact gap of a gap-tail candidate (count30): the prime that opens block tb
 // (lowest phi class with a bit) and the last counted prime before it (look-back
 // up to 2 * 32 blocks: every gap below 2^64 spans fewer). Appends (upper pos,
@@ -3148,20 +3083,14 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 // Gap walk: the low bins (d < G30_CBINS, ~94% of the gaps) are kept once per
 // SIMD lane (+1.4%), so the lanes of one SIMD instruction never queue on the
 // same SLM word. count30 is compiled at G30_SIMD (required sub-group size)
-// and G30_COLS = G30_SIMD: lane l of every sub-group uses column l. Column 0
+// with one column per lane: lane l of every sub-group uses column l. Column 0
 // is the base histogram's own bins 0..G30_CBINS-1; columns 1.. follow it at
-// G30_HBINS and are summed into the base bins at the flush. G30_COLS=0: off.
+// G30_HBINS and are summed into the base bins at the flush.
 #ifndef G30_SIMD
 #define G30_SIMD 16u
 #endif
-#ifndef G30_COLS
-#define G30_COLS G30_SIMD
-#endif
-#if G30_COLS && G30_COLS != G30_SIMD
-#error "G30_COLS must equal G30_SIMD (one column per SIMD lane) or be 0"
-#endif
 #define G30_CBINS 64u
-#define G30_LH (G30_HBINS + (G30_COLS ? G30_COLS - 1u : 0u) * G30_CBINS)
+#define G30_LH (G30_HBINS + (G30_SIMD - 1u) * G30_CBINS)
 inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, __global const u32* restrict lim,
                            const u32 ord, const u32 phis, const u32 pos_lo, const u32 tb,
                            __global u32* restrict gt, const u32 tcap)
@@ -3237,10 +3166,8 @@ __kernel void count30(
     u32 pfirst = ~0u, plast = 0u;             // the lane's first / last counted prime position
     u32 err = 0u, dmax = 0u, dpos = 0u;       // walk: flags, largest gap / 2 and its upper h
     const u32 nlanes = cw32 / C30_CW;
-#if G30_COLS
-    const u32 scol = get_sub_group_local_id();   // < G30_SIMD = G30_COLS: one column per lane
+    const u32 scol = get_sub_group_local_id();   // < G30_SIMD: one column per lane
     const u32 gcol = scol ? G30_HBINS + (scol - 1u) * G30_CBINS : 0u;   // my column of low bins
-#endif
     // grid-stride: walked segments use a fixed grid (one histogram flush per
     // work-group), the others one chunk per lane
     for (u32 lane = get_global_id(0); lane < nlanes; lane += get_global_size(0)) {
@@ -3352,11 +3279,7 @@ __kernel void count30(
                     m &= m - 1u;
                     const u32 d = h - hp;
                     hp = h;
-#if G30_COLS
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
-#else
-                    atomic_inc(&lh[min(d, G30_HBINS - 1u)]);
-#endif
                     if (d > dmax) { dmax = d; dpos = h; }
                 }
             }
@@ -3392,10 +3315,8 @@ __kernel void count30(
     if (walk) {
         for (u32 i = lid; i < G30_HBINS; i += get_local_size(0)) {
             u32 t = lh[i];
-#if G30_COLS
             if (i < G30_CBINS)
-                for (u32 k = 1; k < G30_COLS; ++k) t += lh[G30_HBINS + (k - 1u) * G30_CBINS + i];
-#endif
+                for (u32 k = 1; k < G30_SIMD; ++k) t += lh[G30_HBINS + (k - 1u) * G30_CBINS + i];
             if (t) atomic_add(hist + i, t);
         }
         if (lid == 0) {
@@ -3583,18 +3504,10 @@ __kernel void NAME( \
     xs_body(cmap32, cw32, xall, xtab, xj, xch, pending, pending_count, pending_cap, \
             items_pad, seg_evens, sm30, tb, phik, hist, cls, sh, NA_, W_); \
 }
-#ifndef XS_W8
 #define XS_W8 8
-#endif
-#ifndef XS_W6
 #define XS_W6 9
-#endif
-#ifndef XS_W4
 #define XS_W4 12
-#endif
-#ifndef XS_W3
 #define XS_W3 14
-#endif
 XS_KERNEL(check30_xs8, 8u, XS_W8)
 XS_KERNEL(check30_xs6, 6u, XS_W6)
 XS_KERNEL(check30_xs4, 4u, XS_W4)
@@ -3619,9 +3532,7 @@ XS_KERNEL(check30_xs3, 3u, XS_W3)
 // the bucket: GB_BUCKET_VERIFY checks the result against tile + packed over
 // ALL large primes.
 // ----------------------------------------------------------------------------
-#ifndef HL_MAX_K
 #define HL_MAX_K 128
-#endif
 // q_odds of batch segment j (only the batch's last may be the run's short tail).
 #define HL_QO(j) (((j) == nseg - 1u) ? q_odds_tail : q_odds_full)
 /// Harvests the hits of primes [a, b) for segments [k0, k0 + nseg) of the batch.
