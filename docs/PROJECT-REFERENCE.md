@@ -140,6 +140,22 @@ Validators depend on the `kernels` target.
 | `DEFAULT_SEGMENT_EVEN` | 467,500,000 | default segment span (integer span; 233.75M evens; 425M from v1.12.0 to v2.3.0, §9.2u). Comment block records the measurements. tools/run_range.sh uses 467.5M (GB_RANGE_SEGMENT), bench.py each binary's default |
 | `MAX_LEFTOVERS` | 1,048,576 | compact exception-list cap (2^20) |
 
+Kernel compile-time switches (2026-11-15): the on/off experiment switches of
+goldbach.cl are folded to their production values and removed — EARLY_EXIT,
+WRITE_CHECKED, REPORT_LEFTOVERS, SMALL_PRIME_MASK, FAST_MOD, FF_MOD, FF_I32,
+FF_FIX, FF_BIG, LARGE_FIRST32, LARGE_WHEEL30, TILE_WHEEL30, BUCKET_WHEEL30,
+MARK_ROL, MAPCLR_W, OWN_ATOMIC, OH_F32, LARGE_OH_BM, LARGE_ONEHIT, MED_F32,
+OWN_F32, LARGE_GAPS_CC, BKT_ST_CC, BKT_LD_CC, W32_PREFETCH, W32_EXIT_EVERY,
+C30_UDIV, C30_ROT, SPLIT_EXIT, A_SIMD, the WHEEL_W 30 / 210 / 2310 tables, the
+A_W64 8 / 10 / 14 / 16 windows, and the timing-only ablations (ABL_*,
+LARGE_NOMARK; sparse.cl ABLL_* / ABL3_* / ABL_NOPEND). The host's GB_WHEEL_W
+and GB_BUCKET_WHEEL (usable only with such a rebuilt module) went with them.
+The sections below still name them as history; the git history has the code.
+Proof of no change: the optimized LLVM IR (clang -x cl -target spir64 -O2) of
+all three modules is byte-identical before and after. The numeric tunables
+(TILE_WORDS, WG_SIZE, LARGE_PACK_PPI, MED_BATCH, TABLE_BATCH, PROBE_BATCH,
+BKT_E, XS_W*, G30_SIMD / G30_COLS, ...) stay overridable with ocloc -D.
+
 Device assumptions in config.hpp header comment: 20 Xe-cores, 160 vector
 engines, 128 KB SLM per Xe-core, 256 KB L1, 18 MB shared L3, subgroup
 sizes 16/32, max WG 1024. `--info` confirms on this card: Intel(R) Arc
@@ -220,7 +236,6 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_C30_PLAN=S` | mod-30 checker plan override; a leading `T:` bounds every funnel member below T (the statistics tail bound) |
 | `GB_SPARSE=1` / `GB_SCM_*` | sparse class map: select the path and its knobs (list in §9.2k); `GB_PHASE=1` prints per-segment tile / large / phase A / phase B times and the pending rate, `GB_INIT_TRACE=1` the init breakdown |
 | `GB_PHASE=1` | per-segment host-phase trace to stderr: prep (offsets/table), enqueue (args/l1/l2/l3), wait, collect + raw kernel start/end ticks and sieve->large / large->check gaps. Default off (a few clock reads per segment) |
-| `GB_WHEEL_W=W` | host side of the multiplier wheel (must match the kernel's -DWHEEL_W: 30, 210, 2310) |
 | `GB_BUCKET_VERIFY_DUMP=1` | with GB_BUCKET_VERIFY: on the first mismatch print the differing bits with Miller-Rabin truth |
 | `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid (§9.2b; n >= 1) |
 | `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |

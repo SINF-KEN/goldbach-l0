@@ -81,8 +81,7 @@ inline constexpr uint32_t LARGE_WG_SIZE = 128;
 // Multiplier wheel of the large-prime / bucket marking (v1.9.0; 30030 since
 // v1.10.1): a prime p > 61 only marks p*m for m coprime to WHEEL_W; every
 // other multiple is divisible by a prime <= 13 and cleared by the small-prime
-// mask stage. MUST match WHEEL_W in kernels/goldbach.cl (GB_WHEEL_W overrides
-// the host).
+// mask stage. MUST match WHEEL_W in kernels/goldbach.cl (30030 only).
 inline constexpr uint64_t WHEEL_W = 30030;
 // bucket_process grid-stride work-groups (GB_BUCKET_GROUPS overrides).
 inline constexpr uint32_t BUCKET_GROUPS = 1024;

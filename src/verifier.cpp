@@ -1049,16 +1049,12 @@ RunStats run_gpu(uint64_t limit,
     const uint64_t q_first0 = g_first.q_first;
     const bool bucket_env_off = std::getenv("GB_BUCKET") && std::string(std::getenv("GB_BUCKET")) == "0";
     uint32_t bucket_begin = sieve_count;   // B: first bucketed prime index
-    const bool bucket_wheel = !(std::getenv("GB_BUCKET_WHEEL") &&
-                                std::string(std::getenv("GB_BUCKET_WHEEL")) == "0");
-    // Multiplier wheel of the bucket kernel: MUST match WHEEL_W in the kernel
-    // (GB_WHEEL_W overrides for experiments). Max step (in p) and kept
-    // fraction of odd multipliers per wheel.
-    uint64_t wheel_w = WHEEL_W;
-    if (const char* e = std::getenv("GB_WHEEL_W")) wheel_w = std::strtoull(e, nullptr, 0);
-    const uint64_t wheel_max_step = wheel_w == 30030 ? 11 : wheel_w == 2310 ? 7 : wheel_w == 210 ? 5 : 3;
-    const double wheel_keep = wheel_w == 30030 ? 5760.0 / 15015 : wheel_w == 2310 ? 480.0 / 1155
-                            : wheel_w == 210 ? 48.0 / 105 : 8.0 / 15;
+    // Multiplier wheel of the bucket kernel (WHEEL_W = 30030, the only wheel
+    // the kernel module has): max step (in p) and kept fraction of odd
+    // multipliers.
+    static_assert(WHEEL_W == 30030, "kernels/goldbach.cl only has the 30030 wheel tables");
+    constexpr uint64_t wheel_max_step = 11;
+    constexpr double wheel_keep = 5760.0 / 15015;
     uint32_t bucket_R = 0;
     uint32_t bucket_cap = 0;
     double bucket_lam = 0.0;   // expected bucketed hits per segment
@@ -1080,9 +1076,8 @@ RunStats run_gpu(uint64_t limit,
                                                  uint32_t(std::min<uint64_t>(minp, UINT32_MAX))) -
                                 sieve_primes);
         const uint64_t pmax = sieve_primes[sieve_count - 1];
-        // Farthest next hit: the wheel step is up to wheel_max_step * p (kernel
-        // BUCKET_WHEEL30; GB_BUCKET_WHEEL=0 must match a kernel built without).
-        const uint64_t x = q_odds_full - 1 + (bucket_wheel ? wheel_max_step : 1) * pmax;
+        // Farthest next hit: the wheel step is up to wheel_max_step * p.
+        const uint64_t x = q_odds_full - 1 + wheel_max_step * pmax;
         const uint64_t max_rel = (x < q_odds_full) ? 0 : (x - q_odds_full) / delta + 1;
         bucket_R = uint32_t(max_rel + 2);
         // bucket_process does its filing arithmetic in 32 bits: needs
@@ -1104,7 +1099,7 @@ RunStats run_gpu(uint64_t limit,
         const double lambda = double(q_odds_full) *
             std::max(0.0, std::log(std::log(hi)) - std::log(std::log(lo))) + 1.0;
         // with the wheel only multipliers coprime to 30 are hits: 8/15
-        const double lam = bucket_wheel ? lambda * wheel_keep : lambda;
+        const double lam = lambda * wheel_keep;
         bucket_lam = lam;
         bucket_cap = uint32_t(lam * 1.10 + 8.0 * std::sqrt(lam) + 65536.0);
         // Round the bucket stride to 64 entries (512 B): bucket_process reads
@@ -1940,7 +1935,7 @@ RunStats run_gpu(uint64_t limit,
             k_bproc->set_arg(9, sizeof(inv_delta), &inv_delta);
             k_bproc->set_arg(10, sizeof(is_last), &is_last);
             k_bproc->set_arg(11, sizeof(bkt_err), &bkt_err);
-            const uint32_t qfw = uint32_t(q_first % wheel_w);
+            const uint32_t qfw = uint32_t(q_first % WHEEL_W);
             k_bproc->set_arg(12, sizeof(qfw), &qfw);
             k_bproc->set_arg(13, sizeof(d_bkt_entries1), &d_bkt_entries1);
             k_bproc->set_arg(14, sizeof(bkt_split), &bkt_split);
