@@ -172,6 +172,26 @@ Kernel::Kernel(const Module& mod, const std::string& name) {
     desc.stype       = ZE_STRUCTURE_TYPE_KERNEL_DESC;
     desc.pKernelName = name.c_str();
     ZE_CHECK(zeKernelCreate(mod.handle(), &desc, &kernel_));
+    // EU thread arbitration: round-robin measured +0.6% over the Xe2 default
+    // (stall-based round-robin), oldest-first -0.6%; mixing policies between
+    // the kernels of a segment loses (2026-11-15, PROJECT-REFERENCE 9.2w).
+    // GB_SCHED=0 oldest-first, 1 round-robin (default), 2 stall-based, off =
+    // the driver's default. A driver without the hint keeps its default,
+    // unless GB_SCHED asked for a policy (then it is an error).
+    const char* se = std::getenv("GB_SCHED");
+    const std::string sv = se ? se : "1";
+    if (sv != "off") {
+        if (sv != "0" && sv != "1" && sv != "2")
+            throw std::runtime_error("GB_SCHED must be 0, 1, 2 or off");
+        ze_scheduling_hint_exp_desc_t hint{};
+        hint.stype = ZE_STRUCTURE_TYPE_SCHEDULING_HINT_EXP_DESC;
+        hint.flags = sv == "0" ? ZE_SCHEDULING_HINT_EXP_FLAG_OLDEST_FIRST
+                   : sv == "1" ? ZE_SCHEDULING_HINT_EXP_FLAG_ROUND_ROBIN
+                               : ZE_SCHEDULING_HINT_EXP_FLAG_STALL_BASED_ROUND_ROBIN;
+        const ze_result_t r = zeKernelSchedulingHintExp(kernel_, &hint);
+        if (r != ZE_RESULT_SUCCESS && se)
+            throw std::runtime_error("zeKernelSchedulingHintExp(" + name + ") failed: " + std::to_string(int(r)));
+    }
 }
 
 Kernel::~Kernel() {
