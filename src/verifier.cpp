@@ -811,9 +811,16 @@ RunStats run_gpu(uint64_t limit,
     init_mark("module");
 
     k_sieve.set_group_size(WG_SIZE);
-    // Large-kernel work-group size; GB_LARGE_WG=N (multiple of 32) overrides.
-    const uint32_t large_wg = std::getenv("GB_LARGE_WG")
-        ? uint32_t(std::strtoul(std::getenv("GB_LARGE_WG"), nullptr, 0)) : LARGE_WG_SIZE;
+    // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
+    // kernel indexes by global id). N must be a non-zero multiple of the
+    // SIMD32 subgroup: 0 would divide the launch by zero, anything else
+    // splits a subgroup.
+    uint32_t large_wg = LARGE_WG_SIZE;
+    if (const char* e = std::getenv("GB_LARGE_WG")) {
+        large_wg = uint32_t(std::strtoul(e, nullptr, 0));
+        if (large_wg == 0 || large_wg % 32 != 0 || large_wg > 1024)
+            throw std::runtime_error("GB_LARGE_WG must be a multiple of 32 in [32, 1024]");
+    }
     k_large.set_group_size(large_wg);
     k_check.set_group_size(WG_SIZE);
     k_check_b.set_group_size(WG_SIZE);
@@ -1274,7 +1281,7 @@ RunStats run_gpu(uint64_t limit,
 
     // 32-bit reciprocals for the tile table path. The kernel jumps from the
     // tile's first mark to a thread's 2048-bit range: d = my_bit0 - tf is
-    // always < BITS_PER_TILE = 2^19, so floor(d/p) is computable with a 32-bit
+    // always < BITS_PER_TILE = 2^17, so floor(d/p) is computable with a 32-bit
     // reciprocal: with s = bit_width(BITS_PER_TILE * p) we have 2^s > BITS_PER_TILE*p,
     // which makes floor(d*m/2^s) = floor(d/p) exact for every d < BITS_PER_TILE
     // (for d divisible by p the product is k*p*(2^s+e)/2^s = k + k*e/2^s with
@@ -2682,10 +2689,10 @@ void print_device_info() {
                 std::printf("driver version   : %u\n", dp.driverVersion);
             std::printf("\nconfig           : WG %u | TILE_WORDS %u (%.0f KB SLM) | "
                         "WPI(large) %u | check words/item %u | MAX_GB_PRIME %u | "
-                        "SIEVE_PRIME_LIMIT %u | seg default %llu\n",
+                        "seg default %llu\n",
                         WG_SIZE, TILE_WORDS, double(TILE_WORDS * 8) / 1024.0,
                         LARGE_PRIMES_PER_ITEM, CHECK_WORDS_PER_ITEM,
-                        MAX_GB_PRIME, SIEVE_PRIME_LIMIT,
+                        MAX_GB_PRIME,
                         (unsigned long long)DEFAULT_SEGMENT_EVEN);
         }
     }

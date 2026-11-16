@@ -98,7 +98,8 @@ python3 ci/production_env.py ci/production-env.json --prod-dir . [--dry-run]   #
 
 ## Production control
 
-- **One command**: `ci/goldbach` (installed as `~/.local/bin/goldbach`):
+- **One command**: `ci/goldbach` (installed as a symlink `~/.local/bin/goldbach`;
+  a copy needs `GOLDBACH_ROOT`, as does `ci/campaign_queue.py` run from outside the tree):
   `up` (the default) enables and starts the daemon, the site sync and the
   campaign queue, starts production unless it runs, pushes to the site and
   prints `status`; `down` stops production at the next slice boundary
@@ -197,6 +198,8 @@ downtime), `results.csv` (fixed columns), `runs/<id>/` (logs, outputs,
 
 ```bash
 bash ci/setup-runners.sh                             # goldbach-cpu + goldbach-gpu runners
+gh variable set GOLDBACH_ROOT --body "$PWD"          # the workflows' production tree (goldbach-tools next to it)
+ln -s "$PWD/ci/goldbach" ~/.local/bin/goldbach       # the one-command control (finds the tree through the link)
 echo '{"watch_include": []}' > ci-state/config.json  # pushes are the trigger
 python3 ci/goldbach_ci.py install-service --enable   # daemon: recovery, retries, count checks
 loginctl enable-linger "$USER"                       # survive logout / reboot

@@ -18,7 +18,9 @@ permissions:
   contents: read
 
 env:
-  PROD_DIR: /home/ken/coding/goldbach-l0
+  # the production goldbach-l0 checkout (repository variable, as in ci.yml)
+  GOLDBACH_ROOT: ${{ vars.GOLDBACH_ROOT }}
+  PROD_DIR: ${{ vars.GOLDBACH_ROOT }}
 
 jobs:
   benchmark:
@@ -26,6 +28,12 @@ jobs:
     runs-on: [self-hosted, goldbach-gpu]
     timeout-minutes: 360
     steps:
+      - name: Production tree configured (repository variable GOLDBACH_ROOT)
+        run: |
+          test -n "$GOLDBACH_ROOT" && test -f "$PROD_DIR/ci/goldbach_ci.py" || {
+            echo "::error::set the repository variable GOLDBACH_ROOT to the production goldbach-l0 checkout (gh variable set GOLDBACH_ROOT --body /path/to/goldbach-l0); goldbach-tools is expected next to it"
+            exit 1; }
+
       - name: goldbach_ci.py benchmark
         env:
           PROFILE: ${{ inputs.profile }}

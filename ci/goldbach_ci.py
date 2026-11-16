@@ -114,7 +114,9 @@ TIMING_KEYS = ["total_s", "gpu_s", "init_s", "sieve_s", "large_s", "check_s",
 STATS_STATEFUL = {"version", "new_first"}     # GBSTATS keys that depend on the accumulator
 # GBSTATS fields a candidate may add over its reference release (compared once
 # the reference writes them too); any other extra field fails
-STATS_NEW_OK = {"gaps", "gd1", "gmax", "gtail", "gwalk", "gsmom", "gsamp"}     # v2.4 prime gaps (gstats.hpp gap_fields)
+# the prime-gap fields (gstats.hpp gap_fields, written since v2.4): only
+# relevant while the reference release predates them
+STATS_NEW_OK = {"gaps", "gd1", "gmax", "gtail", "gwalk", "gsmom", "gsamp"}
 NOTIFY_ENV = ("GB_NTFY_TOPIC", "GB_NOTIFY_MAIL", "GB_NOTIFY_CMD", "GB_NOTIFY_WALL",
               "GB_NOTIFY_SP", "GB_RECORD_HOOK")
 FINAL = ("PASS", "FAIL", "IDENTICAL", "DIVERGED", "SKIPPED")
@@ -916,7 +918,14 @@ def build_release(sha, run_dir, refs, cpu_tests=True):
             shutil.rmtree(stage)               # identical: keep the (possibly live) dir
             return wt, rel, checks
         if rel.resolve() in (active_release(), link_target("previous")):
-            raise RuntimeError(f"release {rid} is in use and would change")
+            # the same commit no longer builds the same bytes (toolchain update:
+            # gcc, cmake, ...). Never replace a release production may run; the
+            # installed one is what any further stage (a GPU stack check) tests.
+            shutil.rmtree(stage)
+            checks.append({"name": "release_reproducible", "level": "warn",
+                           "detail": f"rebuild of {rid} differs from the installed release "
+                                     f"(toolchain change?); the installed one is kept and used"})
+            return wt, rel, checks
         shutil.rmtree(rel)
     os.replace(stage, rel)
     return wt, rel, checks
@@ -945,7 +954,7 @@ def run_bench(active, cand, run_dir, seg):
            "--arm", f"cand:@{cand / 'goldbach_l0'}@{cand / 'kernels/goldbach_bmg.spv'}"]
     rc, _ = sh(cmd, cwd=ROOT, env=isolated_env(run_dir / "bench-files"), logf=run_dir / "bench.log", timeout=3600)
     res = {"rc": rc, "windows": {}}
-    rows = list(csv.DictReader(open(out))) if out.exists() else []
+    rows = csv_rows(out)
     for w in c["bench_windows"].split(","):
         by = {}
         for r in rows:
@@ -1047,7 +1056,7 @@ def ci_figures(run_dir, slices):
     try:
         if not out.exists():
             return figs
-        hdr = next(csv.reader(open(out)))
+        hdr = csv_header(out)
         with open(out, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=hdr, extrasaction="ignore")
             for label, res in slices:
@@ -1168,10 +1177,10 @@ def benchmark_session(out_dir, profile="full", pause=True, state=None):
             str(P["big_runs"]), "--warmup", "1", "--split", "0", "--out", csv_out, "--timeout", "1800"],
            cwd=ROOT, env=env, logf=logf, timeout=6 * 3600)
     paused_s = int(time.monotonic() - t0)
-    rows = list(csv.DictReader(open(csv_out))) if csv_out.exists() else []
+    rows = csv_rows(csv_out)
     journal = ROOT / "bench" / "bench-results.csv"  # the project's benchmark journal
     if rows and journal.exists():
-        hdr = next(csv.reader(open(journal)))
+        hdr = csv_header(journal)
         with open(journal, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=hdr, extrasaction="ignore")
             w.writerows(rows)
@@ -1464,7 +1473,7 @@ def ledger_append(rec):
     for w, d in rec.get("bench", {}).get("windows", {}).items():
         flat[f"bench_{w}_speed_ratio"] = d.get("speed_ratio", "")
     p = STATE / "results.csv"
-    if p.exists() and next(csv.reader(open(p)), None) != RESULT_COLS:
+    if p.exists() and csv_header(p) != RESULT_COLS:
         p.rename(p.with_name(f"results-{stamp()}.csv"))      # older layout: keep it aside
     new = not p.exists()
     with open(p, "a", newline="") as f:
@@ -1474,9 +1483,28 @@ def ledger_append(rec):
         w.writerow(flat)
 
 
+def read_lines(path):
+    """The lines of a text file (OSError when it cannot be read)."""
+    with open(path) as f:
+        return f.read().splitlines()
+
+
+def csv_rows(path):
+    """Every row of a CSV file as a dict; [] when the file does not exist."""
+    if not Path(path).exists():
+        return []
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def csv_header(path):
+    with open(path, newline="") as f:
+        return next(csv.reader(f), None)
+
+
 def ledger():
     try:
-        return [json.loads(ln) for ln in open(STATE / "ledger.jsonl")]
+        return [json.loads(ln) for ln in read_lines(STATE / "ledger.jsonl")]
     except OSError:
         return []
 
@@ -1528,12 +1556,21 @@ def list_refs(c):
     return refs
 
 
-def attempts(sha):
-    return sum(r.get("commit") == sha and r["status"] == "INTERRUPTED" for r in ledger())
+def ledger_index():
+    """{sha: (interrupted attempts, judged)} from one read of the ledger."""
+    idx = {}
+    for r in ledger():
+        n, j = idx.get(r.get("commit"), (0, False))
+        idx[r.get("commit")] = (n + (r["status"] == "INTERRUPTED"), j or r["status"] in FINAL)
+    return idx
 
 
-def judged(sha):
-    return any(r.get("commit") == sha and r["status"] in FINAL for r in ledger())
+def attempts(sha, idx=None):
+    return (ledger_index() if idx is None else idx).get(sha, (0, False))[0]
+
+
+def judged(sha, idx=None):
+    return (ledger_index() if idx is None else idx).get(sha, (0, False))[1]
 
 
 def candidates(update_seen=True):
@@ -1544,11 +1581,12 @@ def candidates(update_seen=True):
     seen = load_json(STATE / "refs.json", {})
     refs = list_refs(c)
     act = release_meta(active_release()).get("commit")
+    idx = ledger_index()          # once per poll, not once per ref
     new = {}
     for name, sha, ts in refs:
         if seen.get(name) == sha:
             continue
-        if judged(sha) or attempts(sha) >= c["max_attempts"] or (act and is_ancestor(sha, act)):
+        if judged(sha, idx) or attempts(sha, idx) >= c["max_attempts"] or (act and is_ancestor(sha, act)):
             seen[name] = sha
             continue
         new.setdefault(sha, {"refs": [], "ts": ts})["refs"].append(name.replace("refs/heads/", ""))
@@ -1633,7 +1671,7 @@ def count_check(journal=None, only_new=True, limit_blocks=None, stop_on_mismatch
     # the "journal" field count for slices of the releases they name.
     covered, judged_alone, rechecked = [], {}, set()
     with contextlib.suppress(OSError):
-        for r in map(json.loads, open(STATE / "count-check.jsonl")):
+        for r in map(json.loads, read_lines(STATE / "count-check.jsonl")):
             if "journal" in r and r["journal"] != j.name:
                 continue
             rels = None if "journal" in r else set(r.get("releases") or [r.get("release", "")])
@@ -1642,7 +1680,7 @@ def count_check(journal=None, only_new=True, limit_blocks=None, stop_on_mismatch
             if r.get("slices", 1) == 1:
                 judged_alone.setdefault((r["a"], r["b"]), []).append(rels)
     with contextlib.suppress(OSError):
-        rechecked = {(int(t[1]), int(t[2])) for t in (ln.split() for ln in open(j)) if t[:1] == ["RECHECK"]}
+        rechecked = {(int(t[1]), int(t[2])) for t in (ln.split() for ln in read_lines(j)) if t[:1] == ["RECHECK"]}
 
     def resolved(r):
         mine = lambda rels: rels is None or r["kv"].get("release", "") in rels
@@ -1718,10 +1756,10 @@ def recheck(a=None, release=None):
     else:
         done = set()
         with contextlib.suppress(OSError):
-            done = {tuple(int(x) for x in ln.split()[:2]) for ln in open(STATE / "rechecked.txt")}
+            done = {tuple(int(x) for x in ln.split()[:2]) for ln in read_lines(STATE / "rechecked.txt")}
         qf = j.with_suffix(".recheck")
         queue = list(dict.fromkeys(k for k in (tuple(int(x) for x in ln.split()[:2])
-                                                for ln in (open(qf) if qf.exists() else []))
+                                                for ln in (read_lines(qf) if qf.exists() else []))
                                    if k in rows and k not in done))
     if not queue:
         print("nothing to recheck")
@@ -1806,7 +1844,7 @@ def bench_progress(stt):
     latest run (arm, window, speed) and an ETA."""
     plan = stt.get("bench_plan") or []
     try:
-        rows = list(csv.DictReader(open(stt["bench_csv"])))
+        rows = csv_rows(stt["bench_csv"])
     except (OSError, KeyError):
         rows = []
     total = sum(p[2] for p in plan)
@@ -2002,18 +2040,16 @@ def cmd_daemon(a):
         with flock(STATE / "ci.lock", blocking=True, timeout=6 * 3600):
             recover()
         while True:
-            try:
-                lock = flock(STATE / "ci.lock")
-                lock.__enter__()
-            except RuntimeError:          # a CI run (Actions job, command) is busy: next poll
-                time.sleep(cfg()["poll_s"])
-                continue
-            try:
-                poll_once()
-            except Exception as e:
-                log(f"daemon: poll {type(e).__name__}: {e}")
-            finally:
-                lock.__exit__(None, None, None)
+            with contextlib.ExitStack() as held:
+                try:
+                    held.enter_context(flock(STATE / "ci.lock"))
+                except RuntimeError:      # a CI run (Actions job, command) is busy: next poll
+                    pass
+                else:
+                    try:
+                        poll_once()
+                    except Exception as e:
+                        log(f"daemon: poll {type(e).__name__}: {e}")
             time.sleep(cfg()["poll_s"])
 
 
@@ -2139,6 +2175,12 @@ WantedBy=default.target
     print(f"wrote {d / 'goldbach-ci.service'}" + (" (enabled + started)" if a.enable else ""))
 
 
+def sigterm_as_interrupt(signum, frame):
+    """SIGTERM (systemctl stop, a cancelled Actions job) unwinds like Ctrl-C:
+    child process groups are killed, production is resumed."""
+    raise KeyboardInterrupt
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2183,9 +2225,7 @@ def main():
     p = cmd("install-service", cmd_install_service, "write (and --enable) the systemd user service")
     p.add_argument("--enable", action="store_true")
     a = ap.parse_args()
-    # SIGTERM (systemctl stop, a cancelled Actions job) unwinds like Ctrl-C:
-    # child process groups are killed, production is resumed
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    signal.signal(signal.SIGTERM, sigterm_as_interrupt)
     a.fn(a)
 
 

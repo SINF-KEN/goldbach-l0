@@ -117,24 +117,21 @@ Validators depend on the `kernels` target.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `VERSION` | "2.1.0" | echoed by `--info` / `--csv` |
+| `VERSION` | "2.5.1" | echoed by `--info` / `--csv` |
 | `WG_SIZE` | 256 | threads per work-group; 128/512/1024 measured within noise |
 | `TILE_WORDS` | 2048 | 16 KB SLM per tile (v1.8.1 optimum, §9.2d; `GB_TILE_WORDS` + ocloc `-DTILE_WORDS` to change) |
-| `BITS_PER_TILE` | 524,288 | odd numbers per tile (= ODDS_PER_TILE) |
-| `INTEGERS_PER_TILE` | ~1,048,576 | ~1M integer range per tile |
-| `WORDS_PER_THREAD` | 32 | exactly ONE owner per word -> no atomics in tile kernel |
+| `BITS_PER_TILE` | 131,072 | odd numbers per tile (TILE_WORDS x 64; the kernel's WORDS_PER_THREAD = TILE_WORDS / WG_SIZE = 8 words per thread) |
 | `LARGE_PRIMES_PER_ITEM` | 4 | primes per large-kernel work-item (~98M items -> ~24.5M at 4e18). MUST stay mirrored in goldbach.cl |
 | `CHECK_WORDS_PER_ITEM` | 4 | 64-even words per check work-item (256 evens). MUST match WORDS_PER_ITEM in goldbach.cl |
 | `MAX_GB_PRIME` | 9781 | largest candidate prime needed (published 4e18 verification); ~1,206 primes, u16 (2.4 KB) |
-| `LARGE_PACK_PPI` / `LARGE_PACK_GROUP` | 4 / 128 | sieve_large_packed: primes per work-item / per packing group (host); MUST match LARGE_PACK_PPI / LARGE_PACK_SG in goldbach.cl |
-| `LARGE_WG_SIZE` | 64 | large-kernel work-group size |
+| `LARGE_PACK_PPI` / `LARGE_PACK_GROUP` | 16 / 512 | sieve_large_packed: primes per work-item / per packing group (host); MUST match LARGE_PACK_PPI / LARGE_PACK_SG in goldbach.cl |
+| `LARGE_WG_SIZE` | 128 | large-kernel work-group size (`GB_LARGE_WG` overrides: a multiple of 32 in [32, 1024]) |
 | `CHECK_PHASE_B_GROUPS` | 640 | check_phase_b grid-stride work-groups (`GB_CHECK_BGROUPS` overrides) |
 | `MED_MIN_P` / `MED_MIN_P_CLASS` | 256 / 512 | tile-kernel primes >= this (and < split) use the prime-parallel SLM-atomic stage 3m (dense map / class map); `GB_MED_P=N` overrides |
 | `CHECK30_PLAN` (include/check30.hpp) | 15 classes x 3-4 segments | mod-30 checker (production since v1.13.0, §9.2j): per n mod 30 the (candidate class s, pattern mask, funnels) segments of phase A; `GB_C30_PLAN` overrides, `GB_C30=0` = the v1.12.0 merge30 + class-split checker |
 | `CHECK_PHASE_A_W64` | 12 | phase-A item width in 64-bit words (768 evens), all word checkers; MUST match A_W64 (14 until 2026-10-05, §9.2p) |
 | `CHECK_SPLIT_CANDS` / `CHECK_SPLIT_STAGES` | 38 / "7/3" | class-split checker (v1.11.0, §9.2h): phase-A funnels per class list and stage masks (sexy-prime triplets, then pairs); `GB_SPLIT_CAP` / `GB_SPLIT_STAGES` override |
 | `MASK_MAX_P` | 64 | primes < 64 use whole-word AND masks (17 odd primes 3..61; 1088 mask words = 8.5 KB). MUST match kernel |
-| `SIEVE_PRIME_LIMIT` | 1,000,000 | base primes must reach sqrt(max q); 1e6 supports q to ~1e12 — raise + rebuild for higher |
 | `DEFAULT_LIMIT` | 100,000,000 | default verification range [4, limit] |
 | `DEFAULT_SEGMENT_EVEN` | 467,500,000 | default segment span (integer span; 233.75M evens; 425M from v1.12.0 to v2.3.0, §9.2u). Comment block records the measurements. tools/run_range.sh uses 467.5M (GB_RANGE_SEGMENT), bench.py each binary's default |
 | `MAX_LEFTOVERS` | 1,048,576 | compact exception-list cap (2^20) |
@@ -253,10 +250,13 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` (§9.2w) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest (§9.2v) |
 | `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
-| `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32) |
+| `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32 in [32, 1024], else the run fails; default 128) |
+| `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default: every segment |
+| `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (clamped to [1, 4096]; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
+| `GB_TWIN=0` / `GB_TWIN_CAP=K` | v1.10.0 A/B: the plain two-phase checker (implies `GB_SPLIT=0`) / twin funnels of the twin checker (default `CHECK_TWIN_CANDS` = 100) |
 | `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default: mod-30 class map + merge30) |
 | `GB_SPLIT_CAP=K` / `GB_SPLIT_STAGES=S` | class-split checker funnels per list / stage masks ("7/3", "3", "7:20/3" = at most 20 triplet funnels) |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
@@ -390,7 +390,7 @@ reset).
 - Measured and dropped: 2 B/prime u64 packing (pre-page-fix), L3-bypassing
   prime loads (LSC L1UC/L3UC 2.5x slower, L1S/L3UC 1.5x slower), 8 primes
   per item (~2%, noisier), native_recip, a third mod refinement step.
-- GB_LARGE_WG=N overrides the large-kernel work-group size.
+- GB_LARGE_WG=N overrides the large-kernel work-group size (validated: a multiple of 32 in [32, 1024]).
 - Validation: debug_fb decodes ALL ~109M primes of the 5e18 list at several
   splits via unpack_large_test (bit-exact vs host); debug_map runs the
   packed kernel (GB_MAP_LARGE_PLAIN=1 for the u32 kernel). A deliberately
@@ -1076,7 +1076,7 @@ Env vars (sparse path): `GB_SPARSE=1` (select the path; also `--sparse`),
 `GB_SCM_LCAP` (caps), `GB_SCM_BGROUPS`, `GB_SCM_LARGE_WG`, `GB_SCM_SPV`
 (module override), `GB_INIT_TRACE=1`, `GB_PHASE=1` (per-segment kernel times).
 Production: `GB_SPARSE=1 bash tools/run_range.sh START LIMIT` (the default
---segment 425000000 selects the geometry's segment).
+--segment 467500000 selects the geometry's segment).
 
 ### 9.2l v2.2 — exact Goldbach statistics (dense path; include/gstats.hpp)
 

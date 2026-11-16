@@ -66,7 +66,8 @@ def last_event(log):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=os.path.expanduser("~/coding/goldbach-l0"))
+    # default: $GOLDBACH_ROOT, else the checkout this script lives in
+    ap.add_argument("--root", default=os.environ.get("GOLDBACH_ROOT") or Path(__file__).resolve().parent.parent)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--push", nargs=2, metavar=("START", "LIMIT"))
     ap.add_argument("--slice", default=None)

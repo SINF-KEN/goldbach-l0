@@ -22,9 +22,11 @@ compiled to SPIR-V and a C++20 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts).
 
-**v2.3.0: 64.6 billion even numbers per second** at 4×10¹⁸ (63.8 G at the
-top of the range, 2.8 J per 10⁹ evens) with exact statistics on — the whole
-[4×10¹⁸, 5×10¹⁸] in about **90 days** on one B580.
+Current release: **v2.5.1**. Last full benchmark (v2.3.0): **64.6 billion
+even numbers per second** at 4×10¹⁸ (63.8 G at the top of the range, 2.8 J
+per 10⁹ evens) with exact statistics on — the whole [4×10¹⁸, 5×10¹⁸] in
+about **90 days** on one B580. v2.4–v2.5.1 add a few percent on top
+(+1.2%, +1.3% and +0.4% per change, measured individually: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §9.2u–v).
 
 | Document | Contents |
 |---|---|
@@ -41,7 +43,7 @@ For each even `n` one partition suffices. Candidates `p` are the odd primes
 up to 9781 (no even below 4×10¹⁸ needs more; above it the CPU fallback
 looks further), so the problem becomes: build an exact primality map of the
 odd `q` near the segment, then test `q = n - p` for each even. Per
-425-million-integer segment, double-buffered while the CPU prepares the
+467.5-million-integer segment, double-buffered while the CPU prepares the
 next:
 
 1. **`make_prime_map`** (tile sieve) — the map holds only `q` coprime to 30,
@@ -95,12 +97,15 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
+Last full release comparison (the v2.4–v2.5.1 changes were measured one at
+a time, PROJECT-REFERENCE.md §9.2u–v):
+
 | Window (bench.py, v2.3.0 vs v2.2.1, 8 paired rounds) | v2.3.0 | v2.2.1 | change |
 |---|---|---|---|
 | long — 10¹¹ at 4×10¹⁸ | **64.62 G evens/s** | 59.54 G | +8.54% |
 | long-end — 10¹¹ ending at 5×10¹⁸ | **63.77 G** | 58.38 G | +9.23% |
 
-Per 10¹¹ integers at 4×10¹⁸: large-prime sieve 473 ms (packed kernel + hit
+Per 10¹¹ integers at 4×10¹⁸ (v2.3.0): large-prime sieve 473 ms (packed kernel + hit
 lists), tile sieve 204 ms, checker 92 ms. The history of every version and
 every measured change is in [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md)
 §9.2 and §13; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
