@@ -24,7 +24,7 @@ packed large-prime kernel, hit lists for the largest primes, mod-30
 checker, exact statistics; §8, §9) and the opt-in **sparse class map**
 (`--sparse` / `GB_SPARSE=1`; [§9.2k](HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp)): the map holds only 12 residue classes
 mod 30030 (0.04% of the integers), candidates come from p <= 4e7, ~1.0e12
-evens/s at 4e18 (17x the dense path) but no exact statistics.
+evens/s at 4e18 (~15x the dense path's ~70 G) but no exact statistics.
 
 - `tools/` is a symlink to a sibling clone of the companion
   `goldbach-tools` repo (validators, bench.py, run_range.sh); without it the

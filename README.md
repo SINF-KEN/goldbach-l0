@@ -1,7 +1,7 @@
 <h1 align="center">goldbach-l0</h1>
 
 <p align="center">
-  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 64.6 billion even numbers per second on one B580.</b><br>
+  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: ~70 billion even numbers per second on one B580.</b><br>
   <a href="https://goldbach.net01.io">Live campaign</a> ·
   <a href="docs/CORRECTNESS.md">Correctness</a> ·
   <a href="docs/BENCHMARKING.md">Benchmarks</a> ·
@@ -20,13 +20,18 @@
 compiled to SPIR-V and a C++23 host. It is running a campaign over
 **[4×10¹⁸, 5×10¹⁸]**, beyond the published verification to 4×10¹⁸, and
 records exact statistics of every even it verifies (smallest Goldbach
-primes, prime and twin-prime counts).
+primes, prime and twin-prime counts, prime gaps).
 
-Current release: **v2.5.1**. Last full benchmark (v2.3.0): **64.6 billion
-even numbers per second** at 4×10¹⁸ (63.8 G at the top of the range, 2.8 J
-per 10⁹ evens) with exact statistics on — the whole [4×10¹⁸, 5×10¹⁸] in
-about **90 days** on one B580. v2.4–v2.5.1 add a few percent on top
-(+1.2%, +1.3% and +0.4% per change, measured individually: [HISTORY.md §9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06)–[v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)).
+Current release: **v2.5.1**, plus the SLM-contention round of
+[HISTORY.md §9.2w](docs/HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)
+(on `main` and in production since 2026-11-15, not yet a tagged release).
+Latest measurement (§9.2w, bench.py, 10 paired rounds): **69.9 billion even
+numbers per second** at 4×10¹⁸ (69.2 G at the top of the range) with exact
+statistics on, prime gaps included — the whole [4×10¹⁸, 5×10¹⁸] in about
+**83 days** on one B580. Live campaign on 2026-11-16: **14.2% done**, the
+B580 averaging 65.5 G evens/s over its production slices, ~76 days left
+([goldbach.net01.io](https://goldbach.net01.io); browsers work down from
+5×10¹⁸).
 
 | Document | Contents |
 |---|---|
@@ -98,27 +103,48 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
-Last full release comparison (the v2.4–v2.5.1 changes were measured one at
-a time, [HISTORY.md §9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06)–[v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)):
+Every change since v2.3.0, each measured against its parent (bench.py,
+interleaved paired rounds; absolute rates drift a little between sessions,
+so compare within a row):
+
+| Change | long — 10¹¹ at 4×10¹⁸ | long-end — 10¹¹ ending at 5×10¹⁸ |
+|---|---|---|
+| v2.4.0 fused hit-list apply, one-walk harvest, 467.5M segments ([§9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06), 5 rounds) | 64.60 → 67.67 G (+4.76%) | 63.75 → 66.89 G (+4.94%) |
+| v2.4.0 exact prime-gap statistics (every gap, every segment) | ~11% GPU time | |
+| v2.5.0 unordered list: the next segment's sieve overlaps the checker ([§9.2v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18), 3 pairs) | +1.31% | +1.25% |
+| v2.5.1 gap-stream loads bypass L3 (8 rounds) | +0.37% | +0.46% |
+| SLM contention round, on `main` ([§9.2w](docs/HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15), 10 rounds) | 66.19 → **69.85 G** (+5.53%) | 65.64 → **69.16 G** (+5.37%) |
+
+Per 10¹¹ integers at 4×10¹⁸ (v2.5.1, the §9.2w base): GPU 755 ms —
+large-prime sieve 429 ms (packed kernel + hit lists), tile sieve 197 ms,
+checker + count30 (statistics, gaps) 143 ms; §9.2w took the tile sieve to
+~171 ms and the checker to ~130 ms. A full 5×10¹³ production slice: 376 →
+354 s.
+
+Last full release comparison (all windows, with energy):
 
 | Window (bench.py, v2.3.0 vs v2.2.1, 8 paired rounds) | v2.3.0 | v2.2.1 | change |
 |---|---|---|---|
 | long — 10¹¹ at 4×10¹⁸ | **64.62 G evens/s** | 59.54 G | +8.54% |
 | long-end — 10¹¹ ending at 5×10¹⁸ | **63.77 G** | 58.38 G | +9.23% |
 
-Per 10¹¹ integers at 4×10¹⁸ (v2.3.0): large-prime sieve 473 ms (packed kernel + hit
-lists), tile sieve 204 ms, checker 92 ms. The history of every version and
-every measured change is in [HISTORY.md](docs/HISTORY.md)
-§9.2 and §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
+v2.3.0 per 10¹¹ integers: large-prime sieve 473 ms, tile sieve 204 ms,
+checker 92 ms; 2.8 J per 10⁹ evens. The history of every version and every
+measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and §13.2;
+methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ![Timing waterfall, long window, by version](docs/images/waterfall-long-by-version.png)
+
+*Figure: the bench.py journal ([bench/](bench/)) through v2.3.0. v2.4.0 and
+later have only paired A/B rounds so far (table above), no full benchmark
+session; `bash docs/make-plots.sh` redraws it once one is recorded.*
 
 ### The sparse path (`--sparse`, opt-in)
 
 Each even needs only ONE prime `q`, so the map does not have to cover every
 odd `q`: the sparse class map keeps 12 residue classes mod 30030 (0.04% of
 the integers) chosen so that every even class reaches one of them, with
-candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (17× the
+candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (~15× the
 dense path) but cannot produce the exact statistics (its map holds 12 of
 5760 classes), so the campaign runs the dense path. Design and validation:
 [HISTORY.md §9.2k](docs/HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp).
