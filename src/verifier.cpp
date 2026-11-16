@@ -356,6 +356,47 @@ public:
     RunStats run();
 
 private:
+    // Phases, in run() order
+    void configure_checkers();
+    void configure_ridges_and_stats();
+    void set_group_sizes();
+    void size_buffers();
+    void allocate_slot_buffers();
+    void size_bucket_ring_and_hitlists();
+    void allocate_large_prime_buffers();
+    void upload_tables();
+    void pack_stats_buffers();
+    void create_events();
+    void segment_loop();
+    void assemble_run_stats();
+    void release_device_objects();
+
+    // segment_loop: run-wide state, then the steps of each iteration, then the drain
+    void begin_segment_loop();
+    void begin_segment(Segment& sg);
+    void prepare_segment_tables(Segment& sg);
+    void enqueue_sieve(Segment& sg);
+    void enqueue_large_primes(Segment& sg);
+    void enqueue_hitlists(const Segment& sg, uint32_t& hl_jb);
+    void enqueue_buckets(const Segment& sg);
+    void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
+    void enqueue_bucket_verify(const Segment& sg);
+    void enqueue_check(Segment& sg);
+    void enqueue_count30(const Segment& sg, bool sampled);
+    void enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
+    void enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
+    void enqueue_check_split(const Segment& sg, const SplitSeg& sseg, uint32_t ridge_thresh_u32);
+    void enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t ridge_thresh_u32);
+    void collect_previous_segment(Segment& sg);
+    void end_iteration(const Segment& sg);
+    void drain_final_segment();
+
+    // Helpers (former lambdas of run_gpu)
+    void reset_gaps(int s);
+    void collect_stats(uint32_t sl, uint64_t seg_start_sl);
+    uint64_t bkt_first_seg(uint64_t G) const;
+    bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
+
     // Level Zero objects, created in this order by the constructor (and
     // destroyed in reverse order after every member declared below).
     Context ctx;
@@ -406,8 +447,6 @@ private:
     double module_seconds = 0.0;
     uint32_t large_wg = 0;           // GB_LARGE_WG
 
-    void configure_checkers();
-    void configure_ridges_and_stats();
     // ---- size_buffers ---------------------------------------------------------
     GpuBuffers b;                    // every device / shared buffer (allocated below)
     uint64_t map_words = 0;          // prime map per slot (whole tiles)
@@ -424,7 +463,6 @@ private:
     size_t mask_group_words = 0;
     uint32_t* d_group_desc = nullptr;
 
-    void set_group_sizes();
     // ---- allocate_slot_buffers ---------------------------------------------------
     uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
     bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
@@ -435,11 +473,6 @@ private:
     uint64_t slot_evens[2] = {0, 0};       // evens of the slot's segment
     uint64_t evens_collected = 0;          // live progress (goldbach_live.json)
     clock_::time_point t_live0;
-
-    void size_buffers();
-    void allocate_slot_buffers();
-    void reset_gaps(int s);
-    void collect_stats(uint32_t sl, uint64_t seg_start_sl);
 
     // ---- size_bucket_ring_and_hitlists -------------------------------------------
     uint64_t delta = 0;              // q-bit advance per segment (segment_even / 2)
@@ -454,8 +487,6 @@ private:
     uint32_t hl_G = 1, hl_capg = 64; // harvest regions, entries per region
     uint64_t run_segments = 0, run_last_q_odds = 0;  // hit lists: segments of the run
     uint32_t packed_end = 0;         // packed kernel primes [sieve_split, packed_end)
-
-    void size_bucket_ring_and_hitlists();
 
     // ---- allocate_large_prime_buffers ---------------------------------------------
     uint32_t packed_count = 0;       // primes of the packed large kernel
@@ -482,27 +513,18 @@ private:
     uint64_t* d_verify_map = nullptr;
     uint32_t* verify_diff = nullptr; // shared: differing words (map_compare)
 
-    void allocate_large_prime_buffers();
-    uint64_t bkt_first_seg(uint64_t G) const;
-
     // ---- upload_tables --------------------------------------------------------
     std::vector<uint64_t> magic;     // per-prime magic reciprocals, [0, sieve_split)
     std::vector<uint32_t> shift;
     clock_::time_point t_upload;
 
-    void upload_tables();
-
     // ---- pack_stats_buffers ---------------------------------------------------
     void* stats_block[2] = {nullptr, nullptr};
     std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
 
-    void pack_stats_buffers();
-
     // ---- create_events ----------------------------------------------------------
     uint32_t gb_count = 0;           // candidate primes
     SlotEvents ev;
-
-    void create_events();
 
     // ---- begin_segment_loop: run-wide loop state -----------------------------------
     clock_::time_point t_gpu;
@@ -527,32 +549,6 @@ private:
     double sum_args = 0.0, sum_launch = 0.0;
     bool split_used[2] = {false, false};   // slot's segment ran the split checker
     bool xs_used[2] = {false, false};      // slot's segment ran check30_xs8..3 (4 launches)
-
-    void begin_segment_loop();
-    bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
-
-    void segment_loop();
-    void assemble_run_stats();
-    void release_device_objects();
-
-    // ---- per-segment steps -------------------------------------------------------
-    void enqueue_sieve(Segment& sg);
-    void enqueue_large_primes(Segment& sg);
-    void enqueue_hitlists(const Segment& sg, uint32_t& hl_jb);
-    void enqueue_buckets(const Segment& sg);
-    void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
-    void enqueue_bucket_verify(const Segment& sg);
-    void enqueue_check(Segment& sg);
-    void enqueue_count30(const Segment& sg, bool sampled);
-    void enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
-    void enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
-    void enqueue_check_split(const Segment& sg, const SplitSeg& sseg, uint32_t ridge_thresh_u32);
-    void enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t ridge_thresh_u32);
-    void collect_previous_segment(Segment& sg);
-    void end_iteration(const Segment& sg);
-    void drain_final_segment();
-    void prepare_segment_tables(Segment& sg);
-    void begin_segment(Segment& sg);
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
