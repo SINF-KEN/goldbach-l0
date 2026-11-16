@@ -12,7 +12,8 @@
   `CR_VER`).
 - **Display**: keep the desktop on another GPU (or run headless): a
   compositor on the B580 costs ~20% and makes timings bimodal.
-- **Host**: Linux, CMake >= 3.24, a C++23 compiler (gcc or clang), the Level
+- **Host**: Linux, CMake >= 3.24, a C++23 compiler and library (gcc >= 14, or
+  clang >= 18 on libstdc++ >= 14: `src/main.cpp` uses `<print>`), the Level
   Zero loader and headers; Python 3 for the tests and the CI; `ocloc`
   optional (needed only to rebuild kernels).
 
