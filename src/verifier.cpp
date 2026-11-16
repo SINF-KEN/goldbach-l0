@@ -388,7 +388,21 @@ private:
     uint32_t* d_group_desc = nullptr;
 
     void set_group_sizes();
+    // ---- allocate_slot_buffers ---------------------------------------------------
+    uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
+    bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
+    uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
+    uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
+    bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
+    uint64_t sampled_evens = 0;            // evens of the sampled segments
+    uint64_t slot_evens[2] = {0, 0};       // evens of the slot's segment
+    uint64_t evens_collected = 0;          // live progress (goldbach_live.json)
+    clock_::time_point t_live0;
+
     void size_buffers();
+    void allocate_slot_buffers();
+    void reset_gaps(int s);
+    void collect_stats(uint32_t sl, uint64_t seg_start_sl);
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -758,21 +772,11 @@ void DenseRun::size_buffers() {
     }
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    // count30's gap outputs as the kernel expects them before a segment
-    const auto reset_gaps = [&](int s) {
-        b.g_tail[s][0] = b.g_tail[s][1] = 0;
-        b.x_cnt[s][11] = ~0u;                   // count30's first prime position (atomic_min)
-        b.x_cnt[s][12] = 0;
-        std::memset(b.g_hist[s], 0, GAPS30_HBINS * 4);
-    };
+/// Phase 5: per-slot buffers (map, checked, tables, counters, ridge and
+/// statistics buffers), the shared read-only tables (candidates, plans,
+/// want_p) and the device base-prime list. Allocation only, plus the host
+/// initialisation of shared buffers; the uploads come in upload_tables.
+void DenseRun::allocate_slot_buffers() {
     for (int s = 0; s < 2; ++s) {
         b.prime_map[s]  = static_cast<uint64_t*>(ctx.alloc_device(map_words * 8));
         b.checked[s]    = static_cast<uint64_t*>(ctx.alloc_device(chk_words * 8));
@@ -848,40 +852,8 @@ RunStats DenseRun::run() {
     b.want_p = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 64 + 1) * 4));
     std::memset(b.want_p, 0, (MAX_GB_PRIME / 64 + 1) * 4);
     if (stats_on) std::memcpy(b.want_p, gstats->want_p().data(), gstats->want_p().size() * 4);
-    const uint32_t tail_t = stats_on ? gstats->tail_t() : 0xFFFFFFFFu;   // check30_b tail recording
-    bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
-    uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
-    uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
-    bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
-    uint64_t sampled_evens = 0;            // evens of the sampled segments
-    uint64_t slot_evens[2] = {0, 0};       // evens of the slot's segment
-    uint64_t evens_collected = 0;          // live progress (goldbach_live.json)
-    const auto t_live0 = clock_::now();
-    // Merges a completed slot's statistics buffers (after its check event).
-    const auto collect_stats = [&](uint32_t sl, uint64_t seg_start_sl) {
-        if (sampled_slot[sl]) gstats->add_full(b.x_hist[sl]);
-        else gstats->add_tail(b.p_hist[sl]);
-        gstats->add_first(seg_start_sl, b.p_first[sl]);
-        if (gaps_on) {
-            uint64_t wmax = 0;                  // count30's work-group maxima -> the segment's
-            const bool w = walked_slot[sl];
-            if (w)
-                for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
-            gstats->add_gap_segment(slot_qfirst[sl], slot_evens[sl], b.x_cnt[sl], b.g_tail[sl],
-                                    w ? &wmax : nullptr, w ? b.g_hist[sl] : nullptr);
-        }
-        gstats->add_counts(b.x_cnt[sl]);
-        // ready for the slot's next segment (enqueued after this collect)
-        std::memset(b.p_hist[sl], 0, (MAX_GB_PRIME / 2 + 1) * 4);
-        std::memset(b.p_first[sl], 0xFF, (MAX_GB_PRIME / 2 + 1) * 4);
-        std::memset(b.x_cnt[sl], 0, 16 * 4);
-        reset_gaps(sl);                         // after x_cnt: sets its first-prime sentinel
-        evens_collected += slot_evens[sl];
-        gstats->write_live(start_even, limit, evens_collected, total_evens, seconds_since(t_live0));
-        // monotone (bins only leave the want set): safe while the other
-        // slot's kernels read it
-        std::memcpy(b.want_p, gstats->want_p().data(), gstats->want_p().size() * 4);
-    };
+    tail_t = stats_on ? gstats->tail_t() : 0xFFFFFFFFu;   // check30_b tail recording
+    t_live0 = clock_::now();
     if (c30chk) {
         b.c30_cands = static_cast<uint16_t*>(ctx.alloc_device(std::max<size_t>(plan30.cands.size(), 1) * 2));
         b.c30_meta  = static_cast<uint32_t*>(ctx.alloc_device(plan30.meta.size() * 4));
@@ -894,6 +866,51 @@ RunStats DenseRun::run() {
     // staging buffer — the old fread pass is gone — and the DMA copy doubles
     // as the clock warm-up before the segment loop.
     b.sieve_primes = static_cast<uint32_t*>(ctx.alloc_device(size_t(sieve_count) * 4));
+}
+
+/// count30's gap outputs as the kernel expects them before a segment.
+void DenseRun::reset_gaps(int s) {
+    b.g_tail[s][0] = b.g_tail[s][1] = 0;
+    b.x_cnt[s][11] = ~0u;                   // count30's first prime position (atomic_min)
+    b.x_cnt[s][12] = 0;
+    std::memset(b.g_hist[s], 0, GAPS30_HBINS * 4);
+}
+
+/// Merges a completed slot's statistics buffers (after its check event).
+void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
+    if (sampled_slot[sl]) gstats->add_full(b.x_hist[sl]);
+    else gstats->add_tail(b.p_hist[sl]);
+    gstats->add_first(seg_start_sl, b.p_first[sl]);
+    if (gaps_on) {
+        uint64_t wmax = 0;                  // count30's work-group maxima -> the segment's
+        const bool w = walked_slot[sl];
+        if (w)
+            for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
+        gstats->add_gap_segment(slot_qfirst[sl], slot_evens[sl], b.x_cnt[sl], b.g_tail[sl],
+                                w ? &wmax : nullptr, w ? b.g_hist[sl] : nullptr);
+    }
+    gstats->add_counts(b.x_cnt[sl]);
+    // ready for the slot's next segment (enqueued after this collect)
+    std::memset(b.p_hist[sl], 0, (MAX_GB_PRIME / 2 + 1) * 4);
+    std::memset(b.p_first[sl], 0xFF, (MAX_GB_PRIME / 2 + 1) * 4);
+    std::memset(b.x_cnt[sl], 0, 16 * 4);
+    reset_gaps(sl);                         // after x_cnt: sets its first-prime sentinel
+    evens_collected += slot_evens[sl];
+    gstats->write_live(start_even, limit, evens_collected, total_evens, seconds_since(t_live0));
+    // monotone (bins only leave the want set): safe while the other
+    // slot's kernels read it
+    std::memcpy(b.want_p, gstats->want_p().data(), gstats->want_p().size() * 4);
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
+    allocate_slot_buffers();
     // ---- Bucket sieve geometry (kernels/goldbach.cl, "Bucket sieve") ------
     init_mark("buffers");
     // Primes p > q_odds_full hit a segment at most once; they leave the
