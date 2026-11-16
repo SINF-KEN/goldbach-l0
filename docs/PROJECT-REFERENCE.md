@@ -233,10 +233,23 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 --------------------------------------------------------------------------
 ## 7. Environment variables
 
+Every `GB_*` knob is parsed strictly (include/env.hpp): a malformed value is
+an error (`error: GB_X='v': expected ...`, exit 1), never 0 or the default.
+Numbers are whole strings in decimal, `0x` hex or `0`-prefixed octal within
+the knob's range (no sign, junk, overflow; empty is malformed). On/off switches
+(`GB_SPLIT`, `GB_C30`, `GB_STATS`, `GB_BUCKET`, `GB_HITLIST`, `GB_MASK_GROUPS`,
+`GB_UNORDERED`, `GB_RIDGE`, `GB_SPARSE`) take `0` or `1` (empty = unset);
+trace flags (`GB_PHASE`, `GB_INIT_TRACE`, `GB_RIDGE_DEBUG`,
+`GB_BUCKET_VERIFY_DUMP`) are on when set to anything; file paths treat empty
+as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
+`GB_SCM_WPL` / `GB_SCM_SPAN` >= 1, `GB_SCM_PCAP` / `GB_SCM_LCAP` [1, 2^31 - 1],
+`GB_SCM_LARGE_WG` a multiple of 32 in [32, 1024], `GB_SCM_PLAN_CACHE` 0 or 1,
+`GB_SCM_TARGET` / `GB_SCM_SEGW0` / `GB_SCM_SEGW1` finite >= 0.
+
 | Var | Effect |
 |---|---|
 | `GB_STATS=0` | dense path: no Goldbach statistics ([§9.2l](HISTORY.md#92l-v22--exact-goldbach-statistics-dense-path-includegstatshpp); default on for the mod-30 checker at start >= 1e6) |
-| `GB_STATS_SAMPLE=N` / `GB_STATS_K=K` | full p(n) histogram on every Nth segment (default 256; 1 = all, ~+30%) / exact phase-A prefix per class (default 64, <= 128) |
+| `GB_STATS_SAMPLE=N` / `GB_STATS_K=K` | full p(n) histogram on every Nth segment (default 256; 1 = all, ~+30%; N >= 1) / exact phase-A prefix per class (default 64, K in [1, 128]) |
 | `GB_STATS_STATE=F` / `GB_STATS_LOG=F` | statistics files (default goldbach_stats.state / goldbach_stats.log in the cwd) |
 | `GB_RECORDS_FILE=F` / `GB_STATS_LIVE=F` | record events (p(n) > 9781, new S(p); CPU re-proven, appended at once; default goldbach_records.txt) / live snapshot for scripts/goldbach_live.py (default goldbach_live.json, every 2 s) |
 | `GB_RECORD_HOOK=cmd` | run `cmd KIND P N Q CHECK` in the background per record event (default scripts/notify_record.sh when present; empty: none). The script reads `GB_NOTIFY_WALL`, `GB_NTFY_TOPIC` / `GB_NTFY_SERVER`, `GB_NOTIFY_MAIL`, `GB_NOTIFY_CMD`, `GB_NOTIFY_SP` (README "The record hunt") |
@@ -246,19 +259,19 @@ large_items split sieve_s large_s check_s offset_s wall_s left`.
 | `GB_PHASE=1` | per-segment host-phase trace to stderr: prep (offsets/table), enqueue (args/l1/l2/l3), wait, collect + raw kernel start/end ticks and sieve->large / large->check gaps. Default off (a few clock reads per segment) |
 | `GB_BUCKET_VERIFY_DUMP=1` | with GB_BUCKET_VERIFY: on the first mismatch print the differing bits with Miller-Rabin truth |
 | `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid ([§9.2b](HISTORY.md#92b-bucket-sieve-for-the-largest-primes-v170); n >= 1) |
-| `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all) against a bucket-free rebuild; throws on any difference |
-| `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, max 128, list buffer < 4 GiB) ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)); GB_BUCKET_VERIFY checks either path |
+| `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all; N >= 1: 0 or empty is an error, it used to mean every segment) against a bucket-free rebuild; throws on any difference |
+| `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, n in [1, 128], else an error; list buffer < 4 GiB) ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)); GB_BUCKET_VERIFY checks either path |
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` ([§9.2w](HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest ([§9.2v](HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)) |
 | `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32 in [32, 1024], else the run fails; default 128) |
-| `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default: every segment |
-| `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (clamped to [1, 4096]; default 320) |
+| `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default (`exact`, also `1`): every segment; any other value is an error |
+| `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
 | `GB_TWIN=0` / `GB_TWIN_CAP=K` | v1.10.0 A/B: the plain two-phase checker (implies `GB_SPLIT=0`) / twin funnels of the twin checker (default `CHECK_TWIN_CANDS` = 100) |
-| `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default: mod-30 class map + merge30) |
+| `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default `30`: mod-30 class map + merge30; any other value is an error) |
 | `GB_SPLIT_CAP=K` / `GB_SPLIT_STAGES=S` | class-split checker funnels per list / stage masks ("7/3", "3", "7:20/3" = at most 20 triplet funnels) |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
 | `ZET_ENABLE_METRICS=1` | driver-side metrics enablement (+ `sysctl dev.xe.observation_paranoid=0`, Metrics Library; see §14) |

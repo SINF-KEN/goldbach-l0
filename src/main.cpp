@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "env.hpp"
 #include "l0_context.hpp"
 #include "verifier.hpp"
 #include "sparse_run.hpp"
@@ -332,7 +333,7 @@ int main(int argc, char** argv) {
         }
 
         // GB_SPARSE=1 selects the sparse path too (benchmark harness arms)
-        if (const char* e = std::getenv("GB_SPARSE")) sparse = sparse || std::string(e) == "1";
+        if (gb::env::onoff("GB_SPARSE", false)) sparse = true;
         if (sparse && !spv_set) spv.clear();          // the geometry's module
         const gb::RunStats s = sparse
             ? gb::run_gpu_sparse(limit, segment, spv, verbose, start, uint32_t(split),
@@ -380,8 +381,8 @@ int main(int argc, char** argv) {
                         "  evens with full p(n)    : %llu (sampled segments)\n"
                         "  primes in [start, limit]: %llu\n"
                         "  twin-prime pairs        : %llu\n",
-                        std::getenv("GB_STATS_LOG") ? std::getenv("GB_STATS_LOG") : "goldbach_stats.log",
-                        std::getenv("GB_STATS_STATE") ? std::getenv("GB_STATS_STATE") : "goldbach_stats.state",
+                        gb::env::present("GB_STATS_LOG") ? gb::env::raw("GB_STATS_LOG") : "goldbach_stats.log",
+                        gb::env::present("GB_STATS_STATE") ? gb::env::raw("GB_STATS_STATE") : "goldbach_stats.state",
                         (unsigned long long)s.stats_pmax, (unsigned long long)s.stats_tail,
                         (unsigned long long)s.stats_sampled, (unsigned long long)s.stats_primes,
                         (unsigned long long)s.stats_twins);

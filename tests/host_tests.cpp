@@ -25,6 +25,7 @@
 #include "check30.hpp"
 #include "gstats.hpp"
 #include "config.hpp"
+#include "env.hpp"
 #include "primes.hpp"
 #include "ridge.hpp"
 #include "sparse.hpp"
@@ -1062,6 +1063,279 @@ void test_gap_stats()
     fs::remove_all(dir, ec);
 }
 
+// GB_* environment parsing (include/env.hpp): every malformed value throws
+// (naming the variable) instead of becoming 0 or the default.
+void test_env_parsing()
+{
+    std::puts("environment knobs (strict GB_* parsing)");
+    const char* V = "GB_TEST_ENV_KNOB";
+    const auto with = [&](const char* val, const std::function<void()>& fn) {
+        if (val) ::setenv(V, val, 1); else ::unsetenv(V);
+        fn();
+        ::unsetenv(V);
+    };
+    // @return the call threw a runtime_error naming the variable
+    const auto rejects = [&](const char* val, const std::function<void()>& fn) {
+        bool named = false;
+        with(val, [&] {
+            try { fn(); } catch (const std::runtime_error& e) {
+                named = std::string(e.what()).find(V) != std::string::npos;
+            }
+        });
+        return named;
+    };
+    const auto u64_of = [&](const char* val, uint64_t dflt = 7) {
+        uint64_t v = 0;
+        with(val, [&] { v = env::u64(V, dflt); });
+        return v;
+    };
+    const auto u64_fn = [&] { (void)env::u64(V, 7); };
+    check(u64_of(nullptr) == 7, "env::u64: unset -> default");
+    check(u64_of("0") == 0 && u64_of("123") == 123, "env::u64: decimal");
+    check(u64_of("0x1F") == 31 && u64_of("0X10") == 16, "env::u64: 0x hex (base auto-detected)");
+    check(u64_of("010") == 8, "env::u64: leading 0 octal, as strtoull base 0");
+    check(u64_of("18446744073709551615") == UINT64_MAX, "env::u64: 2^64 - 1 accepted");
+    for (const char* bad : {"", "abc", "12abc", "12 ", " 12", "+5", "-1", "0x", "08", "1e3", "1.5",
+                            "18446744073709551616", "99999999999999999999999"})
+        check(rejects(bad, u64_fn), std::string("env::u64 rejects '") + bad + "'");
+    const auto u32_fn = [&] { (void)env::u32(V, 7, 1, 100); };
+    check(rejects("0", u32_fn) && rejects("101", u32_fn) && rejects("4294967296", u32_fn),
+          "env::u32: outside [lo, hi] / 32 bits rejected");
+    {
+        uint32_t v = 0;
+        with("100", [&] { v = env::u32(V, 7, 1, 100); });
+        check(v == 100, "env::u32: hi bound inclusive");
+        with(nullptr, [&] { v = env::u32(V, 0, 1, 100); });
+        check(v == 0, "env::u32: unset returns the default even outside [lo, hi] (0 = 'unset' sentinel)");
+    }
+    {   // env_grid's contract: >= 1, the cli_tests.sh message
+        bool msg = false;
+        with("0", [&] {
+            try { (void)env::grid(V, 640); } catch (const std::runtime_error& e) {
+                msg = std::string(e.what()).find("work-group count") != std::string::npos;
+            }
+        });
+        check(msg, "env::grid: 0 rejected as a work-group count");
+    }
+    {
+        uint32_t v = 0;
+        with("256", [&] { v = env::wg32(V, 128); });
+        check(v == 256, "env::wg32: 256 accepted");
+        const auto wg_fn = [&] { (void)env::wg32(V, 128); };
+        check(rejects("0", wg_fn) && rejects("48", wg_fn) && rejects("1056", wg_fn) && rejects("x", wg_fn),
+              "env::wg32: 0, non-multiple of 32, > 1024, junk rejected");
+    }
+    {
+        double d = 0;
+        with("2.5", [&] { d = env::f64(V, 1.0, 0.0, 10.0); });
+        check(d == 2.5, "env::f64: 2.5");
+        with(nullptr, [&] { d = env::f64(V, 1.0, 0.0, 10.0); });
+        check(d == 1.0, "env::f64: unset -> default");
+        const auto f_fn = [&] { (void)env::f64(V, 1.0, 0.0, 10.0); };
+        for (const char* bad : {"", "x", "2.5x", " 2", "inf", "nan", "1e999", "-1", "11", "0x1p3"})
+            check(rejects(bad, f_fn), std::string("env::f64 rejects '") + bad + "'");
+    }
+    {   // on/off switch: "" = unset, only 0 / 1
+        bool b = false;
+        with(nullptr, [&] { b = env::onoff(V, true); });
+        check(b, "env::onoff: unset -> default");
+        with("", [&] { b = env::onoff(V, true); });
+        check(b, "env::onoff: empty -> default");
+        with("0", [&] { b = env::onoff(V, true); });
+        check(!b, "env::onoff: 0 -> off");
+        with("1", [&] { b = env::onoff(V, false); });
+        check(b, "env::onoff: 1 -> on");
+        const auto o_fn = [&] { (void)env::onoff(V, true); };
+        check(rejects("yes", o_fn) && rejects("2", o_fn) && rejects("00", o_fn) && rejects(" 0", o_fn),
+              "env::onoff: anything but 0 / 1 rejected");
+    }
+    {   // presence flags count any value, even "" and "0"
+        bool p = true;
+        with(nullptr, [&] { p = env::present(V); });
+        check(!p, "env::present: unset");
+        with("", [&] { p = env::present(V) && !env::is_set(V); });
+        check(p, "env::present: empty counts as present, not as set");
+        with("0", [&] { p = env::present(V) && env::is_set(V); });
+        check(p, "env::present: 0 counts as present");
+    }
+    {   // enumerations
+        std::string c;
+        with(nullptr, [&] { c = env::choice(V, "exact", {"exact", "sampled", "0"}, true); });
+        check(c == "exact", "env::choice: unset -> default");
+        with("", [&] { c = env::choice(V, "exact", {"exact", "sampled", "0"}, true); });
+        check(c == "exact", "env::choice: empty -> default when empty_is_unset");
+        with("sampled", [&] { c = env::choice(V, "exact", {"exact", "sampled", "0"}, true); });
+        check(c == "sampled", "env::choice: listed value");
+        check(rejects("fast", [&] { (void)env::choice(V, "exact", {"exact", "sampled", "0"}, true); }) &&
+              rejects("Sampled", [&] { (void)env::choice(V, "exact", {"exact", "sampled", "0"}, true); }) &&
+              rejects("", [&] { (void)env::choice(V, "1", {"0", "1", "2", "off"}, false); }),
+              "env::choice: unknown / wrong-case / empty (when not unset) rejected");
+    }
+    {   // paths: "" = default
+        std::string s;
+        with("", [&] { s = env::path(V, "dflt"); });
+        check(s == "dflt", "env::path: empty -> default");
+        with("x/y", [&] { s = env::path(V, "dflt"); });
+        check(s == "x/y", "env::path: value");
+    }
+    {   // a knob site: RidgeTracker rejects a malformed GB_RIDGE / GB_RIDGE_MIN
+        const auto cands = odd_primes_up_to(MAX_GB_PRIME);
+        const auto ridge_throws = [&](const char* var, const char* val) {
+            ::setenv(var, val, 1);
+            bool t = false;
+            try { RidgeTracker r(&cands); } catch (const std::runtime_error&) { t = true; }
+            ::unsetenv(var);
+            return t;
+        };
+        check(ridge_throws("GB_RIDGE_MIN", "3k") && ridge_throws("GB_RIDGE", "off") &&
+              !ridge_throws("GB_RIDGE_MIN", "") && !ridge_throws("GB_RIDGE_MIN", "0x1000") &&
+              !ridge_throws("GB_RIDGE", "0"),
+              "RidgeTracker: GB_RIDGE_MIN=3k / GB_RIDGE=off rejected; empty, 0x hex, GB_RIDGE=0 accepted");
+        ::setenv("GB_RIDGE_MIN", "1", 1);
+        RidgeTracker r(&cands);
+        ::unsetenv("GB_RIDGE_MIN");
+        check(r.active() && r.floor() == 3, "RidgeTracker: GB_RIDGE_MIN below 3 still clamps to 3");
+    }
+}
+
+// Malformed records in the statistics state and the gap state: refused
+// (constructor throws, file untouched) like a cut-off state, never parsed as 0.
+void test_stats_state_malformed()
+{
+    std::puts("statistics state file (malformed records)");
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("gb_state_bad_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    const std::string st = (dir / "st").string(), gst = st + ".gaps";
+    ::setenv("GB_STATS_STATE", st.c_str(), 1);
+    ::setenv("GB_STATS_LOG", (dir / "log").string().c_str(), 1);
+    ::setenv("GB_RECORDS_FILE", (dir / "rec").string().c_str(), 1);
+    ::setenv("GB_STATS_LIVE", (dir / "live").string().c_str(), 1);
+    const auto cands = odd_primes_up_to(MAX_GB_PRIME);
+    const StatsPlan plan = make_stats_plan(cands, STATS_K_DEFAULT, CHECK30_TAIL);
+    const uint64_t S = 1000000000000ull;
+    {   // a valid state with a first occurrence (p = 3001)
+        GoldbachStats g(cands, plan, CHECK30_TAIL);
+        std::vector<uint32_t> fp(MAX_GB_PRIME / 2 + 1, ~0u);
+        fp[3001 / 2] = 7;
+        g.add_first(S, fp.data());
+        g.finish_run(S, S + 1000, 501);
+        g.commit("test", 0);
+    }
+    const std::string full = slurp_file(st);
+    const auto put = [](const std::string& p, const std::string& s) {
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        std::fwrite(s.data(), 1, s.size(), f);
+        std::fclose(f);
+    };
+    const auto loads = [&] {
+        try { GoldbachStats g(cands, plan, CHECK30_TAIL); } catch (const std::runtime_error&) { return false; }
+        return true;
+    };
+    check(loads(), "valid state loads");
+    // replaces the whole line starting with @p key (the first one) by @p line
+    const auto with_line = [&](const std::string& key, const std::string& line) {
+        std::string s = full;
+        const size_t p = s.find("\n" + key);
+        if (p == std::string::npos) return std::string();
+        const size_t e = s.find('\n', p + 1);
+        return s.replace(p + 1, e - p - 1, line);
+    };
+    const std::string np1(cands.size(), ',');               // np + 1 empty entries
+    const std::vector<std::pair<std::string, std::string>> bad = {
+        {"evens ", "evens 12x 501"},
+        {"evens ", "evens -1 501"},
+        {"evens ", "evens 99999999999999999999 501"},
+        {"evens ", "evens 501"},
+        {"evens ", "evens 501 0 0"},
+        {"evens ", "evens  501 0"},
+        {"evens ", "evens 501 0 "},
+        {"range ", "range " + std::to_string(S)},
+        {"range ", "range " + std::to_string(S + 1000) + " " + std::to_string(S)},
+        {"range ", "rbnge " + std::to_string(S) + " " + std::to_string(S + 1000)},
+        {"primes30 ", "primes30 1 2 3 4 5 6 7"},
+        {"primes30 ", "primes30 1 2 3 4 5 6 7 x"},
+        {"twins30 ", "twins30 1 2 3 4"},
+        {"tail_t ", "tail_t 3001abc"},
+        {"first ", "first 9 5"},
+        {"first ", "first 3001"},
+        {"sampled 3 ", "sampled 3"},
+        {"sampled 3 ", "sampled 3 1,x"},
+        {"sampled 3 ", "sampled 3 1;2"},
+        {"sampled 3 ", "sampled 15 "},
+        {"sampled 3 ", "sampled 2 "},                       // class 2 twice, class 3 missing
+        {"tailcls 4 ", "tailcls 4 " + np1},
+        {"tailagg ", "tailagg 1,-2"},
+    };
+    for (const auto& [key, line] : bad) {
+        const std::string s = with_line(key, line);
+        if (s.empty()) { check(false, "malformed-state test: no '" + key + "' record to replace"); continue; }
+        put(st, s);
+        check(!loads() && slurp_file(st) == s, "state record '" + line + "' refused, state untouched");
+    }
+    {   // a repeated record
+        std::string s = full;
+        const size_t p = s.find("\nevens ");
+        s.insert(p + 1, s.substr(p + 1, s.find('\n', p + 1) - p));
+        put(st, s);
+        check(!loads(), "repeated evens record refused");
+    }
+    put(st, full);
+    check(loads(), "restored state loads again");
+    // gap state (.gaps)
+    const std::string gfull =
+        "# gap state\n"
+        "gaps_range 10 20\n"
+        "gaps_evens 5 5\n"
+        "gaps 3 12\n"
+        "gaps_walk 3 12 50 200 900\n"
+        "gaps_samp \n"
+        "gaps_max 6 13 1\n"
+        "gaps_tail 700 1 1000\n"
+        "end\n";
+    put(gst, gfull);
+    check(loads(), "valid gap state loads");
+    const std::vector<std::pair<std::string, std::string>> gbad = {
+        {"gaps_range 10 20", "gaps_range 10"},
+        {"gaps_range 10 20", "gaps_range 20 10"},
+        {"gaps_evens 5 5", "gaps_evens 5 5x"},
+        {"gaps 3 12", "gaps 3"},
+        {"gaps 3 12", "gaps 3 -12"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200 900 1"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200 340282366920938463463374607431768211456"},
+        {"gaps_samp ", "gaps_samp 1,a"},
+        {"gaps_max 6 13 1", "gaps_max 6 13 2"},
+        {"gaps_max 6 13 1", "gaps_max 6 13"},
+        {"gaps_tail 700 1 1000", "gaps_tail 4294967296 1 1000"},
+        {"gaps_tail 700 1 1000", "gaps_tail 700 1"},
+        {"end", "end junk"},
+        {"gaps_evens 5 5", "gaps_evns 5 5"},
+    };
+    for (const auto& [from, to] : gbad) {
+        std::string s = gfull;
+        s.replace(s.find(from), from.size(), to);
+        put(gst, s);
+        check(!loads() && slurp_file(gst) == s, "gap state record '" + to + "' refused, untouched");
+    }
+    {
+        std::string s = gfull;
+        s.insert(s.find("gaps 3 12"), "gaps 3 12\n");
+        put(gst, s);
+        check(!loads(), "repeated gaps record refused");
+    }
+    {   // u128 sums at the top of their range still parse
+        std::string s = gfull;
+        s.replace(s.find("gaps_walk 3 12 50 200 900"), 25,
+                  "gaps_walk 3 12 50 200 340282366920938463463374607431768211455");
+        put(gst, s);
+        check(loads(), "gap state with a 2^128 - 1 moment sum loads");
+    }
+    for (const char* v : {"GB_STATS_STATE", "GB_STATS_LOG", "GB_RECORDS_FILE", "GB_STATS_LIVE"}) ::unsetenv(v);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 int main()
 {
     test_prime_lists();
@@ -1077,6 +1351,8 @@ int main()
     test_ridge_store();
     test_stats_state();
     test_gap_stats();
+    test_env_parsing();
+    test_stats_state_malformed();
     std::printf("host_tests: %d checks, %d failed -> %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "env.hpp"
 #include "primes.hpp"
 
 namespace gb {
@@ -73,12 +74,11 @@ public:
     explicit RidgeTracker(const std::vector<uint32_t>* cand)
         : cand_(cand)
     {
-        const char* off = std::getenv("GB_RIDGE");
-        if (off && std::string(off) == "0") return;               // disabled
+        if (!env::onoff("GB_RIDGE", true)) return;               // disabled
         floor_ = RIDGE_MIN_DEFAULT;
-        if (const char* e = std::getenv("GB_RIDGE_MIN"))
-            if (*e) floor_ = uint32_t(std::strtoul(e, nullptr, 0));
+        if (env::is_set("GB_RIDGE_MIN")) floor_ = env::u32("GB_RIDGE_MIN", RIDGE_MIN_DEFAULT);
         if (floor_ < 3) floor_ = 3;
+        debug_ = env::present("GB_RIDGE_DEBUG");
     }
 
     bool active() const { return floor_ != 0; }
@@ -132,7 +132,7 @@ public:
             if (t.n == n) return;
         if (!is_prime_u64(p) || !is_prime_u64(n - p)) {
             ++dropped_;
-            if (std::getenv("GB_RIDGE_DEBUG"))
+            if (debug_)
                 std::fprintf(stderr, "ridge drop (shape/pair): n=%llu p=%llu\n",
                              (unsigned long long)n, (unsigned long long)p);
             return;
@@ -144,7 +144,7 @@ public:
                 if (pp >= p) break;
                 if (is_prime_u64(n - pp)) {
                     ++dropped_;
-                    if (std::getenv("GB_RIDGE_DEBUG"))
+                    if (debug_)
                         std::fprintf(stderr, "ridge drop (not minimal): n=%llu p=%llu "
                                      "< p'=%llu witness\n",
                                      (unsigned long long)n, (unsigned long long)p,
@@ -167,7 +167,7 @@ public:
         const uint32_t cnt = *reinterpret_cast<const volatile uint32_t*>(buf);
         if (cnt > RIDGE_CAP) overflow_ = true;    // kernel dropped the excess
         const uint32_t n = std::min(cnt, RIDGE_CAP);
-        if (std::getenv("GB_RIDGE_DEBUG") && cnt) {
+        if (debug_ && cnt) {
             std::fprintf(stderr, "ridge merge seg=%llu count=%u%s\n",
                          (unsigned long long)seg, cnt, cnt > RIDGE_CAP ? " (OVERFLOW)" : "");
             for (uint32_t i = 0; i < n && i < 12; ++i)
@@ -227,6 +227,7 @@ private:
     const std::vector<uint32_t>* cand_ = nullptr;
     std::vector<RidgeEntry> top_;      // sorted by ridge_before, <= RIDGE_KEEP
     uint32_t floor_ = 0;               // 0 = tracking disabled (GB_RIDGE=0)
+    bool debug_ = false;               // GB_RIDGE_DEBUG set (read once)
     uint64_t appends_ = 0;             // records passed to consider()
     uint64_t dropped_ = 0;             // records rejected by exact validation
     bool overflow_ = false;            // a kernel buffer over its capacity
