@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ci/campaign_queue.py: a finished range hands over to the next queued one;
 a running, stopped or failed range, or an empty queue, is left alone."""
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,8 @@ def check(cond, what):
 
 
 def setup(last_line, then):
-    root = Path(tempfile.mkdtemp())
+    root = Path(tempfile.mkdtemp(prefix="campaign-queue-test-"))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
     (root / "ci-state").mkdir()
     (root / "ci").mkdir()
     # stub CI: records that production start was asked for

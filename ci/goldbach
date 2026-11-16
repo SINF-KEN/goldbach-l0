@@ -8,7 +8,13 @@
 #   goldbach logs     follow the production log
 set -euo pipefail
 
-ROOT=$HOME/coding/goldbach-l0
+# the goldbach-l0 checkout: $GOLDBACH_ROOT, else the tree this script lives in
+# (~/.local/bin/goldbach is meant to be a symlink to ci/goldbach)
+ROOT=${GOLDBACH_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
+[ -f "$ROOT/ci/goldbach_ci.py" ] || {
+    echo "goldbach: $ROOT is not a goldbach-l0 checkout (set GOLDBACH_ROOT)" >&2
+    exit 2
+}
 CI=(python3 "$ROOT/ci/goldbach_ci.py")
 UNITS=(goldbach-ci.service goldbach-sync.timer goldbach-sync.path goldbach-campaign-queue.timer)
 

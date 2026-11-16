@@ -33,7 +33,7 @@ flowchart TD
         I4["Level Zero: Context + immediate list<br/>Module(goldbach_bmg.spv), create kernels"]
         I5["Allocate 2 pipeline slots of buffers:<br/>prime_map, leftovers, pending, ridge, histograms"]
         I6["Hit-list geometry: K = 128 segment lists,<br/>capacity from Mertens estimate"]
-        I7["pack_large_primes: base + gap byte encoding<br/>build_magic_reciprocals + 32-bit ms32 table"]
+        I7["pack_large_primes: base + gap byte encoding<br/>build_magic_reciprocals + build_tile_reciprocals32<br/>(include/host_math.hpp)"]
         I8["stage_upload + host_sync:<br/>candidates, plans, sieve primes,<br/>packed primes, reciprocals → VRAM"]
         I9["RidgeTracker.load goldbach_ridges.csv<br/>GoldbachStats init"]
     end

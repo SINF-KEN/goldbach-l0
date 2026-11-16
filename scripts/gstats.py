@@ -79,6 +79,15 @@ def twin_hl(a, b, steps=2000):
     return 2 * C2 * s * h / 3
 
 
+def merged(hists):
+    """Sum of several {p: count} histograms."""
+    out = {}
+    for h in hists:
+        for p, c in h.items():
+            out[p] = out.get(p, 0) + c
+    return out
+
+
 def read_state(path):
     st = {"range": [], "first": {}, "beyond": [], "sampled": {}, "tailcls": {}, "tailagg": {}}
     for line in open(path):
@@ -175,7 +184,7 @@ def write_export(path, ref, tail, st, cov, T):
         m = min(m, Sv)
     with open(path, "w") as out:
         out.write("# Extension of T. Oliveira e Silva's goldbach table t0 (verification to 4e18)\n"
-                  f"# by goldbach-l0 v2.2 over [4e18, {cov}] (contiguous coverage; exact counts)\n"
+                  f"# by goldbach-l0 (exact statistics, v2.2+) over [4e18, {cov}] (contiguous coverage; exact counts)\n"
                   f"# primes p >= {T} (below that the campaign keeps a sampled histogram only)\n"
                   "# S(p): least even n with p(n) = p over [4, covered limit]; NEW = was '?' in t0\n"
                   "# L4e18: count to 4e18 (t0)   Lrange: count in the campaign range   L: total\n"
@@ -218,12 +227,7 @@ def main():
         print("  twins by type: " + ", ".join(f"({u}, {u + 2}): {c:,}" for u, c in zip((11, 17, 29), t30)))
 
     print(f"\n== p(n) tail: every even with p(n) >= {T} (complete)")
-    tail = {}
-    for cls in st["tailcls"].values():
-        for p, c in cls.items():
-            tail[p] = tail.get(p, 0) + c
-    for p, c in st["tailagg"].items():
-        tail[p] = tail.get(p, 0) + c
+    tail = merged([*st["tailcls"].values(), st["tailagg"]])
     ntail = sum(tail.values()) + len(st["beyond"])
     print(f"  evens: {ntail:,}  (1 in {ev / max(ntail, 1):,.0f})")
     if tail:
@@ -249,10 +253,7 @@ def main():
 
     if st["sampled"]:
         print("\n== p(n) head: full histogram of the sampled segments (exact for those evens)")
-        hist = {}
-        for cls in st["sampled"].values():
-            for p, c in cls.items():
-                hist[p] = hist.get(p, 0) + c
+        hist = merged(st["sampled"].values())
         tot = sum(hist.values())
         mean = sum(p * c for p, c in hist.items()) / tot
         acc, q = 0, {}

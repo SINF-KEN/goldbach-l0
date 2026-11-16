@@ -55,6 +55,15 @@
 
 namespace gb {
 
+/// File-path knob: the variable if set and non-empty, else @p dflt (the same
+/// rule as env::path in env.hpp). Kept local: goldbach-web copies this header
+/// without env.hpp (docs/DEVELOPMENT.md).
+inline std::string env_path(const char* name, const char* dflt)
+{
+    const char* e = std::getenv(name);
+    return (e && *e) ? e : dflt;
+}
+
 inline constexpr uint32_t STATS_K_DEFAULT = 64;    // sampled exact phase-A candidates per class
 inline constexpr uint32_t STATS_SAMPLE_DEFAULT = 256;  // every 256th segment: full p(n) histogram (~0.12%)
 inline constexpr uint32_t STATS_KMAX = 128;        // MUST match X_KMAX in goldbach.cl
@@ -270,6 +279,75 @@ inline u128 u128_parse(const char* s)
     return v;
 }
 
+// Strict field parsers of the state files (goldbach_stats.state and its
+// .gaps companion). save_state / commit_gaps write records of single-space
+// separated fields of plain decimal numbers; anything else -- a sign, junk,
+// overflow, a missing or extra field -- is damage, and a damaged state is
+// refused rather than merged into (a lost field would read as 0).
+
+/// Splits @p line at every single space, keeping empty fields ("a  b" ->
+/// "a", "", "b"; "sampled 3 " -> "sampled", "3", "").
+inline std::vector<std::string> state_fields(const std::string& line)
+{
+    std::vector<std::string> f;
+    size_t pos = 0;
+    for (;;) {
+        const size_t e = line.find(' ', pos);
+        f.push_back(line.substr(pos, e == std::string::npos ? std::string::npos : e - pos));
+        if (e == std::string::npos) return f;
+        pos = e + 1;
+    }
+}
+/// @return @p t is a non-empty run of decimal digits whose value fits 128
+///         bits (stored in @p v).
+inline bool state_u128(const std::string& t, u128& v)
+{
+    if (t.empty()) return false;
+    const u128 max = ~u128(0);
+    v = 0;
+    for (char ch : t) {
+        if (ch < '0' || ch > '9') return false;
+        const unsigned d = unsigned(ch - '0');
+        if (v > (max - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    return true;
+}
+/// As state_u128, for a value that must fit 64 bits.
+inline bool state_u64(const std::string& t, uint64_t& v)
+{
+    u128 w = 0;
+    if (!state_u128(t, w) || w > u128(UINT64_MAX)) return false;
+    v = uint64_t(w);
+    return true;
+}
+/// As state_u128, for a value that must fit 32 bits.
+inline bool state_u32(const std::string& t, uint32_t& v)
+{
+    uint64_t w = 0;
+    if (!state_u64(t, w) || w > UINT32_MAX) return false;
+    v = uint32_t(w);
+    return true;
+}
+/// Parses a dense list (GoldbachStats::dense_list: comma-separated, an empty
+/// entry = 0, trailing zeros dropped) of at most @p n entries into @p v
+/// (resized to n, zero-filled).
+/// @return false on a malformed entry or more than @p n entries.
+inline bool state_dense(const std::string& t, size_t n, std::vector<uint64_t>& v)
+{
+    v.assign(n, 0);
+    if (t.empty()) return true;
+    size_t i = 0, pos = 0;
+    for (;;) {
+        const size_t e = t.find(',', pos);
+        const std::string x = t.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+        if (i >= n || (!x.empty() && !state_u64(x, v[i]))) return false;
+        ++i;
+        if (e == std::string::npos) return true;
+        pos = e + 1;
+    }
+}
+
 /// Prime gap statistics of a run or campaign. A gap g = q - prev(q) belongs to
 /// the run whose prime range [start + 1, limit - 1] holds its upper prime q
 /// (as the prime counts). Exact, every segment: count (= the primes), D1 =
@@ -355,14 +433,10 @@ public:
         first_.assign(np, 0);
         run_first_.assign(np, 0);
         want_p_.assign((primes.back() / 2 + 32) / 32, 0);
-        const char* s = std::getenv("GB_STATS_STATE");
-        state_path_ = (s && *s) ? s : "goldbach_stats.state";
-        const char* l = std::getenv("GB_STATS_LOG");
-        log_path_ = (l && *l) ? l : "goldbach_stats.log";
-        const char* r = std::getenv("GB_RECORDS_FILE");
-        rec_path_ = (r && *r) ? r : "goldbach_records.txt";
-        const char* v = std::getenv("GB_STATS_LIVE");
-        live_path_ = (v && *v) ? v : "goldbach_live.json";
+        state_path_ = env_path("GB_STATS_STATE", "goldbach_stats.state");
+        log_path_ = env_path("GB_STATS_LOG", "goldbach_stats.log");
+        rec_path_ = env_path("GB_RECORDS_FILE", "goldbach_records.txt");
+        live_path_ = env_path("GB_STATS_LIVE", "goldbach_live.json");
         for (uint16_t p : S_UNKNOWN_4E18) unknown_.push_back(p);
         load_state();
         (void)load_gaps();                         // a damaged gap state fails before the run, not after
@@ -736,7 +810,7 @@ private:
         std::fprintf(stderr, "\n*** %s", line);
         if (std::FILE* f = std::fopen(rec_path_.c_str(), "ab")) { std::fputs(line, f); std::fclose(f); }
         events_.push_back({n, p});
-        const char* hk = std::getenv("GB_RECORD_HOOK");
+        const char* hk = std::getenv("GB_RECORD_HOOK");   // set but empty: no hook
         std::string hook = hk ? hk : "";
         if (!hk) {
             if (std::FILE* sf = std::fopen("scripts/notify_record.sh", "rb")) {
@@ -890,18 +964,6 @@ private:
         return hit;
     }
 
-    static std::vector<uint64_t> parse_dense(const char* s, size_t n)
-    {
-        std::vector<uint64_t> v(n, 0);
-        size_t i = 0;
-        while (s && *s && *s != '\n' && i < n) {
-            v[i++] = std::strtoull(s, nullptr, 10);
-            s = std::strchr(s, ',');
-            if (s) ++s;
-        }
-        return v;
-    }
-
     /// Merges this run's gaps into the gap state (GAPS file: the state path +
     /// ".gaps", so isolating GB_STATS_STATE isolates it too), written BEFORE
     /// the main state: a crash in between leaves the run in the gap state
@@ -958,8 +1020,9 @@ private:
         return false;
     }
     /// The gap state (absent = empty).
-    /// @throws std::runtime_error if it exists but is cut off or misses a
-    ///         record (save writes every one, "end" last).
+    /// @throws std::runtime_error if it exists but is cut off, misses a
+    ///         record (save writes every one, "end" last) or has a malformed
+    ///         one (bad number, wrong field count, unknown or repeated record).
     GapCampaign load_gaps() const
     {
         GapCampaign gc;
@@ -972,41 +1035,59 @@ private:
         std::fclose(f);
         unsigned seen = 0;
         size_t pos = 0;
+        const auto damaged = [&](const std::string& line) {
+            return std::runtime_error("stats: gap state " + gap_path() + " has a malformed record '" +
+                                      line.substr(0, 80) + "'; refusing to merge into it");
+        };
         while (pos < all.size()) {
             size_t e = all.find('\n', pos);
             if (e == std::string::npos) break;
             const std::string buf = all.substr(pos, e - pos);
             pos = e + 1;
-            unsigned long long a = 0, c = 0;
-            unsigned p = 0;
             if (buf.empty() || buf[0] == '#') continue;
-            unsigned ex = 0;
-            if (std::sscanf(buf.c_str(), "gaps_range %llu %llu", &a, &c) == 2) { gc.covered.push_back({a, c}); seen |= 1; }
-            else if (std::sscanf(buf.c_str(), "gaps_evens %llu %llu", &a, &c) == 2) { gc.evens = a; gc.walked = c; seen |= 2; }
-            else if (buf.compare(0, 10, "gaps_walk ") == 0) {
-                const char* g = buf.c_str() + 10;
-                gc.g.wn = std::strtoull(g, nullptr, 10);
-                bool ok = true;
-                for (int k = 0; k < 4 && ok; ++k) {
-                    g = std::strchr(g, ' ');
-                    ok = g != nullptr;
-                    if (ok) gc.g.wd[k] = u128_parse(++g);
-                }
-                if (ok) seen |= 64;
-            } else if (buf.compare(0, 5, "gaps ") == 0) {
-                const char* g = buf.c_str() + 5;
-                gc.g.n = std::strtoull(g, nullptr, 10);
-                g = std::strchr(g, ' ');
-                if (g) { gc.g.d1 = u128_parse(g + 1); seen |= 4; }
-            } else if (buf.compare(0, 10, "gaps_samp ") == 0) {
-                const auto v = parse_dense(buf.c_str() + 10, GAPS30_HBINS);
+            const std::vector<std::string> fl = state_fields(buf);
+            const std::string& k = fl[0];
+            const size_t nf = fl.size();
+            // every record but gaps_range / gaps_tail appears once
+            const auto once = [&](unsigned bit) {
+                if (seen & bit) throw damaged(buf);
+                seen |= bit;
+            };
+            bool ok = true;
+            uint64_t a = 0, c = 0;
+            if (k == "gaps_range" && nf == 3) {
+                ok = state_u64(fl[1], a) && state_u64(fl[2], c) && a <= c;
+                gc.covered.push_back({a, c});
+                seen |= 1;
+            } else if (k == "gaps_evens" && nf == 3) {
+                once(2);
+                ok = state_u64(fl[1], gc.evens) && state_u64(fl[2], gc.walked);
+            } else if (k == "gaps" && nf == 3) {
+                once(4);
+                ok = state_u64(fl[1], gc.g.n) && state_u128(fl[2], gc.g.d1);
+            } else if (k == "gaps_samp" && nf <= 2) {          // "gaps_samp" / "gaps_samp " = empty
+                once(8);
+                std::vector<uint64_t> v;
+                ok = state_dense(nf == 2 ? fl[1] : std::string(), GAPS30_HBINS, v);
                 std::copy(v.begin(), v.end(), gc.g.samp.begin());
-                seen |= 8;
-            } else if (buf == "gaps_samp") seen |= 8;
-            else if (std::sscanf(buf.c_str(), "gaps_max %llu %llu %u", &a, &c, &ex) == 3) {
-                gc.g.gmax = a; gc.g.gmax_lo = c; gc.g.all_walked = ex && a < GAPS30_TAIL; seen |= 16;
-            } else if (std::sscanf(buf.c_str(), "gaps_tail %u %llu %llu", &p, &a, &c) == 3) gc.g.note_tail(p, a, c);
-            else if (buf == "end") seen |= 32;
+            } else if (k == "gaps_max" && nf == 4) {
+                once(16);
+                ok = state_u64(fl[1], a) && state_u64(fl[2], c) && (fl[3] == "0" || fl[3] == "1");
+                gc.g.gmax = a; gc.g.gmax_lo = c; gc.g.all_walked = fl[3] == "1" && a < GAPS30_TAIL;
+            } else if (k == "gaps_walk" && nf == 6) {
+                once(64);
+                ok = state_u64(fl[1], gc.g.wn);
+                for (int i = 0; i < 4 && ok; ++i) ok = state_u128(fl[2 + size_t(i)], gc.g.wd[i]);
+            } else if (k == "gaps_tail" && nf == 4) {
+                uint32_t g = 0;
+                ok = state_u32(fl[1], g) && state_u64(fl[2], a) && state_u64(fl[3], c);
+                if (ok) gc.g.note_tail(g, a, c);
+            } else if (k == "end" && nf == 1) {
+                once(32);
+            } else {
+                ok = false;                                     // unknown record or wrong field count
+            }
+            if (!ok) throw damaged(buf);
         }
         if (seen != 127)
             throw std::runtime_error("stats: gap state " + gap_path() + " is cut off or missing records; "
@@ -1049,6 +1130,9 @@ private:
     /// @throws std::runtime_error if the file exists but is not a complete
     ///         state written by save_state (empty, cut-off last line, or a
     ///         record missing: save_state writes every record, tailagg last),
+    ///         has a malformed record (non-decimal or overflowing number,
+    ///         missing or extra field, unknown or repeated record, a range
+    ///         with lo > hi, a first occurrence of a non-candidate p),
     ///         or was recorded with another tail threshold — merging into a
     ///         damaged or incompatible state would silently corrupt it.
     void load_state()
@@ -1068,46 +1152,70 @@ private:
         bool seen_t = false, seen_ev = false, seen_p = false, seen_tw = false, seen_agg = false;
         size_t pos = 0;
         const size_t np = primes_.size();
+        const auto damaged = [&](const std::string& line) {
+            return std::runtime_error("stats: state " + state_path_ + " has a malformed record '" +
+                                      line.substr(0, 80) + "' (damaged); refusing to merge into it");
+        };
+        // records written once by save_state: a repeat is damage too
+        const auto once = [&](bool& seen, const std::string& line) {
+            if (seen) throw damaged(line);
+            seen = true;
+        };
         while (pos < all.size()) {
             size_t e = all.find('\n', pos);
             if (e == std::string::npos) e = all.size();
             buf = all.substr(pos, e - pos);
             pos = e + 1;
             if (buf.empty() || buf[0] == '#') continue;
-            unsigned long long a = 0, c = 0;
-            unsigned p = 0, cr = 0;
-            if (std::sscanf(buf.c_str(), "range %llu %llu", &a, &c) == 2) covered_.push_back({a, c});
-            else if (std::sscanf(buf.c_str(), "tail_t %u", &p) == 1) {
-                if (p != tail_t_)
+            const std::vector<std::string> fl = state_fields(buf);
+            const std::string& k = fl[0];
+            const size_t nf = fl.size();
+            bool ok = true;
+            uint64_t a = 0, c = 0;
+            uint32_t p = 0, cr = 0;
+            if (k == "range" && nf == 3) {
+                ok = state_u64(fl[1], a) && state_u64(fl[2], c) && a <= c;
+                covered_.push_back({a, c});
+            } else if (k == "tail_t" && nf == 2) {
+                once(seen_t, buf);
+                ok = state_u32(fl[1], p);
+                if (ok && p != tail_t_)
                     throw std::runtime_error("stats: state " + state_path_ + " was recorded with tail_t " +
                                              std::to_string(p) + ", this run uses " + std::to_string(tail_t_));
-                seen_t = true;
+            } else if (k == "evens" && nf == 3) {
+                once(seen_ev, buf);
+                ok = state_u64(fl[1], tot_evens_) && state_u64(fl[2], tot_sampled_);
+            } else if (k == "first" && nf == 3) {
+                // only candidate primes have a first occurrence
+                ok = state_u32(fl[1], p) && state_u64(fl[2], a) && p <= primes_.back() &&
+                     (p & 1u) && pi_of_[p / 2] != 0xFFFF;
+                if (ok) first_[pi_of_[p / 2]] = a;
+            } else if (k == "beyond" && nf == 3) {
+                ok = state_u64(fl[1], c) && state_u64(fl[2], a);
+                tot_beyond_.push_back({a, c});
+            } else if (k == "primes30" && nf == 9) {
+                once(seen_p, buf);
+                for (size_t i = 0; i < 8 && ok; ++i) ok = state_u64(fl[1 + i], tot_primes_[i]);
+            } else if (k == "twins30" && nf == 4) {
+                once(seen_tw, buf);
+                for (size_t i = 0; i < 3 && ok; ++i) ok = state_u64(fl[1 + i], tot_twins_[i]);
+            } else if ((k == "sampled" || k == "tailcls") && nf == 3) {
+                uint32_t& seen = k == "sampled" ? seen_samp : seen_tail;
+                std::vector<uint64_t> v;
+                ok = state_u32(fl[1], cr) && cr < 15 && !((seen >> cr) & 1u) && state_dense(fl[2], np, v);
+                if (ok) {
+                    std::copy(v.begin(), v.end(), (k == "sampled" ? cum_samp_ : cum_tail_).begin() + cr * np);
+                    seen |= 1u << cr;
+                }
+            } else if (k == "tailagg" && nf == 2) {
+                once(seen_agg, buf);
+                std::vector<uint64_t> v;
+                ok = state_dense(fl[1], np, v);
+                for (size_t i = 0; i < np && ok; ++i) cum_tail_agg_[primes_[i] / 2] = v[i];
+            } else {
+                ok = false;                                     // unknown record or wrong field count
             }
-            else if (std::sscanf(buf.c_str(), "evens %llu %llu", &a, &c) == 2) { tot_evens_ = a; tot_sampled_ = c; seen_ev = true; }
-            else if (std::sscanf(buf.c_str(), "first %u %llu", &p, &a) == 2) {
-                if (p <= primes_.back() && pi_of_[p / 2] != 0xFFFF) first_[pi_of_[p / 2]] = a;
-            } else if (std::sscanf(buf.c_str(), "beyond %llu %llu", &c, &a) == 2) tot_beyond_.push_back({a, c});
-            else if (buf.compare(0, 9, "primes30 ") == 0) {
-                const char* s = buf.c_str() + 9;
-                for (int i = 0; i < 8 && s; ++i) { tot_primes_[i] = std::strtoull(s, nullptr, 10); s = std::strchr(s + 1, ' '); }
-                seen_p = true;
-            } else if (buf.compare(0, 8, "twins30 ") == 0) {
-                const char* s = buf.c_str() + 8;
-                for (int i = 0; i < 3 && s; ++i) { tot_twins_[i] = std::strtoull(s, nullptr, 10); s = std::strchr(s + 1, ' '); }
-                seen_tw = true;
-            } else if (std::sscanf(buf.c_str(), "sampled %u ", &cr) == 1 && cr < 15) {
-                const auto v = parse_dense(std::strchr(buf.c_str() + 8, ' ') + 1, np);
-                std::copy(v.begin(), v.end(), cum_samp_.begin() + cr * np);
-                seen_samp |= 1u << cr;
-            } else if (std::sscanf(buf.c_str(), "tailcls %u ", &cr) == 1 && cr < 15) {
-                const auto v = parse_dense(std::strchr(buf.c_str() + 8, ' ') + 1, np);
-                std::copy(v.begin(), v.end(), cum_tail_.begin() + cr * np);
-                seen_tail |= 1u << cr;
-            } else if (buf.compare(0, 8, "tailagg ") == 0) {
-                const auto v = parse_dense(buf.c_str() + 8, np);
-                for (size_t i = 0; i < np; ++i) cum_tail_agg_[primes_[i] / 2] = v[i];
-                seen_agg = true;
-            }
+            if (!ok) throw damaged(buf);
         }
         if (!(seen_t && seen_ev && seen_p && seen_tw && seen_agg &&
               seen_samp == 0x7FFFu && seen_tail == 0x7FFFu))

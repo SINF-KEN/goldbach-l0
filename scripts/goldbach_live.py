@@ -193,6 +193,17 @@ def covered_to(ranges, extra=None):
     return hi
 
 
+_warned = set()
+
+
+def warn_once(msg):
+    """msg on stderr, once per distinct message: the dashboard redraws every
+    couple of seconds, a persistent error is reported once, not per frame."""
+    if msg not in _warned:
+        _warned.add(msg)
+        print(f"goldbach_live: {msg}", file=sys.stderr, flush=True)
+
+
 def ci_panel(now):
     """Lines for a local CI run in progress (ci-state/state.json), with the
     progress of its GPU slice (the slice's isolated goldbach_live.json)."""
@@ -214,8 +225,9 @@ def ci_panel(now):
                 sys.path.insert(0, "ci")
             import goldbach_ci
             out.append(f"         {goldbach_ci.bench_progress(stt)}")
-        except Exception:
-            pass
+        except Exception as e:  # import or helper failure: the dashboard goes on without the line
+            warn_once(f"CI benchmark progress unavailable: {type(e).__name__}: {e}")
+            out.append(f"         {D}benchmark progress unavailable ({type(e).__name__}){R}")
     live_path = stt.get("live") or f"ci-state/runs/{stt.get('run_id')}/slice-files/live.json"
     if ph in ("slice", "slice_reference"):
         try:

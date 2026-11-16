@@ -211,5 +211,118 @@ for name, fn in (("gstats", gstats.covered_to), ("goldbach_live", goldbach_live.
     check(fn([(E, E + 10), (E + 12, E + 20), (E + 40, E + 50)]) == E + 20, f"{name}.covered_to stops at a gap")
     check(fn([(E + 2, E + 10)]) is None, f"{name}.covered_to: not starting at 4e18 -> None")
 
+# --- broad exception handlers: logged with a traceback, never a PASS ---------
+import contextlib  # noqa: E402
+import io  # noqa: E402
+cilog = Path(TMP) / "ci.log"
+
+
+def log_since(f):
+    """ci.log written while f() runs (its stdout swallowed)."""
+    n = cilog.stat().st_size if cilog.exists() else 0
+    with contextlib.redirect_stdout(io.StringIO()):
+        f()
+    return cilog.read_text()[n:]
+
+
+def raise_in_handler(key):
+    try:
+        raise ValueError("same failure")
+    except ValueError:
+        g.log_exc("poll failed", key=key)
+
+
+txt = log_since(lambda: raise_in_handler("k"))
+check("poll failed\nTraceback" in txt and "ValueError: same failure" in txt, "log_exc logs the traceback")
+txt = log_since(lambda: raise_in_handler("k"))
+check("same traceback as before" in txt and "Traceback" not in txt, "log_exc: a repeated traceback is not re-logged")
+
+# production_paused: a body failure propagates, a failed resume is recorded,
+# logged with its traceback and alerted
+alerts = []
+g.alert = lambda *a: alerts.append(a)
+g.stop_production = lambda now=False, reason="": {"was_running": True, "mode": "boundary", "lost_s": 0}
+
+
+def no_resume():
+    raise RuntimeError("systemd-run failed: boom")
+
+
+g.start_production = no_resume
+holder = {}
+
+
+def paused_body_fails():
+    try:
+        with g.production_paused("test") as info:
+            holder["info"] = info
+            raise g.CIFail("gate")
+    except g.CIFail:
+        holder["propagated"] = True
+
+
+txt = log_since(paused_body_fails)
+check(holder.get("propagated") and "boom" in holder["info"].get("resume_error", ""),
+      "production_paused: the body's failure propagates, the resume error is recorded")
+check("could NOT resume production" in txt and "Traceback" in txt and alerts[-1][0] == "CI could not resume run_range",
+      "production_paused: a failed resume is logged with its traceback and alerted")
+
+# Run.execute: an infrastructure error is an ERROR, never a promotion, and
+# production is resumed; a benchmark error after a PASS leaves the PASS
+calls = []
+g.stop_production = lambda now=False, reason="": calls.append("stop") or {"was_running": True, "mode": "x", "lost_s": 0}
+g.start_production = lambda expect_release=None: calls.append("start") or {}
+g.promote = lambda rel: calls.append("promote")
+g.flock = lambda *a, **k: contextlib.nullcontext()          # no real .goldbach-gpu.lock in the checkout
+
+
+def fake_run(**stages):
+    r = object.__new__(g.Run)
+    r.c = dict(g.DEFAULTS, bench_on_promote="quick")
+    r.sha, r.refs, r.force_gpu, r.cpu_tests, r.stack_change = "f" * 40, ["t"], False, False, None
+    r.id = f"test-{len(calls)}-{len(alerts)}"
+    r.dir = Path(TMP) / "runs" / r.id
+    r.dir.mkdir(parents=True)
+    r.act, r.ameta, r.pc, r.env, r.seg, r.rel = None, {}, {}, {}, "1", Path(TMP) / "rel"
+    r.rec = {"run_id": r.id, "commit": r.sha, "refs": r.refs, "subject": "s", "status": "RUNNING", "checks": [],
+             "gpu_stack": {}}
+    r.state = {"run_id": r.id, "sha": r.sha, "refs": r.refs}
+    for name in ("build", "gpu_suite", "bench", "ci_window", "remember_reference"):
+        setattr(r, name, stages.get(name, lambda: None))
+    return r
+
+
+def boom(msg, exc=RuntimeError):
+    def f(*a, **k):
+        raise exc(msg)
+    return f
+
+
+out = {}
+calls.clear()
+txt = log_since(lambda: out.update(rec=fake_run(ci_window=boom("GPU hung")).execute()))
+check(out["rec"]["status"] == "ERROR" and "GPU hung" in out["rec"]["reason"], "an infrastructure error -> ERROR")
+check(calls == ["stop", "start"], "ERROR: nothing promoted, production resumed")
+check("Traceback" in txt and "RuntimeError: GPU hung" in txt, "ERROR: logged with its traceback")
+calls.clear()
+log_since(lambda: out.update(rec=fake_run(build=boom("cmake", OSError)).execute()))
+check(out["rec"]["status"] == "ERROR" and calls == [], "a build-stage error -> ERROR, production untouched")
+calls.clear()
+log_since(lambda: out.update(rec=fake_run(ci_window=boom("exact_primes", g.CIFail)).execute()))
+check(out["rec"]["status"] == "FAIL" and calls == ["stop", "start"], "a failed gate -> FAIL, nothing promoted")
+calls.clear()
+g.benchmark_session = boom("bench.py crashed")
+txt = log_since(lambda: out.update(rec=fake_run().execute()))
+check(out["rec"]["status"] == "PASS" and calls == ["stop", "promote", "start"]
+      and "bench.py crashed" in out["rec"]["benchmark"]["error"] and "Traceback" in txt,
+      "a benchmark error after the promotion: the PASS stands, error recorded and logged")
+
+# goldbach_live: a persistent error is reported once, not on every redraw
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    for _ in range(3):
+        goldbach_live.warn_once("CI benchmark progress unavailable: X")
+check(err.getvalue().count("unavailable") == 1, "goldbach_live.warn_once: once per distinct message")
+
 print(f"test_ci: {fails} failure(s) -> {'PASS' if not fails else 'FAIL'}")
 sys.exit(1 if fails else 0)

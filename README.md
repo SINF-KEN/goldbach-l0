@@ -20,7 +20,7 @@
 compiled to SPIR-V and a C++23 host. It is running a campaign over
 **[4×10¹⁸, 5×10¹⁸]**, beyond the published verification to 4×10¹⁸, and
 records exact statistics of every even it verifies (smallest Goldbach
-primes, prime and twin-prime counts).
+primes, prime and twin-prime counts, prime gaps).
 
 **v2.5.1: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
 top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
@@ -31,7 +31,8 @@ on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580.
 | [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 audit |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | hardware and software, build, tests, CI, the kernel shipping procedure, reproducibility, production operation |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | how performance is measured and compared; raw data in [bench/](bench/) |
-| [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, kernels, host, and the log of every optimization kept or dropped (§9.2) |
+| [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, pipeline, kernels, host |
+| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2w, numbered as before), the per-version performance record, the removed wheel path |
 | [docs/PIPELINE.md](docs/PIPELINE.md) | the production run as a diagram, from `run_range.sh` to the journal |
 | [ci/README.md](ci/README.md) | the local CI: release gating, production control |
 
@@ -41,7 +42,7 @@ For each even `n` one partition suffices. Candidates `p` are the odd primes
 up to 9781 (no even below 4×10¹⁸ needs more; above it the CPU fallback
 looks further), so the problem becomes: build an exact primality map of the
 odd `q` near the segment, then test `q = n - p` for each even. Per
-425-million-integer segment, double-buffered while the CPU prepares the
+467.5-million-integer segment, double-buffered while the CPU prepares the
 next:
 
 1. **`make_prime_map`** (tile sieve) — the map holds only `q` coprime to 30,
@@ -108,8 +109,8 @@ doing that extra work. Per 10¹¹ integers at 4×10¹⁸: large-prime sieve
 431 ms (packed kernel + hit lists), tile sieve 168 ms, checker and
 statistics 175 ms; the next segment's sieve overlaps the checker, so the
 parts add up to more than the 718 ms GPU time. The history of every version and
-every measured change is in [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md)
-§9.2 and §13; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
+every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and
+[PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ![Timing waterfall, long window, by version](docs/images/waterfall-long-by-version.png)
 
@@ -118,10 +119,10 @@ every measured change is in [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md)
 Each even needs only ONE prime `q`, so the map does not have to cover every
 odd `q`: the sparse class map keeps 12 residue classes mod 30030 (0.04% of
 the integers) chosen so that every even class reaches one of them, with
-candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (17× the
+candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (~15× the
 dense path) but cannot produce the exact statistics (its map holds 12 of
 5760 classes), so the campaign runs the dense path. Design and validation:
-[PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §9.2k.
+[HISTORY.md §9.2k](docs/HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp).
 
 ## Goldbach ridge tracking (`My Top 30 Largest Goldbach Ridges`)
 

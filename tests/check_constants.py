@@ -10,7 +10,9 @@ kernels' TILE_WORDS 8192 vs the host's 2048 (fixed in v2.0.1) overran the map.
 
 This script extracts each value from source and fails on any mismatch. It
 also checks that every ocloc -D option set used to build a sparse module (CI,
-CMakeLists.txt) matches include/sparse.hpp scm_geo(). No compiler, no GPU.
+CMakeLists.txt) matches include/sparse.hpp scm_geo(), and that README.md's
+release version and C++ badge match config.hpp VERSION and
+CMAKE_CXX_STANDARD. No compiler, no GPU.
 
 usage: tests/check_constants.py   (run from anywhere; exit 1 on mismatch)
 """
@@ -74,9 +76,9 @@ def host_constants(*rels):
     return env
 
 
-def same(what, host_val, kernel_val):
+def same(what, host_val, kernel_val, labels=("host", "kernel")):
     ok = host_val == kernel_val
-    print(f"  {'ok  ' if ok else 'FAIL'} {what}: host {host_val}  kernel {kernel_val}")
+    print(f"  {'ok  ' if ok else 'FAIL'} {what}: {labels[0]} {host_val}  {labels[1]} {kernel_val}")
     if not ok:
         FAIL.append(what)
 
@@ -115,6 +117,8 @@ def main():
     same("MAX_MASK_GROUPS (verifier.cpp)", int(mg.group(1)), gbl["MAX_MASK_GROUPS"])
     rmax = re.search(r"bucket_R\s*>\s*(\d+)", read("src/verifier.cpp"))
     same("bucket ring limit / BKT_MAX_R", int(rmax.group(1)), gbl["BKT_MAX_R"])
+    hk = re.search(r"HL_MAX_K_HOST\s*=\s*(\d+)", read("src/verifier.cpp"))
+    same("HL_MAX_K_HOST (verifier.cpp) / HL_MAX_K", int(hk.group(1)), gbl["HL_MAX_K"])
 
     print("sparse.hpp <-> kernels/sparse.cl")
     sp = host_constants("include/sparse.hpp")
@@ -154,6 +158,30 @@ def main():
             same(f"{rel} M={M}: residues", g.get("res"),
                  [int(x.rstrip("u")) for x in d["SCM_RES_LIST"].split(",")])
             same(f"{rel} M={M}: A3_SPAN", g.get("span"), int(d.get("A3_SPAN", scl["A3_SPAN"])))
+
+    # Documentation drift: what README.md claims vs the code that defines it.
+    print("README.md <-> config.hpp / CMakeLists.txt")
+    doc = ("code", "README")
+    readme = read("README.md")
+    cmake = read("CMakeLists.txt")
+    ver = re.search(r'inline\s+constexpr\s+const\s+char\s*\*\s*VERSION\s*=\s*"([^"]+)"',
+                    read("include/config.hpp"))
+    # the release the README's headline figures are for: "**v2.5.1: 69.6 billion
+    # ..." (or the older "Current release: **v2.5.1**")
+    rel = (re.search(r"^\*\*v(\d+\.\d+\.\d+):", readme, re.M)
+           or re.search(r"Current release: \*\*v([^*]+)\*\*", readme))
+    same("VERSION (config.hpp) / README headline release",
+         ver.group(1) if ver else "unparsed", rel.group(1) if rel else "unparsed", doc)
+    pv = re.search(r"project\s*\([^)]*\bVERSION\s+([0-9.]+)", cmake)
+    if pv:                                           # only if CMake declares one
+        same("VERSION (config.hpp) / CMakeLists.txt project(VERSION)",
+             ver.group(1) if ver else "unparsed", pv.group(1), ("config.hpp", "CMake"))
+    std = re.search(r"set\s*\(\s*CMAKE_CXX_STANDARD\s+(\d+)\s*\)", cmake)
+    badge = re.search(r"badge/C%2B%2B-(\d+)-", readme)
+    alt = re.search(r'alt="C\+\+(\d+)"', readme)
+    std = std.group(1) if std else "unparsed"
+    same("CMAKE_CXX_STANDARD / README C++ badge", std, badge.group(1) if badge else "unparsed", doc)
+    same("CMAKE_CXX_STANDARD / README C++ badge alt", std, alt.group(1) if alt else "unparsed", doc)
 
     print(f"check_constants: {len(FAIL)} mismatch(es) -> {'FAIL' if FAIL else 'PASS'}")
     return 1 if FAIL else 0

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "env.hpp"
 #include "l0_context.hpp"
 #include "verifier.hpp"
 #include "sparse_run.hpp"
@@ -68,7 +69,7 @@ void usage() {
         "  --start N      first even n to verify (scale tests; default 4)\n"
         "  --segment N    even integer span per GPU segment  (default {})\n"
         "  --split N      base-prime split index (0 = auto)  (default 0)\n"
-        "  --sparse       sparse class map (v2.0, PROJECT-REFERENCE.md §9.2k; also\n"
+        "  --sparse       sparse class map (v2.0, HISTORY.md §9.2k; also\n"
         "                 GB_SPARSE=1): ~17x faster at 4e18, needs start >> sqrt(limit)\n"
         "  --spv FILE     SPIR-V module path                (default kernels/goldbach_bmg.spv)\n"
         "  --prime-cache FILE  disk cache for the base-prime list\n"
@@ -307,7 +308,7 @@ int main(int argc, char** argv) {
         }
 
         // GB_SPARSE=1 selects the sparse path too (benchmark harness arms)
-        if (const char* e = std::getenv("GB_SPARSE")) sparse = sparse || std::string(e) == "1";
+        if (gb::env::onoff("GB_SPARSE", false)) sparse = true;
         if (sparse && !spv_set) spv.clear();          // the geometry's module
         const gb::RunStats s = sparse
             ? gb::run_gpu_sparse(limit, segment, spv, verbose, start, uint32_t(split),
@@ -352,8 +353,8 @@ int main(int argc, char** argv) {
                        "  evens with full p(n)    : {} (sampled segments)\n"
                        "  primes in [start, limit]: {}\n"
                        "  twin-prime pairs        : {}\n",
-                       std::getenv("GB_STATS_LOG") ? std::getenv("GB_STATS_LOG") : "goldbach_stats.log",
-                       std::getenv("GB_STATS_STATE") ? std::getenv("GB_STATS_STATE") : "goldbach_stats.state",
+                       gb::env::present("GB_STATS_LOG") ? gb::env::raw("GB_STATS_LOG") : "goldbach_stats.log",
+                       gb::env::present("GB_STATS_STATE") ? gb::env::raw("GB_STATS_STATE") : "goldbach_stats.state",
                        s.stats_pmax, s.stats_tail, s.stats_sampled, s.stats_primes, s.stats_twins);
         if (!csv && !json) print_ridges(s);   // --json / --csv carry ridge_top / ridge_max
         if (per_seg && !json) print_per_segment(s);

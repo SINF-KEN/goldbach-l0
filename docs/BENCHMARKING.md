@@ -5,7 +5,7 @@ journal every `tools/bench.py` session writes (one row per run, never
 edited); `bench-20260926-sparse-v2.csv` is the v2.0 sparse session. Figures:
 `bash docs/make-plots.sh` (needs pandas + matplotlib) renders
 `docs/images/` from the journal. Results per change are recorded in
-[PROJECT-REFERENCE.md](PROJECT-REFERENCE.md) §9.2.
+[HISTORY.md](HISTORY.md) §9.2.
 
 ## The measure
 

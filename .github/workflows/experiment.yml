@@ -16,7 +16,9 @@ permissions:
   contents: read
 
 env:
-  PROD_DIR: /home/ken/coding/goldbach-l0     # production tree (as ci.yml)
+  # production tree: the repository variable GOLDBACH_ROOT (as ci.yml)
+  GOLDBACH_ROOT: ${{ vars.GOLDBACH_ROOT }}
+  PROD_DIR: ${{ vars.GOLDBACH_ROOT }}
 
 jobs:
   experiment:
@@ -27,6 +29,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Production tree configured (repository variable GOLDBACH_ROOT)
+        run: |
+          test -n "$GOLDBACH_ROOT" && test -f "$PROD_DIR/ci/goldbach_ci.py" || {
+            echo "::error::set the repository variable GOLDBACH_ROOT to the production goldbach-l0 checkout (gh variable set GOLDBACH_ROOT --body /path/to/goldbach-l0); goldbach-tools is expected next to it"
+            exit 1; }
 
       - name: Spec
         run: |

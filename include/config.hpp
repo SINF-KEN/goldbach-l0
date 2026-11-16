@@ -13,13 +13,15 @@
 namespace gb {
 
 // Algorithm version. v2.0.0 adds the sparse class map pipeline (--sparse,
-// PROJECT-REFERENCE.md §9.2k); the dense path is unchanged since v1.13.0.
+// HISTORY.md §9.2k); the dense path is unchanged since v1.13.0.
 // v2.0.1: correctness fixes only (--wheel low-range witnesses, §15; CLI and
 // ScmEngine fail-closed paths); dense and --sparse kernels byte-identical.
-// v2.1.0: cleanup release — concluded experiment kernels/tools and the
+// v2.1.0: cleanup release — concluded experiment kernels/tools and their
 // A/B-only env knobs removed; production paths unchanged (spv byte-identical).
+// The selectors of earlier production paths (GB_SPLIT, GB_CLASSMAP, GB_TWIN,
+// GB_C30, ...) were kept; PROJECT-REFERENCE.md §7 lists every GB_* variable.
 // v2.2.0: exact Goldbach statistics on the dense path (include/gstats.hpp,
-// PROJECT-REFERENCE.md §9.2l) and a tail-bounded mod-30 checker plan
+// HISTORY.md §9.2l) and a tail-bounded mod-30 checker plan
 // (every phase-A member < 3000: complete ridges and p(n) >= 3000 tail).
 // v2.2.1: fail closed above 2^64 - 2^40 (the base-prime bound wrapped to ~16
 // above ~1.8446744e19 and sieved with primes < 64 only: false PASS); results
@@ -57,9 +59,6 @@ inline constexpr uint32_t WG_SIZE           = 256;                       // thre
 #endif
 inline constexpr uint32_t TILE_WORDS        = GB_TILE_WORDS;             // words of 64 odd numbers
 inline constexpr uint64_t BITS_PER_TILE     = uint64_t(TILE_WORDS) * 64; // 131,072 odd numbers (16 KB)
-inline constexpr uint64_t ODDS_PER_TILE     = BITS_PER_TILE;             // odd values per tile
-inline constexpr uint64_t INTEGERS_PER_TILE = BITS_PER_TILE * 2;         // ~262K integer range
-inline constexpr uint32_t WORDS_PER_THREAD  = TILE_WORDS / WG_SIZE;      // 8 words per thread
 // The large-prime kernel amortizes dispatch across a small, bounded batch.
 // Keep this mirrored in kernels/goldbach.cl. Four preserves short work-items
 // while reducing ~98M work-items at 4e18 to ~25M.
@@ -161,11 +160,6 @@ inline constexpr uint32_t MED_MIN_P_CLASS = 512;
 // Small-prime mask sieve bound (must match MASK_MAX_P in kernels/goldbach.cl):
 // primes below this use whole-word AND masks in make_prime_map stage 3a.
 inline constexpr uint32_t MASK_MAX_P = 64;
-
-// ---- Sieve primes --------------------------------------------------------
-// Base primes for the segmented sieve must reach sqrt(max q).
-// 1e6 => supports q up to ~1e12. Raise this (and rebuild) for larger runs.
-inline constexpr uint32_t SIEVE_PRIME_LIMIT = 1'000'000;
 
 // ---- Defaults ------------------------------------------------------------
 inline constexpr uint64_t DEFAULT_LIMIT          = 100'000'000ULL;  // verify evens in [4, limit]

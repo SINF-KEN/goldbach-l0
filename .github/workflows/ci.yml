@@ -53,8 +53,11 @@ env:
     goldbach|kernels/goldbach.cl|
     sparse|kernels/sparse.cl|
     sparse30030|kernels/sparse.cl|-DSCM_M=30030u -DSCM_K=12u -DSCM_RES_LIST=2377u,7979u,9731u,11267u,13799u,14611u,18427u,18649u,21467u,21523u,22823u,23911u -DA3_SPAN=8
-  TOOLS_DIR: /home/ken/coding/goldbach-tools     # local goldbach-tools checkout
-  PROD_DIR: /home/ken/coding/goldbach-l0     # production tree (run_range, ci-state)
+  # production tree (run_range, ci-state) and the goldbach-tools checkout next
+  # to it (tools -> ../goldbach-tools): one repository variable, GOLDBACH_ROOT
+  GOLDBACH_ROOT: ${{ vars.GOLDBACH_ROOT }}
+  PROD_DIR: ${{ vars.GOLDBACH_ROOT }}
+  TOOLS_DIR: ${{ vars.GOLDBACH_ROOT }}/../goldbach-tools
 
 jobs:
   kernels:
@@ -127,7 +130,8 @@ jobs:
         # ocloc 26.40 SPIR-V output is deterministic. A difference means the
         # source changed without the binary being rebuilt, or the binary came
         # from another toolchain. Fix: rebuild with the pinned ocloc and commit
-        # kernels/*_bmg.spv + .bin together with the source.
+        # kernels/*_bmg.spv together with the source (the native .bin ocloc
+        # also writes is not shipped: .gitignore).
         run: |
           bad=0
           while IFS='|' read -r label src _; do
@@ -210,13 +214,14 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version | head -2
-          shellcheck -S warning build.sh docs/make-plots.sh tests/cli_tests.sh tests/gpu_validate.sh scripts/notify_record.sh
+          shellcheck -S warning build.sh docs/make-plots.sh tests/cli_tests.sh tests/gpu_validate.sh \
+            scripts/notify_record.sh ci/goldbach ci/setup-runners.sh
 
       - name: actionlint (workflow files)
         run: actionlint -color
 
       - name: Python syntax
-        run: python3 -m py_compile tests/*.py scripts/*.py ci/*.py
+        run: python3 -m py_compile tests/*.py scripts/*.py ci/*.py ci/gbci/*.py
 
       - name: Local CI logic (journal chain, reference cache, exact gates, ledger)
         run: python3 tests/test_ci.py
@@ -238,6 +243,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: goldbach-l0
+
+      - name: Production tree configured (repository variable GOLDBACH_ROOT)
+        run: |
+          test -n "$GOLDBACH_ROOT" && test -f "$PROD_DIR/ci/goldbach_ci.py" || {
+            echo "::error::set the repository variable GOLDBACH_ROOT to the production goldbach-l0 checkout (gh variable set GOLDBACH_ROOT --body /path/to/goldbach-l0); goldbach-tools is expected next to it"
+            exit 1; }
 
       - name: goldbach-tools at its committed HEAD (tools -> ../goldbach-tools)
         # a clone, not a link to the live checkout: the build must not depend
@@ -285,6 +296,12 @@ jobs:
     needs: [kernels, host, static]
     timeout-minutes: 300
     steps:
+      - name: Production tree configured (repository variable GOLDBACH_ROOT)
+        run: |
+          test -n "$GOLDBACH_ROOT" && test -f "$PROD_DIR/ci/goldbach_ci.py" || {
+            echo "::error::set the repository variable GOLDBACH_ROOT to the production goldbach-l0 checkout (gh variable set GOLDBACH_ROOT --body /path/to/goldbach-l0); goldbach-tools is expected next to it"
+            exit 1; }
+
       - name: Local CI (ci/goldbach_ci.py run, the production tree's copy)
         run: |
           python3 "$PROD_DIR/ci/goldbach_ci.py" run "$GITHUB_SHA" --fetch --skip-cpu-tests \

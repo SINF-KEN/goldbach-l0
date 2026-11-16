@@ -1,5 +1,6 @@
 #include <algorithm>
 #include "l0_context.hpp"
+#include "env.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -44,15 +45,7 @@ std::optional<double> kernel_seconds(ze_event_handle_t ev, double timer_hz) {
 }
 
 uint32_t env_grid(const char* name, uint32_t dflt) {
-    const char* e = std::getenv(name);
-    if (!e) return dflt;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long v = std::strtoull(e, &end, 0);
-    if (*e == '\0' || *end != '\0' || errno != 0 || v < 1 || v > 0xFFFFFFFFull)
-        throw std::runtime_error(std::string(name) + "='" + e +
-                                 "': expected a work-group count >= 1");
-    return uint32_t(v);
+    return env::grid(name, dflt);
 }
 
 // ---------------------------------------------------------------- Context --
@@ -60,7 +53,7 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 // EU thread arbitration hint for every Kernel: round-robin measured +0.6%
 // over the Xe2 default (stall-based round-robin), oldest-first -0.6%; mixing
 // policies between the kernels of a segment loses (2026-11-15,
-// PROJECT-REFERENCE 9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
+// HISTORY.md §9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
 // 2 stall-based, off = the driver's default. Parsed once per Context, before
 // any kernel exists. Support is decided by zeKernelSchedulingHintExp itself
 // (Kernel::Kernel), NOT by ze_scheduling_hint_exp_properties_t: the B580
@@ -70,10 +63,9 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 // the default falls back to the driver's arbitration with a warning. The
 // policy in force is reported by sched_policy_name() (run output: sched=).
 static void sched_setup() {
-    const char* se = std::getenv("GB_SCHED");
-    const std::string sv = se ? se : "1";
+    const std::string sv = env::choice("GB_SCHED", "1", {"0", "1", "2", "off"}, false);
     SchedPolicy p;
-    p.requested = se != nullptr;
+    p.requested = env::present("GB_SCHED");
     if (sv == "off") {
         p.name = "driver";
         g_sched = p;
@@ -82,7 +74,7 @@ static void sched_setup() {
     if (sv == "0")      { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_OLDEST_FIRST; p.name = "oldest-first"; }
     else if (sv == "1") { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_ROUND_ROBIN; p.name = "round-robin"; }
     else if (sv == "2") { p.flag = ZE_SCHEDULING_HINT_EXP_FLAG_STALL_BASED_ROUND_ROBIN; p.name = "stall-based"; }
-    else throw std::runtime_error("GB_SCHED='" + sv + "': must be 0, 1, 2 or off");
+    else throw std::logic_error("GB_SCHED: unhandled value " + sv);   // env::choice checked it
 
     g_sched = p;
 }
@@ -117,6 +109,9 @@ Context::Context(bool unordered) {
     if (!device_) throw std::runtime_error("no GPU device found");
 
     sched_setup();
+    // GB_UNORDERED=0: in-order list (dense pipeline only). Read before any Level Zero object is
+    // created, so a malformed value throws without leaking one.
+    const bool unordered_env = unordered && env::onoff("GB_UNORDERED", true);
 
     ze_context_desc_t cdesc{};
     cdesc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
@@ -142,8 +137,7 @@ Context::Context(bool unordered) {
     // segment's checker drains (+1.2%). Raw fills / copies get no barrier:
     // run_gpu orders the ones that need it itself.
     if (unordered) {
-        const char* u = std::getenv("GB_UNORDERED");
-        if (!(u && std::strcmp(u, "0") == 0)) { qdesc.flags = 0; g_unordered = true; }
+        if (unordered_env) { qdesc.flags = 0; g_unordered = true; }
     }
     qdesc.mode   = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
     qdesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
