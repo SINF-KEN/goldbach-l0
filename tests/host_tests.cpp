@@ -829,7 +829,7 @@ void test_stats_state()
         g.commit("test", 7);                      // 7 sampled evens claimed, 0 recorded
     } catch (const std::exception&) { threw = true; }
     check(threw && slurp(st) == full, "sampled-evens mismatch throws, state unchanged");
-    for (size_t cut : {size_t(0), full.size() / 2, full.size() - 1}) {
+    for (size_t cut : {0uz, full.size() / 2, full.size() - 1}) {
         { std::FILE* f = std::fopen(st.c_str(), "wb"); std::fwrite(full.data(), 1, cut, f); std::fclose(f); }
         threw = false;
         try { GoldbachStats g(cands, plan, CHECK30_TAIL); } catch (const std::exception&) { threw = true; }

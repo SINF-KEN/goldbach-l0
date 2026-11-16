@@ -927,7 +927,7 @@ RunStats run_gpu(uint64_t limit,
         b.mask_table[s] = static_cast<uint64_t*>(ctx.alloc_shared(ncls * mask_count * 64 * 8));
         if (mask_groups_n > 0)
             b.group_masks[s] = static_cast<uint64_t*>(ctx.alloc_shared(ncls * mask_group_words * 8));
-        b.group_y[s] = static_cast<uint32_t*>(ctx.alloc_shared(size_t(8) * MAX_MASK_GROUPS_HOST * 4));
+        b.group_y[s] = static_cast<uint32_t*>(ctx.alloc_shared(8uz * MAX_MASK_GROUPS_HOST * 4));
         if (class_mode && mask_groups_n > 0) {   // canonical group tables: segment-independent
             const SmallPrimeGroups cg = small_prime_group_masks_canonical(
                 sieve_primes, mask_count, c30 ? 15u : 3u, mask_period);
@@ -1397,7 +1397,7 @@ RunStats run_gpu(uint64_t limit,
         size_t block_bytes = 0;
         const auto take = [&block_bytes](size_t bytes) {   // 64-byte aligned sub-buffer offset
             const size_t at = block_bytes;
-            block_bytes += (bytes + 63) & ~size_t(63);
+            block_bytes += (bytes + 63) & ~63uz;
             return at;
         };
         const size_t at_p_hist  = take(ph_bytes);

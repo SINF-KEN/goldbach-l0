@@ -299,7 +299,7 @@ inline PlanSCM make_plan_scm(const ScmGeo& g, const std::vector<uint32_t>& prime
     PlanSCM plan;
     plan.pmax = pmax;
     plan.meta.assign(size_t(CR) * SCM_META, 0);
-    plan.rtab.assign(size_t(2) * CR, 0);
+    plan.rtab.assign(2uz * CR, 0);
     double sum_tests = 0, sum_cost = 0, sum_f = 0, sum_s = 0;
     for (uint32_t cr = 0; cr < CR; ++cr) {
         const Local& loc = outs[cr];
@@ -347,7 +347,7 @@ inline void validate_plan_scm(const ScmGeo& g, const PlanSCM& plan, uint32_t TB,
                               uint32_t bound, IsPrime&& is_p)
 {
     const uint32_t M = g.M, K = g.K, CR = g.CR();
-    if (plan.meta.size() != size_t(CR) * SCM_META || plan.rtab.size() != size_t(2) * CR)
+    if (plan.meta.size() != size_t(CR) * SCM_META || plan.rtab.size() != 2uz * CR)
         throw std::runtime_error("plan: table sizes do not match the geometry");
     std::atomic<bool> bad{false};
     std::string why;

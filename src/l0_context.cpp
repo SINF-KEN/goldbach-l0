@@ -165,7 +165,7 @@ void* Context::alloc_device(size_t bytes, size_t align) const {
     // 15-200% slower depending on where the map landed (TLB reach) — one
     // pipeline slot was consistently ~55% slower than the other. Rounded,
     // both slots run at the fast rate (large_s -30%). The tail is unused.
-    constexpr size_t kHuge = size_t(2) << 20;
+    constexpr size_t kHuge = 2uz << 20;
     if (bytes >= kHuge / 2) {
         bytes = (bytes + kHuge - 1) / kHuge * kHuge;
         align = std::max(align, kHuge);
