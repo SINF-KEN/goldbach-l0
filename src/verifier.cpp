@@ -531,6 +531,10 @@ private:
     void begin_segment_loop();
     bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
 
+    void segment_loop();
+    void assemble_run_stats();
+    void release_device_objects();
+
     // ---- per-segment steps -------------------------------------------------------
     void enqueue_sieve(Segment& sg);
     void enqueue_large_primes(Segment& sg);
@@ -2561,23 +2565,10 @@ void DenseRun::drain_final_segment() {
     ridges->save(ridge_file);
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    allocate_slot_buffers();
-    size_bucket_ring_and_hitlists();
-    allocate_large_prime_buffers();
-    upload_tables();
-
-    pack_stats_buffers();
-
-    create_events();
-
+/// Phase 12: the segment loop. Each iteration enqueues segment k on its slot,
+/// then collects segment k - 1 from the other slot; the drain collects the
+/// last one.
+void DenseRun::segment_loop() {
     begin_segment_loop();
 
     for (uint64_t seg_start = start_even; seg_start <= limit; seg_start += segment_even) {
@@ -2607,7 +2598,11 @@ RunStats DenseRun::run() {
 
     // ---- Drain: collect the final segment --------------------------------
     drain_final_segment();
+}
 
+/// Phase 13: RunStats from the loop's sums; the statistics run is finished
+/// and committed; the ridge overflow warning.
+void DenseRun::assemble_run_stats() {
     stats.gpu_seconds = seconds_since(t_gpu);
     if (phase_trace) {
         std::fprintf(stderr,
@@ -2655,7 +2650,12 @@ RunStats DenseRun::run() {
         std::fprintf(stderr, "warning: ridge append buffer over capacity; excess appends were "
                              "dropped by the kernel (%u per segment; should not happen at the "
                              "default floor once the top list fills)\n", RIDGE_CAP);
+}
 
+/// Phase 14 (success path only, as before): destroys the events and frees the
+/// device buffers in run_gpu's order. On an exception nothing here runs; the
+/// kernels, module and context are destroyed by ~DenseRun (as the locals were).
+void DenseRun::release_device_objects() {
     ev.destroy();
 
     // Free GPU memory.
@@ -2702,8 +2702,33 @@ RunStats DenseRun::run() {
     Context::free_mem(ctx.context(), b.magic);
     Context::free_mem(ctx.context(), b.shifts);
     Context::free_mem(ctx.context(), b.ms32);
+}
 
-    return std::move(stats);   // a member now: move, not copy
+/// Runs the phases after construction (phases 1-2 and the Level Zero objects
+/// are done by then), in run_gpu's order.
+RunStats DenseRun::run() {
+    // ---- Level Zero setup (ctx, mod and the first four kernels: DenseRun's
+    // member initializers) -----------------------------------------------------
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    // ---- buffers and uploads -------------------------------------------------
+    size_buffers();
+    allocate_slot_buffers();
+    size_bucket_ring_and_hitlists();
+    allocate_large_prime_buffers();
+    upload_tables();
+    pack_stats_buffers();
+    create_events();
+
+    // ---- segment loop ------------------------------------------------------
+    segment_loop();
+
+    // ---- teardown ------------------------------------------------------------
+    assemble_run_stats();
+    release_device_objects();
+    return std::move(stats);   // a member: move, not copy
 }
 
 } // namespace
