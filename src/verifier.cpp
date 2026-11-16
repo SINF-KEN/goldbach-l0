@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "config.hpp"
@@ -2579,7 +2580,7 @@ bool verify_cpu(uint64_t limit, bool verbose) {
 void print_device_info() {
     ze_result_t r = zeInit(ZE_INIT_FLAG_GPU_ONLY);
     if (r != ZE_RESULT_SUCCESS)
-        throw std::runtime_error("zeInit failed: " + std::to_string(int(r)));
+        throw std::runtime_error("zeInit failed: " + std::to_string(std::to_underlying(r)));
 
     uint32_t nd = 0;
     zeDriverGet(&nd, nullptr);

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 namespace gb {
@@ -23,7 +24,7 @@ std::string ze_result_string(ze_result_t r) {
     case ZE_RESULT_ERROR_MODULE_BUILD_FAILURE: return "module build failure";
     case ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX: return "invalid kernel arg index";
     case ZE_RESULT_ERROR_INVALID_SIZE: return "invalid size";
-    default: return "error " + std::to_string(static_cast<int>(r));
+    default: return "error " + std::to_string(std::to_underlying(r));
     }
 }
 
