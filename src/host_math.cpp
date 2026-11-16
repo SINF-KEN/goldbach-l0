@@ -159,6 +159,20 @@ build_magic_reciprocals(const uint32_t* sieve_primes, uint32_t sieve_split) {
     return {magic, shift};
 }
 
+std::vector<uint64_t> build_tile_reciprocals32(const uint32_t* sieve_primes, uint32_t sieve_split) {
+    std::vector<uint64_t> ms32(sieve_split, 0ull);
+    for (size_t i = 0; i < sieve_split; ++i) {
+        const uint64_t p = sieve_primes[i];
+        if (p < BITS_PER_TILE) {
+            uint32_t s = 0;
+            while ((uint64_t(1) << s) <= BITS_PER_TILE * p) ++s;
+            const uint64_t m = ((uint64_t(1) << s) + p - 1) / p;
+            ms32[i] = m | (uint64_t(s) << 32);
+        }
+    }
+    return ms32;
+}
+
 PackedLarge pack_large_primes(const uint32_t* primes, uint32_t split, uint32_t count) {
     PackedLarge pk;
     const uint64_t n = count - split;

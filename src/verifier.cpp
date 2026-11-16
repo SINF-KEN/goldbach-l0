@@ -1302,27 +1302,10 @@ void DenseRun::upload_tables() {
     init_mark("pack+bucket-alloc(before magic)");
     std::tie(magic, shift) = build_magic_reciprocals(sieve_primes, sieve_split);
 
-    // 32-bit reciprocals for the tile table path. The kernel jumps from the
-    // tile's first mark to a thread's 2048-bit range: d = my_bit0 - tf is
-    // always < BITS_PER_TILE = 2^17, so floor(d/p) is computable with a 32-bit
-    // reciprocal: with s = bit_width(BITS_PER_TILE * p) we have 2^s > BITS_PER_TILE*p,
-    // which makes floor(d*m/2^s) = floor(d/p) exact for every d < BITS_PER_TILE
-    // (for d divisible by p the product is k*p*(2^s+e)/2^s = k + k*e/2^s with
-    // k*e < BITS_PER_TILE < 2^s; otherwise d*e < (p - r)*2^s follows from
-    // d*e < BITS_PER_TILE*p < 2^s). m = ceil(2^s/p) <= 2*BITS_PER_TILE fits u32.
-    // Primes >= BITS_PER_TILE never use it (single mark per tile, range check).
+    // 32-bit reciprocals for the tile table path (host_math.hpp); all zero
+    // when the table path is off (the kernel does not read them then).
     std::vector<uint64_t> ms32v(sieve_split, 0ull);
-    if (use_table) {
-        for (size_t i = 0; i < sieve_split; ++i) {
-            const uint64_t p = sieve_primes[i];
-            if (p < BITS_PER_TILE) {
-                uint32_t s = 0;
-                while ((uint64_t(1) << s) <= BITS_PER_TILE * p) ++s;
-                const uint64_t m = ((uint64_t(1) << s) + p - 1) / p;
-                ms32v[i] = m | (uint64_t(s) << 32);
-            }
-        }
-    }
+    if (use_table) ms32v = build_tile_reciprocals32(sieve_primes, sieve_split);
 
     // Upload the read-only tables once; never touched again per segment.
     // The DMA copies also double as the clock warm-up before the segment loop.
