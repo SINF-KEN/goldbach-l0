@@ -505,6 +505,20 @@ void test_dense_plans()
     check(threw, "make_plan30 rejects a non-unit candidate class");
 }
 
+// mkdtemp under std::filesystem::temp_directory_path() (honours TMPDIR).
+// @return the new directory, or "" (after a failed check) when none could
+// be made: callers skip their file tests rather than write to, or remove,
+// a shared directory.
+std::string make_temp_dir(const char* prefix)
+{
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+    std::string tmpl = ((ec ? std::filesystem::path("/tmp") : base) / (std::string(prefix) + "_XXXXXX")).string();
+    const bool ok = ::mkdtemp(tmpl.data()) != nullptr;
+    check(ok, std::string("mkdtemp ") + tmpl);
+    return ok ? tmpl : std::string();
+}
+
 void test_stats_plan()
 {
     std::puts("statistics plan (check30_xs tables, count30 limits)");
@@ -595,9 +609,7 @@ void test_stats_plan()
     check(sorted && sizeof S_UNKNOWN_4E18 / sizeof S_UNKNOWN_4E18[0] == 105, "S_UNKNOWN_4E18: 105 sorted primes");
     // records file: a claimed first occurrence of unknown-S(p) prime 8423 at an
     // n whose true p(n) is 9781 must be written and flagged MISMATCH
-    {
-        char tmpl[] = "/tmp/gb_host_tests_XXXXXX";
-        const std::string dir = ::mkdtemp(tmpl) ? tmpl : "/tmp";
+    if (const std::string dir = make_temp_dir("gb_host_tests"); !dir.empty()) {
         setenv("GB_RECORDS_FILE", (dir + "/rec.txt").c_str(), 1);
         if (std::FILE* hs = std::fopen((dir + "/hook.sh").c_str(), "wb")) {
             std::fprintf(hs, "echo \"$@\" > %s/hook.txt\n", dir.c_str());
@@ -629,7 +641,7 @@ void test_stats_plan()
         }
         check(txt.find("p(n)=8423 n=3325581707333960528") != std::string::npos &&
               txt.find("cpu_check=MISMATCH") != std::string::npos, "records file: unknown-S(p) event written, false claim flagged");
-        if (dir != "/tmp") std::filesystem::remove_all(dir);
+        std::filesystem::remove_all(dir);
         unsetenv("GB_RECORDS_FILE"); unsetenv("GB_STATS_STATE"); unsetenv("GB_STATS_LOG");
         unsetenv("GB_RECORD_HOOK");
     }
@@ -685,8 +697,8 @@ void test_ridge_store()
     // floor clamp (and no missed ridges) on a default run
     check(RIDGE_MIN_DEFAULT >= make_plan30(cands, CHECK30_PLAN).member_lt,
           "ridge floor default >= check30 phase-A member bound");
-    char tmpl[] = "/tmp/gb_ridge_tests_XXXXXX";
-    const std::string dir = ::mkdtemp(tmpl) ? tmpl : "/tmp";
+    const std::string dir = make_temp_dir("gb_ridge_tests");
+    if (dir.empty()) return;
     const std::string path = dir + "/ridges.csv";
     unsetenv("GB_RIDGE");
     unsetenv("GB_RIDGE_MIN");
