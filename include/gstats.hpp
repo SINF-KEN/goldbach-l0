@@ -51,6 +51,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include "env.hpp"
 #include "primes.hpp"
 
 namespace gb {
@@ -355,14 +356,10 @@ public:
         first_.assign(np, 0);
         run_first_.assign(np, 0);
         want_p_.assign((primes.back() / 2 + 32) / 32, 0);
-        const char* s = std::getenv("GB_STATS_STATE");
-        state_path_ = (s && *s) ? s : "goldbach_stats.state";
-        const char* l = std::getenv("GB_STATS_LOG");
-        log_path_ = (l && *l) ? l : "goldbach_stats.log";
-        const char* r = std::getenv("GB_RECORDS_FILE");
-        rec_path_ = (r && *r) ? r : "goldbach_records.txt";
-        const char* v = std::getenv("GB_STATS_LIVE");
-        live_path_ = (v && *v) ? v : "goldbach_live.json";
+        state_path_ = env::path("GB_STATS_STATE", "goldbach_stats.state");
+        log_path_ = env::path("GB_STATS_LOG", "goldbach_stats.log");
+        rec_path_ = env::path("GB_RECORDS_FILE", "goldbach_records.txt");
+        live_path_ = env::path("GB_STATS_LIVE", "goldbach_live.json");
         for (uint16_t p : S_UNKNOWN_4E18) unknown_.push_back(p);
         load_state();
         (void)load_gaps();                         // a damaged gap state fails before the run, not after
@@ -736,7 +733,7 @@ private:
         std::fprintf(stderr, "\n*** %s", line);
         if (std::FILE* f = std::fopen(rec_path_.c_str(), "ab")) { std::fputs(line, f); std::fclose(f); }
         events_.push_back({n, p});
-        const char* hk = std::getenv("GB_RECORD_HOOK");
+        const char* hk = env::raw("GB_RECORD_HOOK");   // set but empty: no hook
         std::string hook = hk ? hk : "";
         if (!hk) {
             if (std::FILE* sf = std::fopen("scripts/notify_record.sh", "rb")) {

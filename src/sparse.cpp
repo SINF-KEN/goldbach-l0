@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,6 +24,7 @@
 #include <unistd.h>
 
 #include "config.hpp"
+#include "env.hpp"
 #include "l0_context.hpp"
 #include "primes.hpp"
 #include "sparse.hpp"
@@ -36,16 +38,9 @@ double secs(clock_::time_point t0) {
     return std::chrono::duration<double>(clock_::now() - t0).count();
 }
 
-/// @return environment variable @p name parsed by strtoull (base auto-detected;
-///         unparsable text yields 0), or @p dflt when unset.
-uint64_t env_u64(const char* name, uint64_t dflt) {
-    const char* e = std::getenv(name);
-    return e ? std::strtoull(e, nullptr, 0) : dflt;
-}
-/// @return environment variable @p name parsed by strtod, or @p dflt when unset.
-double env_f(const char* name, double dflt) {
-    const char* e = std::getenv(name);
-    return e ? std::strtod(e, nullptr) : dflt;
+/// Plan cost knobs (GB_SCM_TARGET / SEGW0 / SEGW1): any finite value >= 0.
+double env_cost(const char* name, double dflt) {
+    return env::f64(name, dflt, 0.0, std::numeric_limits<double>::max());
 }
 
 /// Splits [begin, end) into at most min(hardware threads, max_workers)
@@ -296,20 +291,22 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
     : im(new Impl)
 {
     Impl& I = *im;
-    const bool itrace = std::getenv("GB_INIT_TRACE") != nullptr;
+    const bool itrace = env::present("GB_INIT_TRACE");
     auto tmark = clock_::now();
     auto mark = [&](const char* what) {
         if (!itrace) return;
         std::fprintf(stderr, "  init %-24s %7.1f ms\n", what, secs(tmark) * 1e3);
         tmark = clock_::now();
     };
-    I.geo = scm_geo(o.M ? o.M : uint32_t(env_u64("GB_SCM_M", SCM_M_DEFAULT)));
+    I.geo = scm_geo(o.M ? o.M : env::u32("GB_SCM_M", SCM_M_DEFAULT));   // scm_geo checks the modulus
     const ScmGeo& G = I.geo;
     I.limit = limit;
     I.start = start_even;
-    I.pmax = o.pmax ? o.pmax : uint32_t(env_u64("GB_SCM_PMAX", G.pmax));
+    // candidate primes run to pmax + (SCM_MAXD + 2) M: must fit 32 bits
+    I.pmax = o.pmax ? o.pmax : env::u32("GB_SCM_PMAX", G.pmax, 1,
+                                        UINT32_MAX - (SCM_MAXD + 2) * G.M);
     I.TB = I.pmax / G.M + SCM_MAXD + 2;
-    I.dlt = o.dlt ? o.dlt : uint32_t(env_u64("GB_SCM_DELTA", G.dlt));
+    I.dlt = o.dlt ? o.dlt : env::u32("GB_SCM_DELTA", G.dlt, 4096, 1u << 26);
     if (I.dlt < 4096 || I.dlt > (1u << 26)) throw std::runtime_error("sparse: segment delta out of range");
     {   // pending entries: cr << pshift | word << 32 | miss mask must fit 64 bits
         uint32_t wb = 0, cb = 0;
@@ -336,23 +333,25 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
         return uint32_t(std::lower_bound(I.primes, I.primes + I.count, p) - I.primes);
     };
     I.j_own0 = idx_of(64);
-    I.own_end = std::max(I.j_own0, idx_of(uint32_t(env_u64("GB_SCM_OWN_P", 512))));
+    I.own_end = std::max(I.j_own0, idx_of(env::u32("GB_SCM_OWN_P", 512)));
     I.split = o.split_p ? idx_of(o.split_p)
-                        : idx_of(uint32_t(env_u64("GB_SCM_SPLIT_P", 131072)));
+                        : idx_of(env::u32("GB_SCM_SPLIT_P", 131072));
     I.split = std::max(I.split, I.own_end);
     I.split = std::min(I.split, I.count);
 
     // ---- candidates + plan ----
-    I.wpl = uint32_t(env_u64("GB_SCM_WPL", SCM_A_WPL));
-    I.span = uint32_t(env_u64("GB_SCM_SPAN", G.span));
+    // >= 1 (the item width divides the segment); both must also match the
+    // module (layout handshake below)
+    I.wpl = env::u32("GB_SCM_WPL", SCM_A_WPL, 1, UINT32_MAX / 32);
+    I.span = env::u32("GB_SCM_SPAN", G.span, 1);
     I.cand_primes = odd_primes_up_to(I.pmax + (SCM_MAXD + 2) * G.M);
     mark("candidate primes");
     {   // checker plan: disk cache keyed by every input, validated either way
-        const double target = env_f("GB_SCM_TARGET", o.target);
-        const double w0 = env_f("GB_SCM_SEGW0", 3.0), w1 = env_f("GB_SCM_SEGW1", 1.0);
+        const double target = env_cost("GB_SCM_TARGET", o.target);
+        const double w0 = env_cost("GB_SCM_SEGW0", 3.0), w1 = env_cost("GB_SCM_SEGW1", 1.0);
         // phase-B candidates per class: an even that failed ~64 phase-A tests
         // passes 384 more with probability ~0.878^384 ~ 2e-22 (beyond: CPU)
-        const uint32_t rcap = uint32_t(env_u64("GB_SCM_RESTCAP", 384));
+        const uint32_t rcap = env::u32("GB_SCM_RESTCAP", 384);
         std::string key = "scm-plan-v1 M=" + std::to_string(G.M) + " res=";
         for (uint32_t c : G.res) key += std::to_string(c) + ",";
         char kb[256];
@@ -365,7 +364,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
         std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)fnv64(key.data(), key.size()));
         const std::string path = (sl == std::string::npos ? std::string() : cp.substr(0, sl + 1)) +
                                  "scm_plan." + std::to_string(G.M) + "." + hx + ".bin";
-        const bool use_cache = env_u64("GB_SCM_PLAN_CACHE", 1) != 0;
+        const bool use_cache = env::u64("GB_SCM_PLAN_CACHE", 1, 0, 1) != 0;
         bool cached = use_cache && load_plan(path, key, I.plan);
         if (!cached)
             I.plan = make_plan_scm(G, I.cand_primes, I.pmax, I.TB, target, w0, w1, rcap, I.span);
@@ -403,12 +402,12 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
     const uint64_t seg_evens = uint64_t(I.dlt) * G.CR();
     I.pending_cap = uint32_t(std::min<uint64_t>(std::max<uint64_t>(seg_evens / 800, 1u << 20),
                                                 0x7FFFFFFFu));
-    I.pending_cap = uint32_t(env_u64("GB_SCM_PCAP", I.pending_cap));
-    I.leftover_cap = uint32_t(env_u64("GB_SCM_LCAP", 1u << 20));
+    I.pending_cap = env::u32("GB_SCM_PCAP", I.pending_cap, 1, 0x7FFFFFFFu);
+    I.leftover_cap = env::u32("GB_SCM_LCAP", 1u << 20, 1, 0x7FFFFFFFu);
     I.cb_groups = env_grid("GB_SCM_BGROUPS", 640);   // >= 1: a zero grid would skip phase B
 
     // ---- L0 ----
-    I.mod.reset(new Module(I.ctx, std::getenv("GB_SCM_SPV") ? std::string(std::getenv("GB_SCM_SPV"))
+    I.mod.reset(new Module(I.ctx, env::present("GB_SCM_SPV") ? std::string(env::raw("GB_SCM_SPV"))
                                   : !o.spv.empty() ? o.spv : std::string(G.spv)));
     {   // geometry handshake (fail closed on a module built for another M / K / residues)
         Kernel kg(*I.mod, "scm_geometry");
@@ -442,7 +441,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
     I.k_ca.reset(new Kernel(*I.mod, "scm_check_a"));
     I.k_cb.reset(new Kernel(*I.mod, "scm_check_b"));
     I.k_tile->set_group_size(256);
-    I.k_large->set_group_size(uint32_t(env_u64("GB_SCM_LARGE_WG", 128)));
+    I.k_large->set_group_size(env::wg32("GB_SCM_LARGE_WG", 128));
     I.k_ca->set_group_size(256);
     I.k_cb->set_group_size(256);
     I.ev.create(I.ctx.context());
@@ -635,7 +634,7 @@ void ScmEngine::enqueue(uint64_t s)
         kl.set_arg(5, 8, &Q);
         kl.set_arg(6, 4, &T);
         kl.set_arg(7, sizeof(I.d_inv), &I.d_inv);
-        const uint32_t wg = uint32_t(env_u64("GB_SCM_LARGE_WG", 128));
+        const uint32_t wg = env::wg32("GB_SCM_LARGE_WG", 128);   // validated by the constructor
         const uint64_t items = (uint64_t(I.large_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
         kl.launch(I.ctx.list(), uint32_t((items + wg - 1) / wg), I.ev.ev[slot][1]);
         ZE_CHECK(zeCommandListAppendBarrier(I.ctx.list(), nullptr, 0, nullptr));
@@ -825,10 +824,10 @@ RunStats run_gpu_sparse(uint64_t limit, uint64_t segment_even, const std::string
     o.split_p = split_p;
     if (segment_even && segment_even != DEFAULT_SEGMENT_EVEN)
         o.dlt = uint32_t(std::max<uint64_t>(
-            segment_even / scm_geo(uint32_t(env_u64("GB_SCM_M", SCM_M_DEFAULT))).M, 4096));
+            segment_even / scm_geo(env::u32("GB_SCM_M", SCM_M_DEFAULT)).M, 4096));
     ScmEngine eng(start_even, limit, o);
     stats.init_seconds = secs(t0);
-    if (verbose || std::getenv("GB_PHASE")) {
+    if (verbose || env::present("GB_PHASE")) {
         const PlanSCM& p = eng.plan();
         std::fprintf(stderr, "sparse: M=%u K=%u pmax=%u TB=%u dlt=%u (D=%llu) split=%u "
                      "plan tests %.1f funnels %.1f segs %.2f cost %.1f max member %u, rest %zu\n",
@@ -848,12 +847,12 @@ RunStats run_gpu_sparse(uint64_t limit, uint64_t segment_even, const std::string
     // pending list (the scan runs between segments; the GPU idles for it,
     // ~0.5% at the default 64 evens). Dense runs track every pending even.
     RidgeTracker ridges(&eng.cand_primes());
-    const char* ridge_file = std::getenv("GB_RIDGE_FILE");
-    if (!ridge_file || !*ridge_file) ridge_file = "goldbach_ridges.csv";
+    const std::string ridge_path = env::path("GB_RIDGE_FILE", "goldbach_ridges.csv");
+    const char* ridge_file = ridge_path.c_str();
     uint32_t ridge_scan = 0;
     if (ridges.active()) {
         ridges.load(ridge_file);
-        ridge_scan = uint32_t(std::min<uint64_t>(env_u64("GB_RIDGE_SCAN", 64), 1u << 22));
+        ridge_scan = env::u32("GB_RIDGE_SCAN", 64, 0, 1u << 22);
         if (verbose)
             std::fprintf(stderr, "ridge tracking: %u pending evens/segment sampled for "
                          "exact ridges (GB_RIDGE_SCAN, 0 = off) + CPU leftovers\n",
@@ -862,7 +861,7 @@ RunStats run_gpu_sparse(uint64_t limit, uint64_t segment_even, const std::string
     const auto tg = clock_::now();
     uint64_t nseg = 0;
     for (uint64_t N = eng.n0(); N <= limit; N += D) ++nseg;
-    const bool trace = verbose || std::getenv("GB_PHASE") != nullptr;
+    const bool trace = verbose || env::present("GB_PHASE");
     auto take = [&](const ScmSegResult& r) {
         eng.resolve(r, &ridges);
         ridges.save(ridge_file);

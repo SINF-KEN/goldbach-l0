@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "env.hpp"
 #include "l0_context.hpp"
 #include "primes.hpp"
 #include "split_check.hpp"
@@ -619,7 +620,7 @@ RunStats run_gpu(uint64_t limit,
     const uint32_t large_count = sieve_count - sieve_split;
 
     // Goldbach candidate primes: p <= 9781 (see config.hpp).
-    const bool init_trace = std::getenv("GB_INIT_TRACE") != nullptr;
+    const bool init_trace = env::present("GB_INIT_TRACE");
     auto t_mark = clock_::now();
     const auto init_mark = [&](const char* what) {
         if (!init_trace) return;
@@ -656,8 +657,7 @@ RunStats run_gpu(uint64_t limit,
     // Twin checker (v1.10.0): phase A reads the map as a twin map with the lower
     // members of twin pairs (two candidates per funnel); phase B then probes
     // ALL candidates of the pending evens. GB_TWIN_CAP caps the twin funnels.
-    uint32_t twin_cap = CHECK_TWIN_CANDS;
-    if (const char* e = std::getenv("GB_TWIN_CAP")) twin_cap = uint32_t(std::strtoul(e, nullptr, 0));
+    const uint32_t twin_cap = env::u32("GB_TWIN_CAP", CHECK_TWIN_CANDS);
     // Phase B of the twin checker probes only the candidates the first
     // twin_cap twin pairs did not cover (ascending): every pending even has
     // already failed all of those.
@@ -677,17 +677,15 @@ RunStats run_gpu(uint64_t limit,
     // twin checker; GB_SPLIT_CAP = funnels per class list, GB_SPLIT_STAGES =
     // stage masks ("7/3": p, p+6, p+12 then p, p+6). Used per segment only
     // where the geometry allows it (split_segment().ok), else twin.
-    const bool split_on =
-        !(std::getenv("GB_SPLIT") && std::string(std::getenv("GB_SPLIT")) == "0");
+    const bool split_on = env::onoff("GB_SPLIT", true);
     SplitPlan split_plan;
     // checked[] is validation output only (tools/debug_check_hi runs the
     // kernels itself): the production checkers do not write it.
     const uint32_t split_write_checked = 0u;
     std::unique_ptr<Kernel> k_split, k_sa, k_sb, k_merge;
     if (split_on) {
-        uint32_t cap = CHECK_SPLIT_CANDS;
-        if (const char* e = std::getenv("GB_SPLIT_CAP")) cap = uint32_t(std::strtoul(e, nullptr, 0));
-        const char* st = std::getenv("GB_SPLIT_STAGES");
+        const uint32_t cap = env::u32("GB_SPLIT_CAP", CHECK_SPLIT_CANDS);
+        const char* st = env::raw("GB_SPLIT_STAGES");   // parse_split_stages validates it
         split_plan = make_split_plan(gb_all, cap, parse_split_stages(st ? st : CHECK_SPLIT_STAGES));
         k_split = std::make_unique<Kernel>(mod, "split_map");
         k_merge = std::make_unique<Kernel>(mod, "merge30");
@@ -697,23 +695,21 @@ RunStats run_gpu(uint64_t limit,
     // Class-map sieve (v1.11.0): the map is built as the q = 1 / 5 (mod 6)
     // arrays the split checker reads (kernels/goldbach.cl map_clear): 2/3 of
     // the tiles, no split_map pass. GB_CLASSMAP=0: dense map + split_map.
-    const bool class_mode = split_on &&
-        !(std::getenv("GB_CLASSMAP") && std::string(std::getenv("GB_CLASSMAP")) == "0");
+    const std::string classmap_env = env::choice("GB_CLASSMAP", "30", {"30", "6", "0"}, true);
+    const bool class_mode = split_on && classmap_env != "0";
     // Class map mod 30 (v1.12.0 default): 8 class arrays for the residues
     // coprime to 30; merge30 rebuilds the checker's S1 / S5. GB_CLASSMAP=6:
     // the v1.11.0 mod-6 class map (the checker reads it directly).
-    const bool c30 = class_mode &&
-        !(std::getenv("GB_CLASSMAP") && std::string(std::getenv("GB_CLASSMAP")) == "6");
+    const bool c30 = class_mode && classmap_env != "6";
     const uint32_t ncls_map = c30 ? 8u : 2u;
     // Mod-30 checker (v1.13.0, include/check30.hpp): evens grouped by n mod
     // 30 read the class arrays directly (no merge30). GB_C30=0: the v1.12.0
     // merge30 + class-split checker; GB_C30_PLAN overrides the plan.
-    const bool c30chk = c30 &&
-        !(std::getenv("GB_C30") && std::string(std::getenv("GB_C30")) == "0");
+    const bool c30chk = c30 && env::onoff("GB_C30", true);
     Plan30 plan30;
     std::unique_ptr<Kernel> k_ca, k_cb;
     if (c30chk) {
-        const char* pe = std::getenv("GB_C30_PLAN");
+        const char* pe = env::raw("GB_C30_PLAN");   // make_plan30 validates it
         plan30 = make_plan30(gb_all, pe ? pe : CHECK30_PLAN);
         k_ca = std::make_unique<Kernel>(mod, "check30_a");
         k_cb = std::make_unique<Kernel>(mod, "check30_b");
@@ -730,8 +726,8 @@ RunStats run_gpu(uint64_t limit,
     // (below the bound phase A may resolve an even first; kept entries are
     // exact either way).
     RidgeTracker ridges(&gb_all);
-    const char* ridge_file = std::getenv("GB_RIDGE_FILE");
-    if (!ridge_file || !*ridge_file) ridge_file = "goldbach_ridges.csv";
+    const std::string ridge_path = env::path("GB_RIDGE_FILE", "goldbach_ridges.csv");
+    const char* ridge_file = ridge_path.c_str();
     // Phase-A ceilings: every candidate a checker's phase A tests is below
     // its ceiling, so an even whose ridge reaches the ceiling fails phase A
     // and phase B records its exact ridge. Below it phase A may resolve the
@@ -754,15 +750,15 @@ RunStats run_gpu(uint64_t limit,
     // p(n) for every even, prime / twin counts. Needs the mod-30 checker and
     // a start far above MAX_GB_PRIME (futile-last candidate order); GB_STATS=0
     // turns it off (plain verification, check30_a / check30_b).
-    const bool stats_on = c30chk && start_even >= STATS_MIN_START &&
-        !(std::getenv("GB_STATS") && std::string(std::getenv("GB_STATS")) == "0");
+    const bool stats_env = env::onoff("GB_STATS", true);
+    const bool stats_on = c30chk && start_even >= STATS_MIN_START && stats_env;
     // prime gaps (count30's tail and walk): with the statistics unless GB_GAPS=0
-    const char* gaps_env = std::getenv("GB_GAPS");
-    const bool gaps_on = stats_on && !(gaps_env && std::string(gaps_env) == "0");
+    const std::string gaps_env = env::choice("GB_GAPS", "exact", {"exact", "1", "sampled", "0"}, true);
+    const bool gaps_on = stats_on && gaps_env != "0";
     // default: the full gap walk (count30) on every segment -- exact N(g) and
     // moments everywhere. GB_GAPS=sampled walks only the
     // sampled segments (count30's exact count / tail / maximum everywhere).
-    const bool gaps_exact = gaps_on && !(gaps_env && std::string(gaps_env) == "sampled");
+    const bool gaps_exact = gaps_on && gaps_env != "sampled";
     // count30 grid on walked segments (work-groups striding over the segment;
     // GB_GAPS_GROUPS tunes it). The default keeps the B580-tuned share of the
     // device: GAPS30_GROUPS per GAPS30_REF_EUS EUs, scaled by this device's
@@ -777,15 +773,12 @@ RunStats run_gpu(uint64_t limit,
                 (uint64_t(GAPS30_GROUPS) * eus + GAPS30_REF_EUS / 2) / GAPS30_REF_EUS, 1, GAPS30_GROUPS_MAX));
         }
     }
-    const uint32_t gaps_groups = std::clamp<uint32_t>(std::getenv("GB_GAPS_GROUPS")
-        ? uint32_t(std::strtoul(std::getenv("GB_GAPS_GROUPS"), nullptr, 0)) : gaps_default, 1u, GAPS30_GROUPS_MAX);
-    uint32_t stats_k = STATS_K_DEFAULT;
-    if (const char* e = std::getenv("GB_STATS_K")) stats_k = uint32_t(std::strtoul(e, nullptr, 0));
+    const uint32_t gaps_groups = env::u32("GB_GAPS_GROUPS", gaps_default, 1u, GAPS30_GROUPS_MAX);
+    const uint32_t stats_k = env::u32("GB_STATS_K", STATS_K_DEFAULT, 1u, STATS_KMAX);
     StatsPlan splan;
     std::unique_ptr<GoldbachStats> gstats;
     std::unique_ptr<Kernel> k_cxs[4], k_cxb, k_cnt;
-    uint32_t stats_sample = STATS_SAMPLE_DEFAULT;
-    if (const char* e = std::getenv("GB_STATS_SAMPLE")) stats_sample = std::max(1u, uint32_t(std::strtoul(e, nullptr, 0)));
+    const uint32_t stats_sample = env::u32("GB_STATS_SAMPLE", STATS_SAMPLE_DEFAULT, 1u);
     if (stats_on) {
         splan = make_stats_plan(gb_all, stats_k, plan30.member_lt);
         gstats = std::make_unique<GoldbachStats>(gb_all, splan, plan30.member_lt);
@@ -794,7 +787,7 @@ RunStats run_gpu(uint64_t limit,
         k_cxb = std::make_unique<Kernel>(mod, "check30_xb");
         k_cnt = std::make_unique<Kernel>(mod, "count30");
         if (gaps_on) gstats->begin_gaps(start_even);
-    } else if (c30chk && start_even < STATS_MIN_START && !std::getenv("GB_STATS")) {
+    } else if (c30chk && start_even < STATS_MIN_START && !env::present("GB_STATS")) {
         std::fprintf(stderr, "note: Goldbach statistics off below start %llu\n",
                      (unsigned long long)STATS_MIN_START);
     }
@@ -802,8 +795,7 @@ RunStats run_gpu(uint64_t limit,
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    uint32_t med_min_p = class_mode ? MED_MIN_P_CLASS : MED_MIN_P;
-    if (const char* e = std::getenv("GB_MED_P")) med_min_p = uint32_t(std::strtoul(e, nullptr, 0));
+    const uint32_t med_min_p = env::u32("GB_MED_P", class_mode ? MED_MIN_P_CLASS : MED_MIN_P);
     const uint32_t own_end = std::clamp<uint32_t>(uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_split, med_min_p) -
         sieve_primes), mask_count, sieve_split);
@@ -815,12 +807,7 @@ RunStats run_gpu(uint64_t limit,
     // kernel indexes by global id). N must be a non-zero multiple of the
     // SIMD32 subgroup: 0 would divide the launch by zero, anything else
     // splits a subgroup.
-    uint32_t large_wg = LARGE_WG_SIZE;
-    if (const char* e = std::getenv("GB_LARGE_WG")) {
-        large_wg = uint32_t(std::strtoul(e, nullptr, 0));
-        if (large_wg == 0 || large_wg % 32 != 0 || large_wg > 1024)
-            throw std::runtime_error("GB_LARGE_WG must be a multiple of 32 in [32, 1024]");
-    }
+    const uint32_t large_wg = env::wg32("GB_LARGE_WG", LARGE_WG_SIZE);
     k_large.set_group_size(large_wg);
     k_check.set_group_size(WG_SIZE);
     k_check_b.set_group_size(WG_SIZE);
@@ -886,15 +873,13 @@ RunStats run_gpu(uint64_t limit,
     // Fused small-prime mask stage (make_prime_map): grouped mask tables,
     // rebuilt per segment (q_first-dependent); the grouping itself is fixed.
     // GB_MASK_GROUPS=0 selects the per-prime mask loop instead (A/B).
-    const bool mask_groups_on = mask_count > 0 &&
-        !(std::getenv("GB_MASK_GROUPS") && std::string(std::getenv("GB_MASK_GROUPS")) == "0");
+    const bool mask_groups_on = mask_count > 0 && env::onoff("GB_MASK_GROUPS", true);
     // Max group period in words. 4096 -> 8 groups, 75 KB of tables (primes
     // 3..61): measured sieve_s per 2e10 window 0.1086 vs 0.1161 at 16384
     // (7 groups, 120 KB) and 0.1143 at 8192 — the tables must stay
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
-    uint32_t mask_period = 4096;   // = small_prime_group_masks default (debug_map validates it)
-    if (const char* e = std::getenv("GB_MASK_PERIOD")) mask_period = uint32_t(std::strtoul(e, nullptr, 0));
+    const uint32_t mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
         mask_groups0 = small_prime_group_masks(sieve_primes, mask_count, 3, mask_period);   // sizes only
@@ -1046,7 +1031,7 @@ RunStats run_gpu(uint64_t limit,
     const uint64_t q_odds_full = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
     const SegmentGeometry g_first = segment_geometry(start_even, limit, segment_even, 0);
     const uint64_t q_first0 = g_first.q_first;
-    const bool bucket_env_off = std::getenv("GB_BUCKET") && std::string(std::getenv("GB_BUCKET")) == "0";
+    const bool bucket_env_off = !env::onoff("GB_BUCKET", true);
     uint32_t bucket_begin = sieve_count;   // B: first bucketed prime index
     // Multiplier wheel of the bucket kernel (WHEEL_W = 30030, the only wheel
     // the kernel module has): max step (in p) and kept fraction of odd
@@ -1066,9 +1051,7 @@ RunStats run_gpu(uint64_t limit,
         // Bucket only primes above max(q_odds_full, GB_BUCKET_MINP): below
         // ~9 x q_odds_full a prime's per-segment packed setup (~22 ps) is
         // cheaper than filing its ~q_odds/p entries (~200 ps each).
-        uint64_t minp = BUCKET_MIN_P_FACTOR * q_odds_full;
-        if (const char* e = std::getenv("GB_BUCKET_MINP"))
-            minp = std::strtoull(e, nullptr, 0);
+        uint64_t minp = env::u64("GB_BUCKET_MINP", BUCKET_MIN_P_FACTOR * q_odds_full);
         minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
                                                  sieve_primes + sieve_count,
@@ -1118,11 +1101,8 @@ RunStats run_gpu(uint64_t limit,
     constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
     static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
     // GB_HITLIST=0 restores the bucket ring (A/B); GB_HITLIST_K sets the batch.
-    const bool hitlist = bucket_on && !(std::getenv("GB_HITLIST") &&
-                                        std::string(std::getenv("GB_HITLIST")) == "0");
-    uint32_t hl_K = 128;
-    if (const char* e = std::getenv("GB_HITLIST_K")) hl_K = uint32_t(std::strtoul(e, nullptr, 0));
-    hl_K = std::clamp<uint32_t>(hl_K, 1u, HL_MAX_K_HOST);
+    const bool hitlist = bucket_on && env::onoff("GB_HITLIST", true);
+    uint32_t hl_K = env::u32("GB_HITLIST_K", 128, 1u, HL_MAX_K_HOST);
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
     // mean m = lam / hl_G hits per region). Capacity m * 1.10 + 10 sqrt(m) +
@@ -1244,9 +1224,8 @@ RunStats run_gpu(uint64_t limit,
     // GB_BUCKET_VERIFY=N checks every Nth segment (1 = all; e.g. 100 costs
     // ~1% and is a cheap production safety net: an end-to-end PASS cannot
     // reveal a lost bucket mark — other candidates still resolve the evens).
-    const uint32_t bucket_verify_every = std::getenv("GB_BUCKET_VERIFY")
-        ? std::max<uint32_t>(1u, uint32_t(std::strtoul(std::getenv("GB_BUCKET_VERIFY"), nullptr, 0)))
-        : 0u;
+    const uint32_t bucket_verify_every = env::present("GB_BUCKET_VERIFY")
+        ? env::u32("GB_BUCKET_VERIFY", 0u, 1u) : 0u;
     const bool bucket_verify = bucket_on && bucket_verify_every > 0;
     PackedLarge packed_full;
     uint32_t* d_full_bases = nullptr;
@@ -1489,7 +1468,7 @@ RunStats run_gpu(uint64_t limit,
     // launches), wait (ev_check host sync) and collect (timestamp queries +
     // leftover read). Printed to stderr; overhead is a few clock reads per
     // segment and the gate defaults to off.
-    const bool phase_trace = std::getenv("GB_PHASE") != nullptr;
+    const bool phase_trace = env::present("GB_PHASE");
     bool hl_used[2] = {false, false};   // slot's segment launched a harvest (timing)
     std::vector<uint64_t> fb_host(class_mode ? size_t(ncls_map) * sieve_split : 0);   // per-segment first bits
     double sum_prep = 0.0, sum_enq = 0.0, sum_wait = 0.0, sum_coll = 0.0;
@@ -2002,7 +1981,7 @@ RunStats run_gpu(uint64_t limit,
             k_cmp->set_arg(2, sizeof(nwords), &nwords);
             k_cmp->set_arg(3, sizeof(verify_diff), &verify_diff);
             k_cmp->launch(ctx.list(), 512);
-            if (std::getenv("GB_BUCKET_VERIFY_DUMP")) {
+            if (env::present("GB_BUCKET_VERIFY_DUMP")) {
                 // Diagnostics: on the first differing segment, show which map
                 // is wrong by checking the differing bits with Miller-Rabin.
                 ctx.host_sync();
