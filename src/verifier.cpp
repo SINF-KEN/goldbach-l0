@@ -269,6 +269,7 @@ struct Segment {
     double l1_s = 0.0;
     double l2_s = 0.0;
     double enq_s = 0.0, launch_s = 0.0, l3_s = 0.0;
+    double wait_s = 0.0, coll_s = 0.0;   // collection of the previous segment
     double table_before = 0.0;
     double prep_s = 0.0;
     clock_::time_point t_seg_wall;
@@ -543,6 +544,9 @@ private:
     void enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
     void enqueue_check_split(const Segment& sg, const SplitSeg& sseg, uint32_t ridge_thresh_u32);
     void enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t ridge_thresh_u32);
+    void collect_previous_segment(Segment& sg);
+    void end_iteration(const Segment& sg);
+    void drain_final_segment();
     void prepare_segment_tables(Segment& sg);
     void begin_segment(Segment& sg);
 };
@@ -2415,6 +2419,148 @@ void DenseRun::enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t
     k_check_b.launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
+/// Per-segment step 6: collects the PREVIOUS segment (other slot) once this
+/// one is queued: waits on its check event, adds its kernel times, fails
+/// closed on device error flags / verify mismatch / pending overflow, merges
+/// ridges and statistics, records its telemetry, resolves its leftovers on
+/// the CPU and saves the ridge store.
+void DenseRun::collect_previous_segment(Segment& sg) {
+    const uint32_t prev = uint32_t((stats.segments - 1) & 1);
+    const auto t_wait = clock_::now();
+    ZE_CHECK(zeEventHostSynchronize(ev.check[prev], UINT64_MAX));
+    sg.wait_s = seconds_since(t_wait);
+    const auto t_coll = clock_::now();
+
+    // Per-kernel GPU times from event timestamps.
+    double ds = 0.0, dl = 0.0, dv = 0.0;
+    query_slot(prev, ds, dl, dv);
+    sieve_seconds  += ds;
+    large_seconds  += dl;
+    verify_seconds += dv;
+
+    if (bkt_err && *bkt_err)
+        throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
+    if (verify_diff && *verify_diff)
+        throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
+                                 std::to_string(*verify_diff) + " words");
+    // Two-phase checker: fail closed if phase A's pending list
+    // overflowed (evens beyond the cap were never checked).
+    if (*b.pending_n[prev] > pending_cap)
+        throw std::runtime_error("two-phase checker: pending list overflow");
+    if (phase_trace)
+        std::fprintf(stderr, "    pending %u\n", *b.pending_n[prev]);
+    // Read the 4-byte counter directly from shared memory (no D2H copy).
+    const uint32_t n_left = *b.leftover_n[prev];
+    total_leftovers += n_left;
+    ridges->merge(b.ridge[prev], prev_seg_start);
+    if (stats_on) collect_stats(prev, prev_seg_start);
+
+    if (collect_segments) {
+        // prev_stat is the record of the segment enqueued one
+        // iteration ago (seg_stat already holds the newer one).
+        prev_stat.sieve_seconds  = ds;
+        prev_stat.large_seconds  = dl;
+        prev_stat.check_seconds  = dv;
+        prev_stat.leftovers      = n_left;
+        prev_stat.offset_seconds = prev_seg_offsets;
+        prev_stat.wall_seconds   = prev_seg_wall;
+        stats.per_segment.push_back(prev_stat);
+    }
+
+    if (n_left > 0)
+        resolve_leftovers(ctx, b.leftovers[prev], n_left, prev_seg_start,
+                          prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
+                          gstats.get(), sampled_slot[prev]);
+    ridges->save(ridge_file);
+    sg.coll_s = seconds_since(t_coll);
+}
+
+/// Per-segment step 7: phase sums and the GB_PHASE line, the carry-over of
+/// this segment to the iteration (or drain) that collects it, the segment
+/// count and the verbose progress line.
+void DenseRun::end_iteration(const Segment& sg) {
+    sum_prep += sg.prep_s;
+    sum_enq += sg.enq_s;
+    sum_wait += sg.wait_s;
+    sum_coll += sg.coll_s;
+    sum_args += sg.args_s;
+    sum_launch += sg.launch_s;
+    if (phase_trace) {
+        std::fprintf(stderr,
+            "  phase seg %llu: prep %.1f ms (off %.1f tab %.1f)  enq %.1f ms "
+            "(args %.1f l1 %.2f l2 %.2f l3 %.2f)  wait %.1f ms  coll %.1f ms\n",
+            (unsigned long long)stats.segments,
+            sg.prep_s * 1e3, offset_seconds - sg.offset_before,
+            (table_seconds - sg.table_before) * 1e3,
+            sg.enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (sg.l2_s - sg.l1_s) * 1e3,
+            (sg.l3_s - sg.l2_s) * 1e3, sg.wait_s * 1e3, sg.coll_s * 1e3);
+    }
+
+    prev_seg_start = sg.seg_start;
+    prev_seg_evens = sg.seg_evens;
+
+    // Finalize the carry-over for this segment: its GPU work will be
+    // collected in the NEXT loop iteration (or the drain) — that is the
+    // point at which prev_seg_wall / prev_seg_offsets are consumed.
+    prev_seg_wall    = seconds_since(sg.t_seg_wall);
+    prev_seg_offsets = offset_seconds - sg.offset_before;
+    prev_stat = seg_stat;
+
+    ++stats.segments;
+
+    if (verbose && (stats.segments % 10 == 0 || sg.seg_end == limit)) {
+        std::printf("  segment %llu: evens [%llu, %llu]  leftovers_total=%llu\n",
+                    (unsigned long long)stats.segments,
+                    (unsigned long long)sg.seg_start,
+                    (unsigned long long)sg.seg_end,
+                    (unsigned long long)total_leftovers);
+    }
+}
+
+/// After the loop: collects the final segment (as collect_previous_segment,
+/// without the wait timing and pending trace; its record is seg_stat).
+void DenseRun::drain_final_segment() {
+    const uint32_t last = uint32_t((stats.segments - 1) & 1);
+    ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
+
+    double ds = 0.0, dl = 0.0, dv = 0.0;
+    query_slot(last, ds, dl, dv);
+    sieve_seconds  += ds;
+    large_seconds  += dl;
+    verify_seconds += dv;
+
+    if (bkt_err && *bkt_err)
+        throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
+    if (verify_diff && *verify_diff)
+        throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
+                         std::to_string(*verify_diff) + " words");
+    if (*b.pending_n[last] > pending_cap)
+        throw std::runtime_error("two-phase checker: pending list overflow");
+    const uint32_t n_left = *b.leftover_n[last];
+    total_leftovers += n_left;
+    ridges->merge(b.ridge[last], prev_seg_start);
+    if (stats_on) collect_stats(last, prev_seg_start);
+
+    if (collect_segments) {
+        // seg_stat still holds the FINAL segment here: it was never
+        // overwritten after its enqueue, and its timestamps are now
+        // readable — this is the one segment collected without delay.
+        seg_stat.sieve_seconds  = ds;
+        seg_stat.large_seconds  = dl;
+        seg_stat.check_seconds  = dv;
+        seg_stat.leftovers      = n_left;
+        seg_stat.offset_seconds = prev_seg_offsets;
+        seg_stat.wall_seconds   = prev_seg_wall;
+        stats.per_segment.push_back(seg_stat);
+    }
+
+    if (n_left > 0)
+        resolve_leftovers(ctx, b.leftovers[last], n_left, prev_seg_start,
+                          prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
+                          gstats.get(), sampled_slot[last]);
+    ridges->save(ridge_file);
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -2438,105 +2584,19 @@ RunStats DenseRun::run() {
         Segment sg;
         sg.seg_start = seg_start;
         begin_segment(sg);
-
         prepare_segment_tables(sg);
         enqueue_sieve(sg);
-
         enqueue_large_primes(sg);
-
         enqueue_check(sg);
 
         // ---- Collect the PREVIOUS segment's results (other slot) ----------
         // The host blocks here only after the next segment's work is already
         // queued, so the GPU transitions straight from segment k-1's check to
         // segment k's sieve without an idle gap.
-        double wait_s = 0.0, coll_s = 0.0;
         if (stats.segments > 0) {
-            const uint32_t prev = uint32_t((stats.segments - 1) & 1);
-            const auto t_wait = clock_::now();
-            ZE_CHECK(zeEventHostSynchronize(ev.check[prev], UINT64_MAX));
-            wait_s = seconds_since(t_wait);
-            const auto t_coll = clock_::now();
-
-            // Per-kernel GPU times from event timestamps.
-            double ds = 0.0, dl = 0.0, dv = 0.0;
-            query_slot(prev, ds, dl, dv);
-            sieve_seconds  += ds;
-            large_seconds  += dl;
-            verify_seconds += dv;
-
-            if (bkt_err && *bkt_err)
-                throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
-            if (verify_diff && *verify_diff)
-                throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
-                                         std::to_string(*verify_diff) + " words");
-            // Two-phase checker: fail closed if phase A's pending list
-            // overflowed (evens beyond the cap were never checked).
-            if (*b.pending_n[prev] > pending_cap)
-                throw std::runtime_error("two-phase checker: pending list overflow");
-            if (phase_trace)
-                std::fprintf(stderr, "    pending %u\n", *b.pending_n[prev]);
-            // Read the 4-byte counter directly from shared memory (no D2H copy).
-            const uint32_t n_left = *b.leftover_n[prev];
-            total_leftovers += n_left;
-            ridges->merge(b.ridge[prev], prev_seg_start);
-            if (stats_on) collect_stats(prev, prev_seg_start);
-
-            if (collect_segments) {
-                // prev_stat is the record of the segment enqueued one
-                // iteration ago (seg_stat already holds the newer one).
-                prev_stat.sieve_seconds  = ds;
-                prev_stat.large_seconds  = dl;
-                prev_stat.check_seconds  = dv;
-                prev_stat.leftovers      = n_left;
-                prev_stat.offset_seconds = prev_seg_offsets;
-                prev_stat.wall_seconds   = prev_seg_wall;
-                stats.per_segment.push_back(prev_stat);
-            }
-
-            if (n_left > 0)
-                resolve_leftovers(ctx, b.leftovers[prev], n_left, prev_seg_start,
-                                  prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
-                                  gstats.get(), sampled_slot[prev]);
-            ridges->save(ridge_file);
-            coll_s = seconds_since(t_coll);
+            collect_previous_segment(sg);
         }
-        sum_prep += sg.prep_s;
-        sum_enq += sg.enq_s;
-        sum_wait += wait_s;
-        sum_coll += coll_s;
-        sum_args += sg.args_s;
-        sum_launch += sg.launch_s;
-        if (phase_trace) {
-            std::fprintf(stderr,
-                "  phase seg %llu: prep %.1f ms (off %.1f tab %.1f)  enq %.1f ms "
-                "(args %.1f l1 %.2f l2 %.2f l3 %.2f)  wait %.1f ms  coll %.1f ms\n",
-                (unsigned long long)stats.segments,
-                sg.prep_s * 1e3, offset_seconds - sg.offset_before,
-                (table_seconds - sg.table_before) * 1e3,
-                sg.enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (sg.l2_s - sg.l1_s) * 1e3,
-                (sg.l3_s - sg.l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
-        }
-
-        prev_seg_start = sg.seg_start;
-        prev_seg_evens = sg.seg_evens;
-
-        // Finalize the carry-over for this segment: its GPU work will be
-        // collected in the NEXT loop iteration (or the drain) — that is the
-        // point at which prev_seg_wall / prev_seg_offsets are consumed.
-        prev_seg_wall    = seconds_since(sg.t_seg_wall);
-        prev_seg_offsets = offset_seconds - sg.offset_before;
-        prev_stat = seg_stat;
-
-        ++stats.segments;
-
-        if (verbose && (stats.segments % 10 == 0 || sg.seg_end == limit)) {
-            std::printf("  segment %llu: evens [%llu, %llu]  leftovers_total=%llu\n",
-                        (unsigned long long)stats.segments,
-                        (unsigned long long)sg.seg_start,
-                        (unsigned long long)sg.seg_end,
-                        (unsigned long long)total_leftovers);
-        }
+        end_iteration(sg);
 
         // The merged final segment already includes limit. Without this
         // break, the for-loop increment lands exactly on limit and schedules
@@ -2546,47 +2606,7 @@ RunStats DenseRun::run() {
     }
 
     // ---- Drain: collect the final segment --------------------------------
-    {
-        const uint32_t last = uint32_t((stats.segments - 1) & 1);
-        ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
-
-        double ds = 0.0, dl = 0.0, dv = 0.0;
-        query_slot(last, ds, dl, dv);
-        sieve_seconds  += ds;
-        large_seconds  += dl;
-        verify_seconds += dv;
-
-        if (bkt_err && *bkt_err)
-            throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
-        if (verify_diff && *verify_diff)
-            throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
-                             std::to_string(*verify_diff) + " words");
-        if (*b.pending_n[last] > pending_cap)
-            throw std::runtime_error("two-phase checker: pending list overflow");
-        const uint32_t n_left = *b.leftover_n[last];
-        total_leftovers += n_left;
-        ridges->merge(b.ridge[last], prev_seg_start);
-        if (stats_on) collect_stats(last, prev_seg_start);
-
-        if (collect_segments) {
-            // seg_stat still holds the FINAL segment here: it was never
-            // overwritten after its enqueue, and its timestamps are now
-            // readable — this is the one segment collected without delay.
-            seg_stat.sieve_seconds  = ds;
-            seg_stat.large_seconds  = dl;
-            seg_stat.check_seconds  = dv;
-            seg_stat.leftovers      = n_left;
-            seg_stat.offset_seconds = prev_seg_offsets;
-            seg_stat.wall_seconds   = prev_seg_wall;
-            stats.per_segment.push_back(seg_stat);
-        }
-
-        if (n_left > 0)
-            resolve_leftovers(ctx, b.leftovers[last], n_left, prev_seg_start,
-                              prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
-                              gstats.get(), sampled_slot[last]);
-        ridges->save(ridge_file);
-    }
+    drain_final_segment();
 
     stats.gpu_seconds = seconds_since(t_gpu);
     if (phase_trace) {
