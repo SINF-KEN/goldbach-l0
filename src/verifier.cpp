@@ -264,6 +264,9 @@ struct Segment {
     uint32_t mask_coff = 0;          // group-mask table offset per class
     uint32_t mask_count_seg = 0;     // small-prime mask entries
     // host timings (GB_PHASE trace and telemetry)
+    clock_::time_point t_enq, t_launch0;
+    double args_s = 0.0;
+    double l1_s = 0.0;
     double table_before = 0.0;
     double prep_s = 0.0;
     clock_::time_point t_seg_wall;
@@ -526,6 +529,7 @@ private:
     bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
 
     // ---- per-segment steps -------------------------------------------------------
+    void enqueue_sieve(Segment& sg);
     void prepare_segment_tables(Segment& sg);
     void begin_segment(Segment& sg);
 };
@@ -1698,6 +1702,83 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
     sg.prep_s = seconds_since(t_prep);
 }
 
+/// Per-segment step 3: make_prime_map's arguments, the slot's counter
+/// fills and event resets, and the tile-sieve launch (all tiles, one launch).
+void DenseRun::enqueue_sieve(Segment& sg) {
+    sg.t_enq = clock_::now();
+
+    // --- make_prime_map args (single launch covers ALL tiles)
+    // Kernel arg order: 0=map 1=primes 2=fb_global 3=magic 4=shifts
+    //                   5=count 6=q_odds 7=SLM 8=mask_count 9=mask_table
+    //                   10=q_first 11=sieve_split
+    const auto t_args0 = clock_::now();
+    k_sieve.set_arg(0, sizeof(b.prime_map[sg.slot]),    &b.prime_map[sg.slot]);
+    k_sieve.set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
+    k_sieve.set_arg(2, sizeof(b.first_bits[sg.slot]),   &b.first_bits[sg.slot]);
+    k_sieve.set_arg(3, sizeof(b.magic),        &b.magic);
+    k_sieve.set_arg(4, sizeof(b.shifts),       &b.shifts);
+    k_sieve.set_arg(5, sizeof(sieve_split),    &sieve_split);
+    k_sieve.set_arg(6, sizeof(sg.q_odds),         &sg.q_odds);
+    k_sieve.set_local_arg(7, size_t(TILE_WORDS) * 8); // 16 KB SLM
+    k_sieve.set_arg(8, sizeof(sg.mask_count_seg), &sg.mask_count_seg);
+    k_sieve.set_arg(9, sizeof(b.mask_table[sg.slot]), &b.mask_table[sg.slot]);
+    k_sieve.set_arg(10, sizeof(sg.q_first),       &sg.q_first);
+    k_sieve.set_arg(11, sizeof(sieve_split),   &sieve_split);
+    k_sieve.set_arg(12, sizeof(b.tile_first[sg.slot]), &b.tile_first[sg.slot]);
+    k_sieve.set_arg(13, sizeof(use_table_u32), &use_table_u32);
+    k_sieve.set_arg(14, sizeof(b.ms32),        &b.ms32);
+    k_sieve.set_arg(15, sizeof(own_end),       &own_end);
+    k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
+    k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
+    k_sieve.set_arg(18, sizeof(mask_groups_n), &mask_groups_n);
+    k_sieve.set_arg(19, 4, &cm_u32);
+    k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
+    k_sieve.set_arg(21, 4, &sg.phis);
+    k_sieve.set_arg(22, 8, &sg.cgeo.n[0]);
+    k_sieve.set_arg(23, 8, &sg.cgeo.n[1]);
+    k_sieve.set_arg(24, 4, &sg.mask_coff);
+    {
+        uint32_t* gy = (class_mode && mask_groups_n > 0) ? b.group_y[sg.slot] : nullptr;
+        k_sieve.set_arg(26, sizeof(gy), &gy);
+    }
+    k_sieve.set_arg(25, 4, &sieve_split);
+
+    // Reset per-segment state BEFORE enqueueing the kernels that signal
+    // these events. zeEventHostReset after its signaling launch has been
+    // enqueued is a race: if the GPU completes the kernel before the host
+    // reset executes, the signal is lost and the later WaitOnEvents
+    // blocks forever (this caused size-dependent hangs). All events are
+    // quiescent here: their previous signals belonged to segment k-2,
+    // whose check kernel was host-synchronized during the last iteration.
+    const uint32_t zero = 0;
+    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[sg.slot], &zero, 1, 4,
+                                           nullptr, 0, nullptr));
+    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
+                                           nullptr, 0, nullptr));
+    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
+                                           nullptr, 0, nullptr));
+    // statistics: p_hist / p_first / x_cnt are reset by the host after
+    // each collect (collect_stats); x_hist is used by sampled segments only
+    if (stats_on && stats.segments % stats_sample == 0)
+        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.x_hist[sg.slot], &zero, 4,
+                                               splan.xall.size() * 4, nullptr, 0, nullptr));
+    ZE_CHECK(zeEventHostReset(ev.sieve[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.large[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.check[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.checka[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.bucket[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.hl[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.splitk[sg.slot]));
+    for (int v = 0; v < 3; ++v) ZE_CHECK(zeEventHostReset(ev.xv[v][sg.slot]));
+    sg.args_s = seconds_since(t_args0);
+
+    sg.t_launch0 = clock_::now();
+    // launch_overlap: may overlap segment k-1's checker (this slot's map,
+    // tables and counters were last used by segment k-2, host-synchronized)
+    k_sieve.launch_overlap(ctx.list(), uint32_t(sg.tiles_launch), ev.sieve[sg.slot]); // all tiles, one launch
+    sg.l1_s = seconds_since(sg.t_launch0);
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1723,78 +1804,7 @@ RunStats DenseRun::run() {
         begin_segment(sg);
 
         prepare_segment_tables(sg);
-        const auto t_enq = clock_::now();
-
-        // --- make_prime_map args (single launch covers ALL tiles)
-        // Kernel arg order: 0=map 1=primes 2=fb_global 3=magic 4=shifts
-        //                   5=count 6=q_odds 7=SLM 8=mask_count 9=mask_table
-        //                   10=q_first 11=sieve_split
-        const auto t_args0 = clock_::now();
-        k_sieve.set_arg(0, sizeof(b.prime_map[sg.slot]),    &b.prime_map[sg.slot]);
-        k_sieve.set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
-        k_sieve.set_arg(2, sizeof(b.first_bits[sg.slot]),   &b.first_bits[sg.slot]);
-        k_sieve.set_arg(3, sizeof(b.magic),        &b.magic);
-        k_sieve.set_arg(4, sizeof(b.shifts),       &b.shifts);
-        k_sieve.set_arg(5, sizeof(sieve_split),    &sieve_split);
-        k_sieve.set_arg(6, sizeof(sg.q_odds),         &sg.q_odds);
-        k_sieve.set_local_arg(7, size_t(TILE_WORDS) * 8); // 16 KB SLM
-        k_sieve.set_arg(8, sizeof(sg.mask_count_seg), &sg.mask_count_seg);
-        k_sieve.set_arg(9, sizeof(b.mask_table[sg.slot]), &b.mask_table[sg.slot]);
-        k_sieve.set_arg(10, sizeof(sg.q_first),       &sg.q_first);
-        k_sieve.set_arg(11, sizeof(sieve_split),   &sieve_split);
-        k_sieve.set_arg(12, sizeof(b.tile_first[sg.slot]), &b.tile_first[sg.slot]);
-        k_sieve.set_arg(13, sizeof(use_table_u32), &use_table_u32);
-        k_sieve.set_arg(14, sizeof(b.ms32),        &b.ms32);
-        k_sieve.set_arg(15, sizeof(own_end),       &own_end);
-        k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
-        k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
-        k_sieve.set_arg(18, sizeof(mask_groups_n), &mask_groups_n);
-        k_sieve.set_arg(19, 4, &cm_u32);
-        k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
-        k_sieve.set_arg(21, 4, &sg.phis);
-        k_sieve.set_arg(22, 8, &sg.cgeo.n[0]);
-        k_sieve.set_arg(23, 8, &sg.cgeo.n[1]);
-        k_sieve.set_arg(24, 4, &sg.mask_coff);
-        {
-            uint32_t* gy = (class_mode && mask_groups_n > 0) ? b.group_y[sg.slot] : nullptr;
-            k_sieve.set_arg(26, sizeof(gy), &gy);
-        }
-        k_sieve.set_arg(25, 4, &sieve_split);
-
-        // Reset per-segment state BEFORE enqueueing the kernels that signal
-        // these events. zeEventHostReset after its signaling launch has been
-        // enqueued is a race: if the GPU completes the kernel before the host
-        // reset executes, the signal is lost and the later WaitOnEvents
-        // blocks forever (this caused size-dependent hangs). All events are
-        // quiescent here: their previous signals belonged to segment k-2,
-        // whose check kernel was host-synchronized during the last iteration.
-        const uint32_t zero = 0;
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[sg.slot], &zero, 1, 4,
-                                               nullptr, 0, nullptr));
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
-                                               nullptr, 0, nullptr));
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
-                                               nullptr, 0, nullptr));
-        // statistics: p_hist / p_first / x_cnt are reset by the host after
-        // each collect (collect_stats); x_hist is used by sampled segments only
-        if (stats_on && stats.segments % stats_sample == 0)
-            ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.x_hist[sg.slot], &zero, 4,
-                                                   splan.xall.size() * 4, nullptr, 0, nullptr));
-        ZE_CHECK(zeEventHostReset(ev.sieve[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.large[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.check[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.checka[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.bucket[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.hl[sg.slot]));
-        ZE_CHECK(zeEventHostReset(ev.splitk[sg.slot]));
-        for (int v = 0; v < 3; ++v) ZE_CHECK(zeEventHostReset(ev.xv[v][sg.slot]));
-        const double args_s = seconds_since(t_args0);
-
-        const auto t_launch0 = clock_::now();
-        // launch_overlap: may overlap segment k-1's checker (this slot's map,
-        // tables and counters were last used by segment k-2, host-synchronized)
-        k_sieve.launch_overlap(ctx.list(), uint32_t(sg.tiles_launch), ev.sieve[sg.slot]); // all tiles, one launch
-        const double l1_s = seconds_since(t_launch0);
+        enqueue_sieve(sg);
 
         // --- sieve_large_primes: one work-item per large base prime.
         // The explicit event wait is LOAD-BEARING even though the list is
@@ -2026,7 +2036,7 @@ RunStats DenseRun::run() {
                 }
             }
         }
-        const double l2_s = seconds_since(t_launch0);
+        const double l2_s = seconds_since(sg.t_launch0);
 
         // --- check_numbers args
         // Twin checker: phase A reads the twin map with the twin list.
@@ -2350,9 +2360,9 @@ RunStats DenseRun::run() {
             k_check_b.set_arg(14, 4, &ridge_thresh_u32);
             k_check_b.launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
         }
-        const double enq_s = seconds_since(t_enq);
-        const double launch_s = seconds_since(t_launch0);
-        const double l3_s = seconds_since(t_launch0);
+        const double enq_s = seconds_since(sg.t_enq);
+        const double launch_s = seconds_since(sg.t_launch0);
+        const double l3_s = seconds_since(sg.t_launch0);
 
         // ---- Collect the PREVIOUS segment's results (other slot) ----------
         // The host blocks here only after the next segment's work is already
@@ -2413,7 +2423,7 @@ RunStats DenseRun::run() {
         sum_enq += enq_s;
         sum_wait += wait_s;
         sum_coll += coll_s;
-        sum_args += args_s;
+        sum_args += sg.args_s;
         sum_launch += launch_s;
         if (phase_trace) {
             std::fprintf(stderr,
@@ -2422,7 +2432,7 @@ RunStats DenseRun::run() {
                 (unsigned long long)stats.segments,
                 sg.prep_s * 1e3, offset_seconds - sg.offset_before,
                 (table_seconds - sg.table_before) * 1e3,
-                enq_s * 1e3, args_s * 1e3, l1_s * 1e3, (l2_s - l1_s) * 1e3,
+                enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (l2_s - sg.l1_s) * 1e3,
                 (l3_s - l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
         }
 
