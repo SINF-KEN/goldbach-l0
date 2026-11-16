@@ -38,6 +38,7 @@ add_executable(goldbach_l0
     src/l0_context.cpp
     src/primes.cpp
     src/verifier.cpp
+    src/host_math.cpp
     src/sparse.cpp
 )
 target_include_directories(goldbach_l0 PRIVATE include /usr/include/level_zero)
@@ -48,7 +49,7 @@ gb_quality(goldbach_l0)
 # GPU-free tests (ctest): host math vs brute force, host <-> kernel constant
 # mirrors, CLI contract. `ctest --test-dir build --output-on-failure`.
 enable_testing()
-add_executable(host_tests tests/host_tests.cpp src/primes.cpp)
+add_executable(host_tests tests/host_tests.cpp src/primes.cpp src/host_math.cpp)
 target_include_directories(host_tests PRIVATE include)
 target_link_libraries(host_tests PRIVATE Threads::Threads)
 target_compile_options(host_tests PRIVATE -O2 -g)
@@ -144,6 +145,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tools/sweep.py)
         src/l0_context.cpp
         src/primes.cpp
         src/verifier.cpp
+        src/host_math.cpp
     )
 
     add_executable(goldbach_tuner
