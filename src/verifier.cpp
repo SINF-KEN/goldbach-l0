@@ -463,6 +463,12 @@ private:
     std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
 
     void pack_stats_buffers();
+
+    // ---- create_events ----------------------------------------------------------
+    uint32_t gb_count = 0;           // candidate primes
+    SlotEvents ev;
+
+    void create_events();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1374,6 +1380,27 @@ void DenseRun::pack_stats_buffers() {
     }
 }
 
+/// Phase 10: the per-slot timestamp events; closes the init timing.
+void DenseRun::create_events() {
+    gb_count = uint32_t(gb_primes.size());
+    // The mask-table kernel arg is set per segment (the table CONTENT is
+    // q_first-dependent and rewritten into the slot's shared buffer each
+    // iteration, alongside first_bits).
+
+    // Events for per-kernel GPU timing and GPU-side dependencies.
+    // Per pipeline slot: sieve signals after the tile-sieve launch, large
+    // after the large-prime launch (the check kernel waits on BOTH GPU-side),
+    // check signals after the check launch (the host waits on it once per
+    // segment). Pools are per-event so each can be reset independently.
+    init_mark("upload");
+    ev.create(ctx.context());
+
+    stats.init_seconds = seconds_since(t_start);
+    stats.init_cache_s  = cache_seconds;
+    stats.init_module_s = module_seconds;
+    stats.init_upload_s = seconds_since(t_upload);
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1389,24 +1416,7 @@ RunStats DenseRun::run() {
 
     pack_stats_buffers();
 
-    const uint32_t gb_count = uint32_t(gb_primes.size());
-    // The mask-table kernel arg is set per segment (the table CONTENT is
-    // q_first-dependent and rewritten into the slot's shared buffer each
-    // iteration, alongside first_bits).
-
-    // Events for per-kernel GPU timing and GPU-side dependencies.
-    // Per pipeline slot: sieve signals after the tile-sieve launch, large
-    // after the large-prime launch (the check kernel waits on BOTH GPU-side),
-    // check signals after the check launch (the host waits on it once per
-    // segment). Pools are per-event so each can be reset independently.
-    init_mark("upload");
-    SlotEvents ev;
-    ev.create(ctx.context());
-
-    stats.init_seconds = seconds_since(t_start);
-    stats.init_cache_s  = cache_seconds;
-    stats.init_module_s = module_seconds;
-    stats.init_upload_s = seconds_since(t_upload);
+    create_events();
 
     // ------------------------------------------------------ Segment loop --
     const auto t_gpu = clock_::now();
