@@ -37,7 +37,7 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 // EU thread arbitration hint for every Kernel: round-robin measured +0.6%
 // over the Xe2 default (stall-based round-robin), oldest-first -0.6%; mixing
 // policies between the kernels of a segment loses (2026-11-15,
-// PROJECT-REFERENCE 9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
+// HISTORY.md §9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
 // 2 stall-based, off = the driver's default. Parsed once per Context, before
 // any kernel exists. Support is decided by zeKernelSchedulingHintExp itself
 // (Kernel::Kernel), NOT by ze_scheduling_hint_exp_properties_t: the B580

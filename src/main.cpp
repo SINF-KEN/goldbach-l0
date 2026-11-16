@@ -67,7 +67,7 @@ void usage() {
         "  --start N      first even n to verify (scale tests; default 4)\n"
         "  --segment N    even integer span per GPU segment  (default %llu)\n"
         "  --split N      base-prime split index (0 = auto)  (default 0)\n"
-        "  --sparse       sparse class map (v2.0, PROJECT-REFERENCE.md §9.2k; also\n"
+        "  --sparse       sparse class map (v2.0, HISTORY.md §9.2k; also\n"
         "                 GB_SPARSE=1): ~17x faster at 4e18, needs start >> sqrt(limit)\n"
         "  --spv FILE     SPIR-V module path                (default kernels/goldbach_bmg.spv)\n"
         "  --prime-cache FILE  disk cache for the base-prime list\n"

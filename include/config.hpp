@@ -13,7 +13,7 @@
 namespace gb {
 
 // Algorithm version. v2.0.0 adds the sparse class map pipeline (--sparse,
-// PROJECT-REFERENCE.md §9.2k); the dense path is unchanged since v1.13.0.
+// HISTORY.md §9.2k); the dense path is unchanged since v1.13.0.
 // v2.0.1: correctness fixes only (--wheel low-range witnesses, §15; CLI and
 // ScmEngine fail-closed paths); dense and --sparse kernels byte-identical.
 // v2.1.0: cleanup release — concluded experiment kernels/tools and their
@@ -21,7 +21,7 @@ namespace gb {
 // The selectors of earlier production paths (GB_SPLIT, GB_CLASSMAP, GB_TWIN,
 // GB_C30, ...) were kept; PROJECT-REFERENCE.md §7 lists every GB_* variable.
 // v2.2.0: exact Goldbach statistics on the dense path (include/gstats.hpp,
-// PROJECT-REFERENCE.md §9.2l) and a tail-bounded mod-30 checker plan
+// HISTORY.md §9.2l) and a tail-bounded mod-30 checker plan
 // (every phase-A member < 3000: complete ridges and p(n) >= 3000 tail).
 // v2.2.1: fail closed above 2^64 - 2^40 (the base-prime bound wrapped to ~16
 // above ~1.8446744e19 and sieved with primes < 64 only: false PASS); results
