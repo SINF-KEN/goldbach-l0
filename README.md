@@ -1,7 +1,7 @@
 <h1 align="center">goldbach-l0</h1>
 
 <p align="center">
-  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 64.6 billion even numbers per second on one B580.</b><br>
+  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 69.6 billion even numbers per second on one B580.</b><br>
   <a href="https://goldbach.net01.io">Live campaign</a> ·
   <a href="docs/CORRECTNESS.md">Correctness</a> ·
   <a href="docs/BENCHMARKING.md">Benchmarks</a> ·
@@ -22,9 +22,9 @@ compiled to SPIR-V and a C++23 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts).
 
-**v2.3.0: 64.6 billion even numbers per second** at 4×10¹⁸ (63.8 G at the
-top of the range, 2.8 J per 10⁹ evens) with exact statistics on — the whole
-[4×10¹⁸, 5×10¹⁸] in about **90 days** on one B580.
+**v2.5.1: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
+top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
+on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580.
 
 | Document | Contents |
 |---|---|
@@ -95,13 +95,19 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
-| Window (bench.py, v2.3.0 vs v2.2.1, 8 paired rounds) | v2.3.0 | v2.2.1 | change |
+| Window (bench.py, v2.5.1 vs v2.3.0, 12 paired rounds) | v2.5.1 | v2.3.0 | change |
 |---|---|---|---|
-| long — 10¹¹ at 4×10¹⁸ | **64.62 G evens/s** | 59.54 G | +8.54% |
-| long-end — 10¹¹ ending at 5×10¹⁸ | **63.77 G** | 58.38 G | +9.23% |
+| long — 10¹¹ at 4×10¹⁸ | **69.61 G evens/s** | 64.30 G | +8.24% |
+| long-end — 10¹¹ ending at 5×10¹⁸ | **68.87 G** | 63.38 G | +8.52% |
 
-Per 10¹¹ integers at 4×10¹⁸: large-prime sieve 473 ms (packed kernel + hit
-lists), tile sieve 204 ms, checker 92 ms. The history of every version and
+Measured 2026-11-16 with production's release binary and configuration
+(exact statistics including the exact prime-gap walk, `GB_BUCKET_VERIFY=500`),
+each version at its own default segment; the paired 95% intervals are
+±0.12% and ±0.19%. v2.3.0 recorded no prime gaps: v2.5.1 is faster while
+doing that extra work. Per 10¹¹ integers at 4×10¹⁸: large-prime sieve
+431 ms (packed kernel + hit lists), tile sieve 168 ms, checker and
+statistics 175 ms; the next segment's sieve overlaps the checker, so the
+parts add up to more than the 718 ms GPU time. The history of every version and
 every measured change is in [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md)
 §9.2 and §13; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 

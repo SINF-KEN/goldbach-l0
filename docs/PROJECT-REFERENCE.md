@@ -1733,6 +1733,15 @@ dominated and not comparable.)
 
 ### 13.2 Measured performance
 
+- v2.5.1 (bench.py, 2026-11-16, production's release binary bb3a96f and
+  configuration: exact statistics incl. the prime-gap walk,
+  `GB_BUCKET_VERIFY=500`; paired against a v2.3.0 build, each at its
+  default segment): long **69.61 G** ev/s (v2.3.0 64.30, +8.24% ±0.12%,
+  12 rounds), long-end **68.87 G** (63.38, +8.52% ±0.19%); steady 65.54 G
+  (+11.0% ±1.0%), end 65.05 G (+11.3% ±0.4%), bench 38.49 G (+6.2% ±1.6%),
+  8 rounds each. 2.74 J per 1e9 evens (long); full [4e18, 5e18] ~83 days.
+  Per 1e11 at 4e18: large 431 ms, tile sieve 168 ms, checker + statistics
+  175 ms, GPU 718 ms (the sieve overlaps the checker, §9.2v).
 - v1.7.0 (tools/bench.py, 2026-09-24, display on the iGPU, 9 runs each):
   bench window 16.6 G, steady (2e10 @4e18) **17.7 G**, end (2e10 below
   5e18) 17.3 G ev/s, CV <= 1.1%; 8.1-8.3 J per 1e9 evens in steady state.
@@ -1740,7 +1749,7 @@ dominated and not comparable.)
   Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`):
 
   ![steady window by version](images/waterfall-steady-by-version.png)
-  ![v1.8.0 by window](images/waterfall-current-by-window.png)
+  ![current version by window](images/waterfall-current-by-window.png)
 - v1.8.0 (bench.py, 9 paired runs vs v1.7.0 and v1.6.2): bench 19.1 G,
   steady **20.5 G**, end **20.0 G** ev/s; 7.2-7.4 J per 1e9 evens; full
   [4e18, 5e18] ~290 days (§9.2c).
