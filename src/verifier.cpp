@@ -264,6 +264,8 @@ struct Segment {
     uint32_t mask_coff = 0;          // group-mask table offset per class
     uint32_t mask_count_seg = 0;     // small-prime mask entries
     // host timings (GB_PHASE trace and telemetry)
+    double table_before = 0.0;
+    double prep_s = 0.0;
     clock_::time_point t_seg_wall;
     double offset_before = 0.0;
 };
@@ -524,6 +526,7 @@ private:
     bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
 
     // ---- per-segment steps -------------------------------------------------------
+    void prepare_segment_tables(Segment& sg);
     void begin_segment(Segment& sg);
 };
 
@@ -1611,6 +1614,90 @@ void DenseRun::begin_segment(Segment& sg) {
     sum_large_items += seg_stat.large_items;
 }
 
+/// Per-segment step 2 (host prep, overlapping the GPU's previous segment):
+/// first bits, the per-tile first-mark table and the small-prime masks,
+/// written into this slot's shared buffers.
+void DenseRun::prepare_segment_tables(Segment& sg) {
+    // Host prep for this segment (first-bits, tile table, masks).
+    //
+    // PIPELINE NOTE: this host work runs while the GPU is still executing
+    // the PREVIOUS segment (other slot). It is safe to write the slot's
+    // shared buffers here because that slot was last read by the segment
+    // two iterations ago, whose check kernel completed before the host
+    // collected it (host-synced on ev.check of that slot).
+    const auto t_prep = clock_::now();
+    sg.table_before = table_seconds;
+    {
+        // first_bits is a shared (host-mapped) allocation: write it
+        // directly, no copy command or sync needed. The kernel launch is
+        // queued after this host write completes.
+        // Class mode: the first bits are computed into a persistent host
+        // buffer (a fresh 2.3 MB vector per segment paid its page faults
+        // every time) by parallel workers over disjoint prime ranges, each
+        // copying its own slices: 1.65 -> ~0.3 ms of per-segment host
+        // prep, which had become the pipeline's limit once the GPU
+        // segment time dropped below the host loop's.
+        if (class_mode) {
+            parallel_for(0, sieve_split, 6, [&](uint32_t j0, uint32_t j1) {
+                first_bits_class_range(fb_host.data(), sieve_primes, sieve_split, j0, j1,
+                                       sg.q_first, sg.q_last, sg.cgeo);
+                for (uint32_t c = 0; c < sg.cgeo.K; ++c)
+                    std::memcpy(b.first_bits[sg.slot] + size_t(c) * sieve_split + j0,
+                                fb_host.data() + size_t(c) * sieve_split + j0, size_t(j1 - j0) * 8);
+            });
+        } else {
+            fb_host = compute_first_bits(sieve_primes, sieve_split, sg.q_first, sg.q_last);
+            std::memcpy(b.first_bits[sg.slot], fb_host.data(), fb_host.size() * 8);
+        }
+        const std::vector<uint64_t>& fb = fb_host;
+
+        if (use_table) {
+            const auto t_table = clock_::now();
+            build_tile_first_table(b.tile_first[sg.slot], uint32_t(sg.tiles_launch),
+                                   sieve_split, own_end, fb.data(), magic.data(),
+                                   shift.data(), sieve_primes, class_mode ? sg.cgeo.tpc : 0u);
+            table_seconds += seconds_since(t_table);
+        }
+
+        // Large-prime first bits are computed INLINE by
+        // sieve_large_primes (one u64 division per prime — the former
+        // host/98M-prime pass and then a separate GPU pre-pass were both
+        // measured and removed; see tools/debug_fb.cpp for the bit-exact
+        // validation of that formula).
+
+        // Small-prime mask table for THIS segment (q_first-dependent).
+        // Same shared-buffer pipeline-safety argument as first_bits:
+        // this slot was last read two segments ago, already synced.
+        if (class_mode) {
+            for (uint32_t c = 0; c < sg.cgeo.K; ++c) {
+                if (mask_groups_n > 0) {
+                    // canonical tables (uploaded once): per class only the
+                    // word offset of each group (primes.cpp)
+                    const std::vector<uint32_t> ys = small_prime_group_offsets(
+                        sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period);
+                    if (ys.size() != mask_groups_n)
+                        throw std::runtime_error("class masks: group layout mismatch");
+                    std::memcpy(b.group_y[sg.slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
+                    continue;
+                }
+                const auto mt = small_prime_mask_table_step(sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod);
+                if (sg.mask_count_seg > 0) {
+                    std::memcpy(b.mask_table[sg.slot] + size_t(c) * sg.mask_count_seg * 64, mt.data(),
+                                mt.size() * 8);
+                }
+            }
+        } else if (mask_groups_n > 0) {
+            const SmallPrimeGroups gm =
+                small_prime_group_masks(sieve_primes, sg.mask_count_seg, sg.q_first, mask_period);
+            std::memcpy(b.group_masks[sg.slot], gm.words.data(), gm.words.size() * 8);
+        } else if (sg.mask_count_seg > 0) {
+            const auto mt = small_prime_mask_table(sieve_primes, sg.mask_count_seg, sg.q_first);
+            std::memcpy(b.mask_table[sg.slot], mt.data(), mt.size() * 8);
+        }
+    }
+    sg.prep_s = seconds_since(t_prep);
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1635,84 +1722,7 @@ RunStats DenseRun::run() {
         sg.seg_start = seg_start;
         begin_segment(sg);
 
-        // Host prep for this segment (first-bits, tile table, masks).
-        //
-        // PIPELINE NOTE: this host work runs while the GPU is still executing
-        // the PREVIOUS segment (other slot). It is safe to write the slot's
-        // shared buffers here because that slot was last read by the segment
-        // two iterations ago, whose check kernel completed before the host
-        // collected it (host-synced on ev.check of that slot).
-        const auto t_prep = clock_::now();
-        const double table_before = table_seconds;
-        {
-            // first_bits is a shared (host-mapped) allocation: write it
-            // directly, no copy command or sync needed. The kernel launch is
-            // queued after this host write completes.
-            // Class mode: the first bits are computed into a persistent host
-            // buffer (a fresh 2.3 MB vector per segment paid its page faults
-            // every time) by parallel workers over disjoint prime ranges, each
-            // copying its own slices: 1.65 -> ~0.3 ms of per-segment host
-            // prep, which had become the pipeline's limit once the GPU
-            // segment time dropped below the host loop's.
-            if (class_mode) {
-                parallel_for(0, sieve_split, 6, [&](uint32_t j0, uint32_t j1) {
-                    first_bits_class_range(fb_host.data(), sieve_primes, sieve_split, j0, j1,
-                                           sg.q_first, sg.q_last, sg.cgeo);
-                    for (uint32_t c = 0; c < sg.cgeo.K; ++c)
-                        std::memcpy(b.first_bits[sg.slot] + size_t(c) * sieve_split + j0,
-                                    fb_host.data() + size_t(c) * sieve_split + j0, size_t(j1 - j0) * 8);
-                });
-            } else {
-                fb_host = compute_first_bits(sieve_primes, sieve_split, sg.q_first, sg.q_last);
-                std::memcpy(b.first_bits[sg.slot], fb_host.data(), fb_host.size() * 8);
-            }
-            const std::vector<uint64_t>& fb = fb_host;
-
-            if (use_table) {
-                const auto t_table = clock_::now();
-                build_tile_first_table(b.tile_first[sg.slot], uint32_t(sg.tiles_launch),
-                                       sieve_split, own_end, fb.data(), magic.data(),
-                                       shift.data(), sieve_primes, class_mode ? sg.cgeo.tpc : 0u);
-                table_seconds += seconds_since(t_table);
-            }
-
-            // Large-prime first bits are computed INLINE by
-            // sieve_large_primes (one u64 division per prime — the former
-            // host/98M-prime pass and then a separate GPU pre-pass were both
-            // measured and removed; see tools/debug_fb.cpp for the bit-exact
-            // validation of that formula).
-
-            // Small-prime mask table for THIS segment (q_first-dependent).
-            // Same shared-buffer pipeline-safety argument as first_bits:
-            // this slot was last read two segments ago, already synced.
-            if (class_mode) {
-                for (uint32_t c = 0; c < sg.cgeo.K; ++c) {
-                    if (mask_groups_n > 0) {
-                        // canonical tables (uploaded once): per class only the
-                        // word offset of each group (primes.cpp)
-                        const std::vector<uint32_t> ys = small_prime_group_offsets(
-                            sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period);
-                        if (ys.size() != mask_groups_n)
-                            throw std::runtime_error("class masks: group layout mismatch");
-                        std::memcpy(b.group_y[sg.slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
-                        continue;
-                    }
-                    const auto mt = small_prime_mask_table_step(sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod);
-                    if (sg.mask_count_seg > 0) {
-                        std::memcpy(b.mask_table[sg.slot] + size_t(c) * sg.mask_count_seg * 64, mt.data(),
-                                    mt.size() * 8);
-                    }
-                }
-            } else if (mask_groups_n > 0) {
-                const SmallPrimeGroups gm =
-                    small_prime_group_masks(sieve_primes, sg.mask_count_seg, sg.q_first, mask_period);
-                std::memcpy(b.group_masks[sg.slot], gm.words.data(), gm.words.size() * 8);
-            } else if (sg.mask_count_seg > 0) {
-                const auto mt = small_prime_mask_table(sieve_primes, sg.mask_count_seg, sg.q_first);
-                std::memcpy(b.mask_table[sg.slot], mt.data(), mt.size() * 8);
-            }
-        }
-        const double prep_s = seconds_since(t_prep);
+        prepare_segment_tables(sg);
         const auto t_enq = clock_::now();
 
         // --- make_prime_map args (single launch covers ALL tiles)
@@ -2399,7 +2409,7 @@ RunStats DenseRun::run() {
             ridges->save(ridge_file);
             coll_s = seconds_since(t_coll);
         }
-        sum_prep += prep_s;
+        sum_prep += sg.prep_s;
         sum_enq += enq_s;
         sum_wait += wait_s;
         sum_coll += coll_s;
@@ -2410,8 +2420,8 @@ RunStats DenseRun::run() {
                 "  phase seg %llu: prep %.1f ms (off %.1f tab %.1f)  enq %.1f ms "
                 "(args %.1f l1 %.2f l2 %.2f l3 %.2f)  wait %.1f ms  coll %.1f ms\n",
                 (unsigned long long)stats.segments,
-                prep_s * 1e3, offset_seconds - sg.offset_before,
-                (table_seconds - table_before) * 1e3,
+                sg.prep_s * 1e3, offset_seconds - sg.offset_before,
+                (table_seconds - sg.table_before) * 1e3,
                 enq_s * 1e3, args_s * 1e3, l1_s * 1e3, (l2_s - l1_s) * 1e3,
                 (l3_s - l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
         }
