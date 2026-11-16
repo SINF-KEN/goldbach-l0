@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-00599C">
+  <img alt="C++23" src="https://img.shields.io/badge/C%2B%2B-23-00599C">
   <img alt="Level Zero" src="https://img.shields.io/badge/Intel-Level%20Zero-0071C5">
   <img alt="Arc B580" src="https://img.shields.io/badge/GPU-Arc%20B580-0071C5">
 </p>
@@ -17,7 +17,7 @@
 `goldbach-l0` verifies the even Goldbach conjecture — every even `n` in
 `[start, limit]` is the sum of two primes `p + q` — on an Intel Arc
 **B580** (Xe2 / Battlemage) through **Level Zero**, with OpenCL C kernels
-compiled to SPIR-V and a C++20 host. It is running a campaign over
+compiled to SPIR-V and a C++23 host. It is running a campaign over
 **[4×10¹⁸, 5×10¹⁸]**, beyond the published verification to 4×10¹⁸, and
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts).
