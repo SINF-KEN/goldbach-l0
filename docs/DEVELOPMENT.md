@@ -31,6 +31,12 @@ validators and benchmark tools live in the companion repository
 this one (`tools -> ../goldbach-tools`); without it only `goldbach_l0`,
 `host_tests` and `stats_ref` are built.
 
+The host code is C++23, except `src/primes.cpp` and
+`include/{config,primes,gstats}.hpp`: the
+[browser verifier](https://github.com/SINF-KEN/goldbach-web) builds copies of
+these four files with `-std=c++20` (g++ and em++), so they must stay valid
+C++20.
+
 ## Tests
 
 | Command | Needs | What |
