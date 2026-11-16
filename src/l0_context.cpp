@@ -27,6 +27,21 @@ std::string ze_result_string(ze_result_t r) {
     }
 }
 
+std::optional<ze_kernel_timestamp_data_t> kernel_ticks(ze_event_handle_t ev) {
+    ze_kernel_timestamp_result_t ts{};
+    if (zeEventQueryKernelTimestamp(ev, &ts) != ZE_RESULT_SUCCESS) return std::nullopt;
+    return ts.context;
+}
+
+std::optional<double> kernel_seconds(ze_event_handle_t ev, double timer_hz) {
+    if (!(timer_hz > 0)) return std::nullopt;
+    const auto t = kernel_ticks(ev);
+    if (!t) return std::nullopt;
+    const int64_t d = int64_t(t->kernelEnd) - int64_t(t->kernelStart);
+    if (d <= 0) return std::nullopt;
+    return double(d) / timer_hz;
+}
+
 uint32_t env_grid(const char* name, uint32_t dflt) {
     const char* e = std::getenv(name);
     if (!e) return dflt;

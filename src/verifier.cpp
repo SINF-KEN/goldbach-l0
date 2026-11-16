@@ -1490,93 +1490,57 @@ RunStats run_gpu(uint64_t limit,
     bool split_used[2] = {false, false};   // slot's segment ran the split checker
     bool xs_used[2] = {false, false};      // slot's segment ran check30_xs8..3 (4 launches)
 
-    // Query the three per-kernel GPU timestamps of the given slot and ADD the
-    // deltas to the destination counters. Returns true when the events
-    // yielded valid timestamps. Deltas are skipped when the device clock
-    // reports end < start (clock anomalies observed on some driver builds).
+    // Query the per-kernel GPU timestamps of the given slot: the sieve, large
+    // and check kernels SET ds / dl / dv, the extra kernels of a phase are
+    // ADDED to them. Returns true when one of the three yielded a valid
+    // timestamp. A kernel is skipped when the device clock reports
+    // end <= start (kernel_seconds: anomalies seen on some driver builds).
     // With GB_PHASE=1, also log raw start/end ticks per segment so kernel
     // overlap (or its absence) can be verified directly.
     const auto query_slot = [&](uint32_t slot, double& ds, double& dl, double& dv) {
-        ze_kernel_timestamp_result_t r0{}, r1{}, r2{};
-        const ze_result_t q0 = zeEventQueryKernelTimestamp(ev.sieve[slot], &r0);
-        const ze_result_t q1 = zeEventQueryKernelTimestamp(ev.check[slot], &r1);
-        const ze_result_t q2 = zeEventQueryKernelTimestamp(ev.large[slot], &r2);
         bool any = false;
-        if (q0 == ZE_RESULT_SUCCESS && timer_hz > 0) {
-            const int64_t d = int64_t(r0.context.kernelEnd) - int64_t(r0.context.kernelStart);
-            if (d > 0) { ds = double(d) / timer_hz; any = true; }
-        }
-        if (q2 == ZE_RESULT_SUCCESS && timer_hz > 0) {
-            const int64_t d = int64_t(r2.context.kernelEnd) - int64_t(r2.context.kernelStart);
-            if (d > 0) { dl = double(d) / timer_hz; any = true; }
-        }
-        if (q1 == ZE_RESULT_SUCCESS && timer_hz > 0) {
-            const int64_t d = int64_t(r1.context.kernelEnd) - int64_t(r1.context.kernelStart);
-            if (d > 0) { dv = double(d) / timer_hz; any = true; }
-        }
-        if (hl_used[slot] && timer_hz > 0) {   // large_s also counts the hit-list harvest
-            ze_kernel_timestamp_result_t rh{};
-            if (zeEventQueryKernelTimestamp(ev.hl[slot], &rh) == ZE_RESULT_SUCCESS) {
-                const int64_t d = int64_t(rh.context.kernelEnd) - int64_t(rh.context.kernelStart);
-                if (d > 0) {
-                    dl += double(d) / timer_hz;
-                    if (phase_trace)
-                        std::fprintf(stderr, "    hl_harvest %.3f ms\n", double(d) / timer_hz * 1e3);
-                }
+        if (const auto t = kernel_seconds(ev.sieve[slot], timer_hz)) { ds = *t; any = true; }
+        if (const auto t = kernel_seconds(ev.large[slot], timer_hz)) { dl = *t; any = true; }
+        if (const auto t = kernel_seconds(ev.check[slot], timer_hz)) { dv = *t; any = true; }
+        if (hl_used[slot])   // large_s also counts the hit-list harvest
+            if (const auto t = kernel_seconds(ev.hl[slot], timer_hz)) {
+                dl += *t;
+                if (phase_trace) std::fprintf(stderr, "    hl_harvest %.3f ms\n", *t * 1e3);
             }
-        }
-        if (bucket_on && !hl_fuse && timer_hz > 0) {   // large_s = packed kernel + bucket_process
-            ze_kernel_timestamp_result_t rb{};
-            if (zeEventQueryKernelTimestamp(ev.bucket[slot], &rb) == ZE_RESULT_SUCCESS) {
-                const int64_t d = int64_t(rb.context.kernelEnd) - int64_t(rb.context.kernelStart);
-                if (d > 0) {
-                    dl += double(d) / timer_hz;
-                    if (phase_trace)
-                        std::fprintf(stderr, "    bucket_process %.3f ms (large total %.3f ms)\n",
-                                     double(d) / timer_hz * 1e3, dl * 1e3);
-                }
+        if (bucket_on && !hl_fuse)   // large_s = packed kernel + bucket_process
+            if (const auto t = kernel_seconds(ev.bucket[slot], timer_hz)) {
+                dl += *t;
+                if (phase_trace)
+                    std::fprintf(stderr, "    bucket_process %.3f ms (large total %.3f ms)\n",
+                                 *t * 1e3, dl * 1e3);
             }
+        // check_s = phase A + phase B (+ split_map)
+        if (const auto t = kernel_seconds(ev.checka[slot], timer_hz)) {
+            dv += *t;
+            if (phase_trace) std::fprintf(stderr, "    phase_a %.3f ms\n", *t * 1e3);
         }
-        if (timer_hz > 0) {   // check_s = phase A + phase B (+ split_map)
-            ze_kernel_timestamp_result_t ra{};
-            if (zeEventQueryKernelTimestamp(ev.checka[slot], &ra) == ZE_RESULT_SUCCESS) {
-                const int64_t d = int64_t(ra.context.kernelEnd) - int64_t(ra.context.kernelStart);
-                if (d > 0) {
-                    dv += double(d) / timer_hz;
-                    if (phase_trace)
-                        std::fprintf(stderr, "    phase_a %.3f ms\n", double(d) / timer_hz * 1e3);
-                }
+        for (int v = 0; v < 3 && xs_used[slot]; ++v)
+            if (const auto t = kernel_seconds(ev.xv[v][slot], timer_hz)) {
+                dv += *t;
+                if (phase_trace) std::fprintf(stderr, "    phase_a variant %d %.3f ms\n", v, *t * 1e3);
             }
-            for (int v = 0; v < 3 && xs_used[slot]; ++v)
-                if (zeEventQueryKernelTimestamp(ev.xv[v][slot], &ra) == ZE_RESULT_SUCCESS) {
-                    const int64_t d = int64_t(ra.context.kernelEnd) - int64_t(ra.context.kernelStart);
-                    if (d > 0) {
-                        dv += double(d) / timer_hz;
-                        if (phase_trace)
-                            std::fprintf(stderr, "    phase_a variant %d %.3f ms\n", v, double(d) / timer_hz * 1e3);
-                    }
-                }
-            if (split_used[slot] &&
-                zeEventQueryKernelTimestamp(ev.splitk[slot], &ra) == ZE_RESULT_SUCCESS) {
-                const int64_t d = int64_t(ra.context.kernelEnd) - int64_t(ra.context.kernelStart);
-                if (d > 0) {
-                    dv += double(d) / timer_hz;
-                    if (phase_trace)
-                        std::fprintf(stderr, "    split_map %.3f ms\n", double(d) / timer_hz * 1e3);
-                }
+        if (split_used[slot])
+            if (const auto t = kernel_seconds(ev.splitk[slot], timer_hz)) {
+                dv += *t;
+                if (phase_trace) std::fprintf(stderr, "    split_map %.3f ms\n", *t * 1e3);
             }
-        }
-        if (phase_trace && q0 == ZE_RESULT_SUCCESS && q2 == ZE_RESULT_SUCCESS &&
-            q1 == ZE_RESULT_SUCCESS) {
-            std::fprintf(stderr,
-                "    ticks: sieve[%lld..%lld] large[%lld..%lld] check[%lld..%lld] "
-                "gap_s->l %+.1f ms gap_l->c %+.1f ms\n",
-                (long long)r0.context.kernelStart, (long long)r0.context.kernelEnd,
-                (long long)r2.context.kernelStart, (long long)r2.context.kernelEnd,
-                (long long)r1.context.kernelStart, (long long)r1.context.kernelEnd,
-                (double(int64_t(r2.context.kernelStart) - int64_t(r0.context.kernelEnd)) / timer_hz) * 1e3,
-                (double(int64_t(r1.context.kernelStart) - int64_t(r2.context.kernelEnd)) / timer_hz) * 1e3);
-        }
+        if (phase_trace)
+            if (const auto s = kernel_ticks(ev.sieve[slot]), l = kernel_ticks(ev.large[slot]),
+                           c = kernel_ticks(ev.check[slot]);
+                s && l && c)
+                std::fprintf(stderr,
+                    "    ticks: sieve[%lld..%lld] large[%lld..%lld] check[%lld..%lld] "
+                    "gap_s->l %+.1f ms gap_l->c %+.1f ms\n",
+                    (long long)s->kernelStart, (long long)s->kernelEnd,
+                    (long long)l->kernelStart, (long long)l->kernelEnd,
+                    (long long)c->kernelStart, (long long)c->kernelEnd,
+                    (double(int64_t(l->kernelStart) - int64_t(s->kernelEnd)) / timer_hz) * 1e3,
+                    (double(int64_t(c->kernelStart) - int64_t(l->kernelEnd)) / timer_hz) * 1e3);
         return any;
     };
 
