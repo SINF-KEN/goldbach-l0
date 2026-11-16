@@ -242,6 +242,32 @@ void resolve_leftovers(Context& ctx, uint32_t* leftover_buf, uint32_t n_left,
     }
 }
 
+/// One segment of the loop (stack object, one per iteration): geometry, the
+/// class-map kernel arguments derived from it, and the host timings the
+/// iteration's steps record. Kernel arguments are passed by address and
+/// copied by set_arg, so the fields serve exactly as run_gpu's locals did.
+struct Segment {
+    uint64_t seg_start = 0;          // first even n
+    uint64_t seg_end   = 0;          // last even n (inclusive)
+    uint64_t seg_evens = 0;
+    uint64_t q_first   = 0;
+    uint64_t q_last    = 0;
+    uint64_t q_odds    = 0;
+    uint64_t tiles     = 0;          // dense-map tiles
+    uint32_t slot      = 0;          // pipeline slot
+    ClassGeo cgeo;                   // class mode: class arrays of cgeo.tpc tiles
+    uint64_t tiles_launch = 0;       // tile-kernel work-groups
+    uint32_t c5w  = 0;               // class stride (u64 words)
+    uint32_t off5 = 0;               // class stride (bits)
+    uint32_t phis = 0;               // class phases (kernel arg)
+    uint32_t ga1 = 0, ga2 = 0;       // phi1 / phi5 kernel args
+    uint32_t mask_coff = 0;          // group-mask table offset per class
+    uint32_t mask_count_seg = 0;     // small-prime mask entries
+    // host timings (GB_PHASE trace and telemetry)
+    clock_::time_point t_seg_wall;
+    double offset_before = 0.0;
+};
+
 // ---------------------------------------------------------------------------
 // run_gpu, split into phases.
 //
@@ -496,6 +522,9 @@ private:
 
     void begin_segment_loop();
     bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
+
+    // ---- per-segment steps -------------------------------------------------------
+    void begin_segment(Segment& sg);
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1516,6 +1545,72 @@ bool DenseRun::query_slot(uint32_t slot, double& ds, double& dl, double& dv) {
     return any;
 }
 
+/// Per-segment step 1: geometry of the segment at sg.seg_start, the class-map
+/// kernel arguments derived from it, and its telemetry record (seg_stat).
+void DenseRun::begin_segment(Segment& sg) {
+    const SegmentGeometry g = segment_geometry(sg.seg_start, limit, segment_even,
+                                               stats.segments);
+    sg.seg_end   = g.seg_end;
+    sg.seg_evens = g.seg_evens;
+    sg.q_first   = g.q_first;
+    sg.q_last    = g.q_last;
+    sg.q_odds    = g.q_odds;
+    sg.tiles     = g.tiles;
+    sg.slot      = g.slot;
+    // Class mode: the map is two class arrays of cgeo.tpc tiles each.
+    sg.cgeo = class_mode ? class_geometry(sg.q_first, sg.q_odds, ncls_map) : ClassGeo{};
+    sg.tiles_launch = class_mode ? uint64_t(sg.cgeo.K) * sg.cgeo.tpc : sg.tiles;
+    sg.c5w = sg.cgeo.tpc * TILE_WORDS;                 // class stride (u64 words)
+    sg.off5 = sg.c5w * 64u;                            // class stride (bits)
+    sg.phis = sg.cgeo.phi[0] | (sg.cgeo.phi[1] << 8);
+    // phi1 / phi5 kernel args: K = 2 the two phases; K = 8 the dense
+    // phase (mod 15) -> class nibble table (15 = not stored)
+    sg.ga1 = sg.cgeo.phi[0];
+    sg.ga2 = sg.cgeo.phi[1];
+    if (c30) {
+        sg.phis = 0;
+        uint64_t ph2k = ~0ull;
+        for (uint32_t c = 0; c < 8; ++c) {
+            sg.phis |= sg.cgeo.phi[c] << (4 * c);
+            ph2k &= ~(0xFull << (4 * sg.cgeo.phi[c]));
+            ph2k |= uint64_t(c) << (4 * sg.cgeo.phi[c]);
+        }
+        sg.ga1 = uint32_t(ph2k);
+        sg.ga2 = uint32_t(ph2k >> 32);
+    }
+    sg.mask_coff = class_mode ? 0u : uint32_t(mask_group_words);   // class: one canonical set
+
+    // Per-segment telemetry: start the wall clock. The record itself is
+    // filled after mask_count_seg/tiles are computed below, and finalized
+    // when this segment's GPU work is collected (next iteration or drain).
+    sg.t_seg_wall = clock_::now();
+    sg.offset_before = offset_seconds;
+
+    // The small-prime mask table is q_first-dependent; the kernel's stage
+    // 3.5 (restore q = p) is range-sensitive and skipped when q_first >
+    // MASK_MAX_P, so masks stay valid at every range (disabling them at
+    // high ranges forced Xe2 into thousands of scalar SLM RMWs per lane
+    // for p=3..61 instead of 18 x 32 whole-word ANDs).
+    sg.mask_count_seg = mask_count;
+
+    // Per-segment telemetry record (collected after the NEXT iteration's
+    // sync, once this segment's kernel timestamps are readable).
+    seg_stat = SegmentStats{};
+    seg_stat.seg_start   = sg.seg_start;
+    seg_stat.seg_end     = sg.seg_end;
+    seg_stat.evens       = sg.seg_evens;
+    seg_stat.sieve_split = sieve_split;
+    seg_stat.mask_count  = sg.mask_count_seg;
+    seg_stat.tiles       = sg.tiles_launch;
+    // work-items of the packed large-prime kernel as launched below
+    // (LARGE_PACK_PPI primes each; the bucketed / hit-listed primes are
+    // not work-items of it). The legacy LARGE_PRIMES_PER_ITEM count over
+    // every large prime reported ~4x the real launch.
+    seg_stat.large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
+    sum_tiles += sg.tiles_launch;
+    sum_large_items += seg_stat.large_items;
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1536,66 +1631,9 @@ RunStats DenseRun::run() {
     begin_segment_loop();
 
     for (uint64_t seg_start = start_even; seg_start <= limit; seg_start += segment_even) {
-        const SegmentGeometry g = segment_geometry(seg_start, limit, segment_even,
-                                                   stats.segments);
-        const uint64_t seg_end   = g.seg_end;
-        const uint64_t seg_evens = g.seg_evens;
-        const uint64_t q_first   = g.q_first;
-        const uint64_t q_last    = g.q_last;
-        const uint64_t q_odds    = g.q_odds;
-        const uint64_t tiles     = g.tiles;
-        const uint32_t slot      = g.slot;
-        // Class mode: the map is two class arrays of cgeo.tpc tiles each.
-        const ClassGeo cgeo = class_mode ? class_geometry(q_first, q_odds, ncls_map) : ClassGeo{};
-        const uint64_t tiles_launch = class_mode ? uint64_t(cgeo.K) * cgeo.tpc : tiles;
-        const uint32_t c5w = cgeo.tpc * TILE_WORDS;                 // class stride (u64 words)
-        const uint32_t off5 = c5w * 64u;                            // class stride (bits)
-        uint32_t phis = cgeo.phi[0] | (cgeo.phi[1] << 8);
-        // phi1 / phi5 kernel args: K = 2 the two phases; K = 8 the dense
-        // phase (mod 15) -> class nibble table (15 = not stored)
-        uint32_t ga1 = cgeo.phi[0], ga2 = cgeo.phi[1];
-        if (c30) {
-            phis = 0;
-            uint64_t ph2k = ~0ull;
-            for (uint32_t c = 0; c < 8; ++c) {
-                phis |= cgeo.phi[c] << (4 * c);
-                ph2k &= ~(0xFull << (4 * cgeo.phi[c]));
-                ph2k |= uint64_t(c) << (4 * cgeo.phi[c]);
-            }
-            ga1 = uint32_t(ph2k);
-            ga2 = uint32_t(ph2k >> 32);
-        }
-        const uint32_t mask_coff = class_mode ? 0u : uint32_t(mask_group_words);   // class: one canonical set
-
-        // Per-segment telemetry: start the wall clock. The record itself is
-        // filled after mask_count_seg/tiles are computed below, and finalized
-        // when this segment's GPU work is collected (next iteration or drain).
-        const auto t_seg_wall = clock_::now();
-        const double offset_before = offset_seconds;
-
-        // The small-prime mask table is q_first-dependent; the kernel's stage
-        // 3.5 (restore q = p) is range-sensitive and skipped when q_first >
-        // MASK_MAX_P, so masks stay valid at every range (disabling them at
-        // high ranges forced Xe2 into thousands of scalar SLM RMWs per lane
-        // for p=3..61 instead of 18 x 32 whole-word ANDs).
-        const uint32_t mask_count_seg = mask_count;
-
-        // Per-segment telemetry record (collected after the NEXT iteration's
-        // sync, once this segment's kernel timestamps are readable).
-        seg_stat = SegmentStats{};
-        seg_stat.seg_start   = seg_start;
-        seg_stat.seg_end     = seg_end;
-        seg_stat.evens       = seg_evens;
-        seg_stat.sieve_split = sieve_split;
-        seg_stat.mask_count  = mask_count_seg;
-        seg_stat.tiles       = tiles_launch;
-        // work-items of the packed large-prime kernel as launched below
-        // (LARGE_PACK_PPI primes each; the bucketed / hit-listed primes are
-        // not work-items of it). The legacy LARGE_PRIMES_PER_ITEM count over
-        // every large prime reported ~4x the real launch.
-        seg_stat.large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
-        sum_tiles += tiles_launch;
-        sum_large_items += seg_stat.large_items;
+        Segment sg;
+        sg.seg_start = seg_start;
+        begin_segment(sg);
 
         // Host prep for this segment (first-bits, tile table, masks).
         //
@@ -1619,22 +1657,22 @@ RunStats DenseRun::run() {
             if (class_mode) {
                 parallel_for(0, sieve_split, 6, [&](uint32_t j0, uint32_t j1) {
                     first_bits_class_range(fb_host.data(), sieve_primes, sieve_split, j0, j1,
-                                           q_first, q_last, cgeo);
-                    for (uint32_t c = 0; c < cgeo.K; ++c)
-                        std::memcpy(b.first_bits[slot] + size_t(c) * sieve_split + j0,
+                                           sg.q_first, sg.q_last, sg.cgeo);
+                    for (uint32_t c = 0; c < sg.cgeo.K; ++c)
+                        std::memcpy(b.first_bits[sg.slot] + size_t(c) * sieve_split + j0,
                                     fb_host.data() + size_t(c) * sieve_split + j0, size_t(j1 - j0) * 8);
                 });
             } else {
-                fb_host = compute_first_bits(sieve_primes, sieve_split, q_first, q_last);
-                std::memcpy(b.first_bits[slot], fb_host.data(), fb_host.size() * 8);
+                fb_host = compute_first_bits(sieve_primes, sieve_split, sg.q_first, sg.q_last);
+                std::memcpy(b.first_bits[sg.slot], fb_host.data(), fb_host.size() * 8);
             }
             const std::vector<uint64_t>& fb = fb_host;
 
             if (use_table) {
                 const auto t_table = clock_::now();
-                build_tile_first_table(b.tile_first[slot], uint32_t(tiles_launch),
+                build_tile_first_table(b.tile_first[sg.slot], uint32_t(sg.tiles_launch),
                                        sieve_split, own_end, fb.data(), magic.data(),
-                                       shift.data(), sieve_primes, class_mode ? cgeo.tpc : 0u);
+                                       shift.data(), sieve_primes, class_mode ? sg.cgeo.tpc : 0u);
                 table_seconds += seconds_since(t_table);
             }
 
@@ -1648,30 +1686,30 @@ RunStats DenseRun::run() {
             // Same shared-buffer pipeline-safety argument as first_bits:
             // this slot was last read two segments ago, already synced.
             if (class_mode) {
-                for (uint32_t c = 0; c < cgeo.K; ++c) {
+                for (uint32_t c = 0; c < sg.cgeo.K; ++c) {
                     if (mask_groups_n > 0) {
                         // canonical tables (uploaded once): per class only the
                         // word offset of each group (primes.cpp)
                         const std::vector<uint32_t> ys = small_prime_group_offsets(
-                            sieve_primes, mask_count_seg, cgeo.Q[c], cgeo.qmod, mask_period);
+                            sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period);
                         if (ys.size() != mask_groups_n)
                             throw std::runtime_error("class masks: group layout mismatch");
-                        std::memcpy(b.group_y[slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
+                        std::memcpy(b.group_y[sg.slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
                         continue;
                     }
-                    const auto mt = small_prime_mask_table_step(sieve_primes, mask_count_seg, cgeo.Q[c], cgeo.qmod);
-                    if (mask_count_seg > 0) {
-                        std::memcpy(b.mask_table[slot] + size_t(c) * mask_count_seg * 64, mt.data(),
+                    const auto mt = small_prime_mask_table_step(sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod);
+                    if (sg.mask_count_seg > 0) {
+                        std::memcpy(b.mask_table[sg.slot] + size_t(c) * sg.mask_count_seg * 64, mt.data(),
                                     mt.size() * 8);
                     }
                 }
             } else if (mask_groups_n > 0) {
                 const SmallPrimeGroups gm =
-                    small_prime_group_masks(sieve_primes, mask_count_seg, q_first, mask_period);
-                std::memcpy(b.group_masks[slot], gm.words.data(), gm.words.size() * 8);
-            } else if (mask_count_seg > 0) {
-                const auto mt = small_prime_mask_table(sieve_primes, mask_count_seg, q_first);
-                std::memcpy(b.mask_table[slot], mt.data(), mt.size() * 8);
+                    small_prime_group_masks(sieve_primes, sg.mask_count_seg, sg.q_first, mask_period);
+                std::memcpy(b.group_masks[sg.slot], gm.words.data(), gm.words.size() * 8);
+            } else if (sg.mask_count_seg > 0) {
+                const auto mt = small_prime_mask_table(sieve_primes, sg.mask_count_seg, sg.q_first);
+                std::memcpy(b.mask_table[sg.slot], mt.data(), mt.size() * 8);
             }
         }
         const double prep_s = seconds_since(t_prep);
@@ -1682,33 +1720,33 @@ RunStats DenseRun::run() {
         //                   5=count 6=q_odds 7=SLM 8=mask_count 9=mask_table
         //                   10=q_first 11=sieve_split
         const auto t_args0 = clock_::now();
-        k_sieve.set_arg(0, sizeof(b.prime_map[slot]),    &b.prime_map[slot]);
+        k_sieve.set_arg(0, sizeof(b.prime_map[sg.slot]),    &b.prime_map[sg.slot]);
         k_sieve.set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
-        k_sieve.set_arg(2, sizeof(b.first_bits[slot]),   &b.first_bits[slot]);
+        k_sieve.set_arg(2, sizeof(b.first_bits[sg.slot]),   &b.first_bits[sg.slot]);
         k_sieve.set_arg(3, sizeof(b.magic),        &b.magic);
         k_sieve.set_arg(4, sizeof(b.shifts),       &b.shifts);
         k_sieve.set_arg(5, sizeof(sieve_split),    &sieve_split);
-        k_sieve.set_arg(6, sizeof(q_odds),         &q_odds);
+        k_sieve.set_arg(6, sizeof(sg.q_odds),         &sg.q_odds);
         k_sieve.set_local_arg(7, size_t(TILE_WORDS) * 8); // 16 KB SLM
-        k_sieve.set_arg(8, sizeof(mask_count_seg), &mask_count_seg);
-        k_sieve.set_arg(9, sizeof(b.mask_table[slot]), &b.mask_table[slot]);
-        k_sieve.set_arg(10, sizeof(q_first),       &q_first);
+        k_sieve.set_arg(8, sizeof(sg.mask_count_seg), &sg.mask_count_seg);
+        k_sieve.set_arg(9, sizeof(b.mask_table[sg.slot]), &b.mask_table[sg.slot]);
+        k_sieve.set_arg(10, sizeof(sg.q_first),       &sg.q_first);
         k_sieve.set_arg(11, sizeof(sieve_split),   &sieve_split);
-        k_sieve.set_arg(12, sizeof(b.tile_first[slot]), &b.tile_first[slot]);
+        k_sieve.set_arg(12, sizeof(b.tile_first[sg.slot]), &b.tile_first[sg.slot]);
         k_sieve.set_arg(13, sizeof(use_table_u32), &use_table_u32);
         k_sieve.set_arg(14, sizeof(b.ms32),        &b.ms32);
         k_sieve.set_arg(15, sizeof(own_end),       &own_end);
-        k_sieve.set_arg(16, sizeof(b.group_masks[slot]), &b.group_masks[slot]);
+        k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
         k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
         k_sieve.set_arg(18, sizeof(mask_groups_n), &mask_groups_n);
         k_sieve.set_arg(19, 4, &cm_u32);
-        k_sieve.set_arg(20, 4, &cgeo.tpc);
-        k_sieve.set_arg(21, 4, &phis);
-        k_sieve.set_arg(22, 8, &cgeo.n[0]);
-        k_sieve.set_arg(23, 8, &cgeo.n[1]);
-        k_sieve.set_arg(24, 4, &mask_coff);
+        k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
+        k_sieve.set_arg(21, 4, &sg.phis);
+        k_sieve.set_arg(22, 8, &sg.cgeo.n[0]);
+        k_sieve.set_arg(23, 8, &sg.cgeo.n[1]);
+        k_sieve.set_arg(24, 4, &sg.mask_coff);
         {
-            uint32_t* gy = (class_mode && mask_groups_n > 0) ? b.group_y[slot] : nullptr;
+            uint32_t* gy = (class_mode && mask_groups_n > 0) ? b.group_y[sg.slot] : nullptr;
             k_sieve.set_arg(26, sizeof(gy), &gy);
         }
         k_sieve.set_arg(25, 4, &sieve_split);
@@ -1721,31 +1759,31 @@ RunStats DenseRun::run() {
         // quiescent here: their previous signals belonged to segment k-2,
         // whose check kernel was host-synchronized during the last iteration.
         const uint32_t zero = 0;
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[slot], &zero, 1, 4,
+        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[sg.slot], &zero, 1, 4,
                                                nullptr, 0, nullptr));
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[slot], &zero, 1, 4,
+        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
                                                nullptr, 0, nullptr));
-        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[slot], &zero, 1, 4,
+        ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
                                                nullptr, 0, nullptr));
         // statistics: p_hist / p_first / x_cnt are reset by the host after
         // each collect (collect_stats); x_hist is used by sampled segments only
         if (stats_on && stats.segments % stats_sample == 0)
-            ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.x_hist[slot], &zero, 4,
+            ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.x_hist[sg.slot], &zero, 4,
                                                    splan.xall.size() * 4, nullptr, 0, nullptr));
-        ZE_CHECK(zeEventHostReset(ev.sieve[slot]));
-        ZE_CHECK(zeEventHostReset(ev.large[slot]));
-        ZE_CHECK(zeEventHostReset(ev.check[slot]));
-        ZE_CHECK(zeEventHostReset(ev.checka[slot]));
-        ZE_CHECK(zeEventHostReset(ev.bucket[slot]));
-        ZE_CHECK(zeEventHostReset(ev.hl[slot]));
-        ZE_CHECK(zeEventHostReset(ev.splitk[slot]));
-        for (int v = 0; v < 3; ++v) ZE_CHECK(zeEventHostReset(ev.xv[v][slot]));
+        ZE_CHECK(zeEventHostReset(ev.sieve[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.large[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.check[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.checka[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.bucket[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.hl[sg.slot]));
+        ZE_CHECK(zeEventHostReset(ev.splitk[sg.slot]));
+        for (int v = 0; v < 3; ++v) ZE_CHECK(zeEventHostReset(ev.xv[v][sg.slot]));
         const double args_s = seconds_since(t_args0);
 
         const auto t_launch0 = clock_::now();
         // launch_overlap: may overlap segment k-1's checker (this slot's map,
         // tables and counters were last used by segment k-2, host-synchronized)
-        k_sieve.launch_overlap(ctx.list(), uint32_t(tiles_launch), ev.sieve[slot]); // all tiles, one launch
+        k_sieve.launch_overlap(ctx.list(), uint32_t(sg.tiles_launch), ev.sieve[sg.slot]); // all tiles, one launch
         const double l1_s = seconds_since(t_launch0);
 
         // --- sieve_large_primes: one work-item per large base prime.
@@ -1772,7 +1810,7 @@ RunStats DenseRun::run() {
             if (k_idx >= run_segments)
                 throw std::runtime_error("hit lists: segment index beyond the run");
             const uint32_t jb = k_idx % hl_K;
-            hl_used[slot] = false;
+            hl_used[sg.slot] = false;
             if (jb == 0) {
                 const uint32_t nseg = uint32_t(std::min<uint64_t>(hl_K, run_segments - k_idx));
                 const uint32_t qtail = uint32_t((k_idx + nseg == run_segments) ? run_last_q_odds
@@ -1788,7 +1826,7 @@ RunStats DenseRun::run() {
                 k_hlh->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
                 k_hlh->set_arg(1, sizeof(a), &a);
                 k_hlh->set_arg(2, sizeof(bnd), &bnd);
-                k_hlh->set_arg(3, sizeof(q_first), &q_first);
+                k_hlh->set_arg(3, sizeof(sg.q_first), &sg.q_first);
                 k_hlh->set_arg(4, sizeof(delta32), &delta32);
                 k_hlh->set_arg(5, sizeof(qof32), &qof32);
                 k_hlh->set_arg(6, sizeof(nseg), &nseg);
@@ -1798,14 +1836,14 @@ RunStats DenseRun::run() {
                 k_hlh->set_arg(10, sizeof(hl_capg), &hl_capg);
                 k_hlh->set_arg(11, sizeof(d_hl_counts), &d_hl_counts);
                 k_hlh->set_arg(12, sizeof(bkt_err), &bkt_err);
-                k_hlh->launch_overlap(ctx.list(), hl_G, ev.hl[slot]);   // exactly hl_G: the region layout
-                hl_used[slot] = true;
+                k_hlh->launch_overlap(ctx.list(), hl_G, ev.hl[sg.slot]);   // exactly hl_G: the region layout
+                hl_used[sg.slot] = true;
             }
             hl_jb = jb;
             if (!hl_fuse) {
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint32_t q_odds32 = uint32_t(q_odds);
-            k_hla->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            const uint32_t q_odds32 = uint32_t(sg.q_odds);
+            k_hla->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_hla->set_arg(1, sizeof(d_hl_lists), &d_hl_lists);
             k_hla->set_arg(2, sizeof(hl_capg), &hl_capg);
             k_hla->set_arg(3, sizeof(d_hl_counts), &d_hl_counts);
@@ -1814,10 +1852,10 @@ RunStats DenseRun::run() {
             k_hla->set_arg(6, sizeof(q_odds32), &q_odds32);
             k_hla->set_arg(7, sizeof(bkt_err), &bkt_err);
             k_hla->set_arg(8, 4, &cm_u32);
-            k_hla->set_arg(9, 4, &ga1);
-            k_hla->set_arg(10, 4, &ga2);
-            k_hla->set_arg(11, 4, &off5);
-            k_hla->launch(ctx.list(), bucket_groups, ev.bucket[slot]);
+            k_hla->set_arg(9, 4, &sg.ga1);
+            k_hla->set_arg(10, 4, &sg.ga2);
+            k_hla->set_arg(11, 4, &sg.off5);
+            k_hla->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
             }
         } else if (bucket_on) {
             // Bucket sieve for primes [bucket_begin, sieve_count): activate
@@ -1855,29 +1893,29 @@ RunStats DenseRun::run() {
             }
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             const uint32_t bslot = k_idx % bucket_R;
-            const uint32_t is_last = (seg_end == limit) ? 1u : 0u;
+            const uint32_t is_last = (sg.seg_end == limit) ? 1u : 0u;
             const float inv_delta = 1.0f / float(delta);
-            k_bproc->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            k_bproc->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_bproc->set_arg(1, sizeof(d_bkt_entries), &d_bkt_entries);
             k_bproc->set_arg(2, sizeof(d_bkt_counts), &d_bkt_counts);
             k_bproc->set_arg(3, sizeof(bucket_cap), &bucket_cap);
             k_bproc->set_arg(4, sizeof(bucket_R), &bucket_R);
             k_bproc->set_arg(5, sizeof(bslot), &bslot);
-            k_bproc->set_arg(6, sizeof(q_odds), &q_odds);
+            k_bproc->set_arg(6, sizeof(sg.q_odds), &sg.q_odds);
             k_bproc->set_arg(7, sizeof(q_odds_full), &q_odds_full);
             k_bproc->set_arg(8, sizeof(delta), &delta);
             k_bproc->set_arg(9, sizeof(inv_delta), &inv_delta);
             k_bproc->set_arg(10, sizeof(is_last), &is_last);
             k_bproc->set_arg(11, sizeof(bkt_err), &bkt_err);
-            const uint32_t qfw = uint32_t(q_first % WHEEL_W);
+            const uint32_t qfw = uint32_t(sg.q_first % WHEEL_W);
             k_bproc->set_arg(12, sizeof(qfw), &qfw);
             k_bproc->set_arg(13, sizeof(d_bkt_entries1), &d_bkt_entries1);
             k_bproc->set_arg(14, sizeof(bkt_split), &bkt_split);
             k_bproc->set_arg(15, 4, &cm_u32);
-            k_bproc->set_arg(16, 4, &ga1);
-            k_bproc->set_arg(17, 4, &ga2);
-            k_bproc->set_arg(18, 4, &off5);
-            k_bproc->launch(ctx.list(), bucket_groups, ev.bucket[slot]);
+            k_bproc->set_arg(16, 4, &sg.ga1);
+            k_bproc->set_arg(17, 4, &sg.ga2);
+            k_bproc->set_arg(18, 4, &sg.off5);
+            k_bproc->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
             // The drained bucket is refilled only from segment k+1's
             // activation on (horizon k+R); the next segment's barriers order
             // this reset before any such push. The reset is a write after
@@ -1899,17 +1937,17 @@ RunStats DenseRun::run() {
             // to run until the barrier was added).
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             Kernel& kl = hl_fuse ? *k_hla : k_large;
-            kl.set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            kl.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             kl.set_arg(1, sizeof(d_large_bases),  &d_large_bases);
             kl.set_arg(2, sizeof(d_large_gaps),   &d_large_gaps);
             kl.set_arg(3, sizeof(packed_count),   &packed_count);
-            kl.set_arg(4, sizeof(q_odds),         &q_odds);
-            kl.set_arg(5, sizeof(q_first),        &q_first);
-            kl.set_arg(6, sizeof(q_last),         &q_last);
+            kl.set_arg(4, sizeof(sg.q_odds),         &sg.q_odds);
+            kl.set_arg(5, sizeof(sg.q_first),        &sg.q_first);
+            kl.set_arg(6, sizeof(sg.q_last),         &sg.q_last);
             kl.set_arg(7, 4, &cm_u32);
-            kl.set_arg(8, 4, &ga1);
-            kl.set_arg(9, 4, &ga2);
-            kl.set_arg(10, 4, &off5);
+            kl.set_arg(8, 4, &sg.ga1);
+            kl.set_arg(9, 4, &sg.ga2);
+            kl.set_arg(10, 4, &sg.off5);
             if (hl_fuse) {
                 kl.set_arg(11, sizeof(d_hl_lists), &d_hl_lists);
                 kl.set_arg(12, sizeof(hl_capg), &hl_capg);
@@ -1921,31 +1959,31 @@ RunStats DenseRun::run() {
             const uint64_t large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
             if (large_items > 0)
                 kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
-                               ev.large[slot]);
+                               ev.large[sg.slot]);
         }
         if (bucket_verify && stats.segments % bucket_verify_every == 0) {
             // Rebuild this segment's map without buckets into the scratch map
             // and count differing words (checked at collection).
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             k_sieve.set_arg(0, sizeof(d_verify_map), &d_verify_map);
-            k_sieve.launch(ctx.list(), uint32_t(tiles_launch));
+            k_sieve.launch(ctx.list(), uint32_t(sg.tiles_launch));
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             k_large_full->set_arg(0, sizeof(d_verify_map), &d_verify_map);
             k_large_full->set_arg(1, sizeof(d_full_bases), &d_full_bases);
             k_large_full->set_arg(2, sizeof(d_full_gaps), &d_full_gaps);
             k_large_full->set_arg(3, sizeof(large_count), &large_count);
-            k_large_full->set_arg(4, sizeof(q_odds), &q_odds);
-            k_large_full->set_arg(5, sizeof(q_first), &q_first);
-            k_large_full->set_arg(6, sizeof(q_last), &q_last);
+            k_large_full->set_arg(4, sizeof(sg.q_odds), &sg.q_odds);
+            k_large_full->set_arg(5, sizeof(sg.q_first), &sg.q_first);
+            k_large_full->set_arg(6, sizeof(sg.q_last), &sg.q_last);
             k_large_full->set_arg(7, 4, &cm_u32);
-            k_large_full->set_arg(8, 4, &ga1);
-            k_large_full->set_arg(9, 4, &ga2);
-            k_large_full->set_arg(10, 4, &off5);
+            k_large_full->set_arg(8, 4, &sg.ga1);
+            k_large_full->set_arg(9, 4, &sg.ga2);
+            k_large_full->set_arg(10, 4, &sg.off5);
             const uint64_t items_full = (uint64_t(large_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
             k_large_full->launch(ctx.list(), uint32_t((items_full + large_wg - 1) / large_wg));
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint64_t nwords = class_mode ? uint64_t(cgeo.K) * c5w : (q_odds + 63) / 64;
-            k_cmp->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            const uint64_t nwords = class_mode ? uint64_t(sg.cgeo.K) * sg.c5w : (sg.q_odds + 63) / 64;
+            k_cmp->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_cmp->set_arg(1, sizeof(d_verify_map), &d_verify_map);
             k_cmp->set_arg(2, sizeof(nwords), &nwords);
             k_cmp->set_arg(3, sizeof(verify_diff), &verify_diff);
@@ -1956,7 +1994,7 @@ RunStats DenseRun::run() {
                 ctx.host_sync();
                 if (*verify_diff) {
                     std::vector<uint64_t> a(nwords), bref(nwords);
-                    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), a.data(), b.prime_map[slot], nwords * 8, nullptr, 0, nullptr));
+                    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), a.data(), b.prime_map[sg.slot], nwords * 8, nullptr, 0, nullptr));
                     ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), bref.data(), d_verify_map, nwords * 8, nullptr, 0, nullptr));
                     ctx.host_sync();
                     int shown = 0;
@@ -1965,8 +2003,8 @@ RunStats DenseRun::run() {
                         while (x && shown < 12) {
                             const int bb = __builtin_ctzll(x); x &= x - 1;
                             const uint64_t bit = w * 64 + bb;
-                            const uint64_t q = !class_mode ? q_first + 2 * bit
-                                             : cgeo.Q[w / c5w] + cgeo.qmod * (bit - uint64_t(w / c5w) * c5w * 64);
+                            const uint64_t q = !class_mode ? sg.q_first + 2 * bit
+                                             : sg.cgeo.Q[w / sg.c5w] + sg.cgeo.qmod * (bit - uint64_t(w / sg.c5w) * sg.c5w * 64);
                             std::fprintf(stderr, "seg %llu bit %llu q=%llu bucket_map=%d reference=%d prime(MR)=%d\n",
                                          (unsigned long long)stats.segments, (unsigned long long)bit,
                                          (unsigned long long)q, int((a[w] >> bb) & 1), int((bref[w] >> bb) & 1),
@@ -1983,16 +2021,16 @@ RunStats DenseRun::run() {
         // --- check_numbers args
         // Twin checker: phase A reads the twin map with the twin list.
         const uint32_t twin_count = uint32_t(twin_primes.size());
-        k_check.set_arg(0, sizeof(b.prime_map[slot]),  &b.prime_map[slot]);
-        k_check.set_arg(1, sizeof(b.checked[slot]),    &b.checked[slot]);
+        k_check.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
+        k_check.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
         k_check.set_arg(2, sizeof(b.twin_primes),  &b.twin_primes);
         k_check.set_arg(3, sizeof(twin_count),     &twin_count);
-        k_check.set_arg(4, sizeof(b.pending[slot]),   &b.pending[slot]);
-        k_check.set_arg(5, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
-        k_check.set_arg(6, sizeof(q_first),        &q_first);
-        k_check.set_arg(7, sizeof(q_odds),         &q_odds);
-        k_check.set_arg(8, sizeof(seg_start),      &seg_start);
-        k_check.set_arg(9, sizeof(seg_evens),      &seg_evens);
+        k_check.set_arg(4, sizeof(b.pending[sg.slot]),   &b.pending[sg.slot]);
+        k_check.set_arg(5, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+        k_check.set_arg(6, sizeof(sg.q_first),        &sg.q_first);
+        k_check.set_arg(7, sizeof(sg.q_odds),         &sg.q_odds);
+        k_check.set_arg(8, sizeof(sg.seg_start),      &sg.seg_start);
+        k_check.set_arg(9, sizeof(sg.seg_evens),      &sg.seg_evens);
         k_check.set_arg(10, sizeof(twin_cap),    &twin_cap);
         k_check.set_arg(11, sizeof(pending_cap), &pending_cap);
         const uint32_t twin_u32 = 1u;
@@ -2006,46 +2044,46 @@ RunStats DenseRun::run() {
         ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
         const uint64_t evens_per_a_group = uint64_t(WG_SIZE) * a_w64 * 64;
         const uint32_t a_groups =
-            uint32_t((seg_evens + evens_per_a_group - 1) / evens_per_a_group);
-        const SplitSeg sseg = split_on ? split_segment(seg_start, seg_evens, q_first, split_plan)
+            uint32_t((sg.seg_evens + evens_per_a_group - 1) / evens_per_a_group);
+        const SplitSeg sseg = split_on ? split_segment(sg.seg_start, sg.seg_evens, sg.q_first, split_plan)
                                        : SplitSeg{};
-        const Seg30 s30 = c30chk ? seg30(seg_start, seg_evens, q_first) : Seg30{};
+        const Seg30 s30 = c30chk ? seg30(sg.seg_start, sg.seg_evens, sg.q_first) : Seg30{};
         // Recording threshold: the current Kth largest ridge (ratchets up as
         // the top list fills; ~0u disables every append).
         const uint32_t seg_ceiling = s30.ok ? ceil_c30 : sseg.ok ? ceil_split : ceil_fallback;
         const uint32_t ridge_thresh_u32 =
             ridges->active() ? std::max(ridges->thresh(), seg_ceiling) : 0xFFFFFFFFu;
-        split_used[slot] = sseg.ok && (!class_mode || c30) && !s30.ok;  // split_map / merge30 timing
-        if (class_mode && (!sseg.ok || (!c30 && (sseg.phi1 != cgeo.phi[0] || sseg.phi5 != cgeo.phi[1]))))
+        split_used[sg.slot] = sseg.ok && (!class_mode || c30) && !s30.ok;  // split_map / merge30 timing
+        if (class_mode && (!sseg.ok || (!c30 && (sseg.phi1 != sg.cgeo.phi[0] || sseg.phi5 != sg.cgeo.phi[1]))))
             throw std::runtime_error("class map: split checker geometry rejected");
         if (stats_on && !s30.ok)
             throw std::runtime_error("statistics: segment geometry outside the mod-30 checker");
         // Every stats_sample-th segment of the run (segment 0 always) gets the
         // full exact p(n) histogram; the others record the tail in check30_b.
         const bool sampled = stats_on && stats.segments % stats_sample == 0;
-        sampled_slot[slot] = sampled;
-        slot_evens[slot] = seg_evens;
-        if (sampled) sampled_evens += seg_evens;
-        xs_used[slot] = sampled;
+        sampled_slot[sg.slot] = sampled;
+        slot_evens[sg.slot] = sg.seg_evens;
+        if (sampled) sampled_evens += sg.seg_evens;
+        xs_used[sg.slot] = sampled;
         if (stats_on) {
             // count30 (prime / twin counts; fusing it into check30_a measured
             // no faster: the larger kernel slows phase A) is timed under the
             // splitk event (added to check_s).
-            const uint32_t cw32 = 2 * c5w;
-            const std::vector<uint32_t> lim = count30_limits(seg_start, seg_end, cgeo.Q);
-            std::memcpy(b.x_lim[slot], lim.data(), lim.size() * 4);
+            const uint32_t cw32 = 2 * sg.c5w;
+            const std::vector<uint32_t> lim = count30_limits(sg.seg_start, sg.seg_end, sg.cgeo.Q);
+            std::memcpy(b.x_lim[sg.slot], lim.data(), lim.size() * 4);
             // class order by phase (gap kernels): ord / phis in ascending phi,
             // phic by class; the smallest counted position
             uint32_t g_ord = 0, g_phis = 0, g_phic = 0, g_poslo = ~0u;
             {
                 uint32_t cls[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-                std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return cgeo.phi[x] < cgeo.phi[y]; });
+                std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return sg.cgeo.phi[x] < sg.cgeo.phi[y]; });
                 for (uint32_t k = 0; k < 8; ++k) {
                     g_ord |= cls[k] << (4 * k);
-                    g_phis |= cgeo.phi[cls[k]] << (4 * k);
-                    g_phic |= cgeo.phi[k] << (4 * k);
+                    g_phis |= sg.cgeo.phi[cls[k]] << (4 * k);
+                    g_phic |= sg.cgeo.phi[k] << (4 * k);
                     if (lim[2 * cls[k]] < lim[2 * cls[k] + 1])
-                        g_poslo = std::min(g_poslo, 30 * lim[2 * cls[k]] + 2 * cgeo.phi[cls[k]]);
+                        g_poslo = std::min(g_poslo, 30 * lim[2 * cls[k]] + 2 * sg.cgeo.phi[cls[k]]);
                 }
             }
             // count30 also finds every gap >= GAPS30_TAIL (bit-parallel) and the
@@ -2053,33 +2091,33 @@ RunStats DenseRun::run() {
             // on the walked segments walks every prime (the gap histogram) on a
             // fixed grid of work-groups (one histogram flush each)
             const uint32_t ctcap = gaps_on ? GAPS30_TCAP : 0u;
-            walked_slot[slot] = gaps_on && (sampled || gaps_exact);
-            const uint32_t cwalk = walked_slot[slot] ? 1u : 0u;
+            walked_slot[sg.slot] = gaps_on && (sampled || gaps_exact);
+            const uint32_t cwalk = walked_slot[sg.slot] ? 1u : 0u;
             if (cw32 % COUNT30_CW) throw std::runtime_error("count30: class stride not a multiple of its lane width");
             const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
-            slot_ggroups[slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
-            slot_qfirst[slot] = q_first;
-            k_cnt->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
+            slot_qfirst[sg.slot] = sg.q_first;
+            k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_cnt->set_arg(1, 4, &cw32);
-            k_cnt->set_arg(2, sizeof(b.x_lim[slot]), &b.x_lim[slot]);
-            k_cnt->set_arg(3, sizeof(b.x_cnt[slot]), &b.x_cnt[slot]);
+            k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
+            k_cnt->set_arg(3, sizeof(b.x_cnt[sg.slot]), &b.x_cnt[sg.slot]);
             k_cnt->set_arg(4, 4, &g_ord);
             k_cnt->set_arg(5, 4, &g_phis);
             k_cnt->set_arg(6, 4, &g_phic);
             k_cnt->set_arg(7, 4, &g_poslo);
-            k_cnt->set_arg(8, sizeof(b.g_tail[slot]), &b.g_tail[slot]);
+            k_cnt->set_arg(8, sizeof(b.g_tail[sg.slot]), &b.g_tail[sg.slot]);
             k_cnt->set_arg(9, 4, &ctcap);
             k_cnt->set_arg(10, 4, &cwalk);
-            k_cnt->set_arg(11, sizeof(b.g_part[slot]), &b.g_part[slot]);
-            k_cnt->set_arg(12, sizeof(b.g_hist[slot]), &b.g_hist[slot]);
-            k_cnt->launch(ctx.list(), slot_ggroups[slot], ev.splitk[slot]);
-            split_used[slot] = true;
+            k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
+            k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
+            k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+            split_used[sg.slot] = true;
         }
         if (sampled) {
             // Full histogram: check30_xs8/6/4/3 (ascending prefix) -> barrier
             // -> check30_xb (ascending continuation).
-            const uint32_t cw32 = 2 * c5w;
-            const uint32_t se32 = uint32_t(seg_evens);
+            const uint32_t cw32 = 2 * sg.c5w;
+            const uint32_t se32 = uint32_t(sg.seg_evens);
             int first_xs = 0;
             while (first_xs < 4 && !splan.vn[first_xs]) ++first_xs;
             for (int v = 0; v < 4; ++v) {      // one launch per array-count variant
@@ -2087,62 +2125,62 @@ RunStats DenseRun::run() {
                 Kernel& kv = *k_cxs[v];
                 const uint32_t per_item = XS_W_HOST[v] * 32;
                 const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
-                kv.set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+                kv.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
                 kv.set_arg(1, 4, &cw32);
                 kv.set_arg(2, sizeof(b.x_all), &b.x_all);
                 kv.set_arg(3, sizeof(b.x_tab), &b.x_tab);
                 kv.set_arg(4, sizeof(b.x_j), &b.x_j);
                 kv.set_arg(5, sizeof(b.x_ch), &b.x_ch);
-                kv.set_arg(6, sizeof(b.pending[slot]), &b.pending[slot]);
-                kv.set_arg(7, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
+                kv.set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+                kv.set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
                 kv.set_arg(8, 4, &pending_cap);
                 kv.set_arg(9, 4, &items_pad);
                 kv.set_arg(10, 4, &se32);
                 kv.set_arg(11, 4, &s30.sm30);
                 kv.set_arg(12, 4, &s30.tb);
                 kv.set_arg(13, 4, &s30.phik);
-                kv.set_arg(14, sizeof(b.x_hist[slot]), &b.x_hist[slot]);
+                kv.set_arg(14, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
                 kv.set_arg(15, 8, &splan.vcls[v]);
                 // the first variant may overlap count30 (see phase A below)
-                const ze_event_handle_t xe = v == 3 ? ev.checka[slot] : ev.xv[v][slot];
+                const ze_event_handle_t xe = v == 3 ? ev.checka[sg.slot] : ev.xv[v][sg.slot];
                 if (v == first_xs) kv.launch_overlap(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
                 else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
             }
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_cxb->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
             k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
-            k_cxb->set_arg(3, sizeof(b.pending[slot]), &b.pending[slot]);
-            k_cxb->set_arg(4, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
-            k_cxb->set_arg(5, sizeof(b.leftovers[slot]), &b.leftovers[slot]);
-            k_cxb->set_arg(6, sizeof(b.leftover_n[slot]), &b.leftover_n[slot]);
-            k_cxb->set_arg(7, sizeof(q_first), &q_first);
-            k_cxb->set_arg(8, sizeof(q_odds), &q_odds);
-            k_cxb->set_arg(9, sizeof(seg_start), &seg_start);
+            k_cxb->set_arg(3, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+            k_cxb->set_arg(4, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+            k_cxb->set_arg(5, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+            k_cxb->set_arg(6, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+            k_cxb->set_arg(7, sizeof(sg.q_first), &sg.q_first);
+            k_cxb->set_arg(8, sizeof(sg.q_odds), &sg.q_odds);
+            k_cxb->set_arg(9, sizeof(sg.seg_start), &sg.seg_start);
             k_cxb->set_arg(10, 4, &pending_cap);
-            k_cxb->set_arg(11, 4, &ga1);
-            k_cxb->set_arg(12, 4, &ga2);
-            k_cxb->set_arg(13, 4, &off5);
-            k_cxb->set_arg(14, sizeof(b.ridge[slot]), &b.ridge[slot]);
+            k_cxb->set_arg(11, 4, &sg.ga1);
+            k_cxb->set_arg(12, 4, &sg.ga2);
+            k_cxb->set_arg(13, 4, &sg.off5);
+            k_cxb->set_arg(14, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
             k_cxb->set_arg(15, 4, &ridge_thresh_u32);
-            k_cxb->set_arg(16, sizeof(b.x_hist[slot]), &b.x_hist[slot]);
-            k_cxb->set_arg(17, sizeof(b.p_first[slot]), &b.p_first[slot]);
+            k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
+            k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
             k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
-            k_cxb->launch(ctx.list(), stats_b_groups, ev.check[slot]);  // grid-stride
+            k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
         } else if (s30.ok) {
             // Mod-30 checker: phase A on the class arrays -> barrier -> phase B.
-            const uint32_t cw32 = 2 * c5w;
+            const uint32_t cw32 = 2 * sg.c5w;
             const uint32_t per_item = a_w64 * 64;
             const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
-            const uint32_t se32 = uint32_t(seg_evens);
-            k_ca->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+            const uint32_t se32 = uint32_t(sg.seg_evens);
+            k_ca->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
             k_ca->set_arg(1, 4, &cw32);
-            k_ca->set_arg(2, sizeof(b.checked[slot]), &b.checked[slot]);
+            k_ca->set_arg(2, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
             k_ca->set_arg(3, 4, &chk_stride30);
             k_ca->set_arg(4, sizeof(b.c30_cands), &b.c30_cands);
             k_ca->set_arg(5, sizeof(b.c30_meta), &b.c30_meta);
-            k_ca->set_arg(6, sizeof(b.pending[slot]), &b.pending[slot]);
-            k_ca->set_arg(7, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
+            k_ca->set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+            k_ca->set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
             k_ca->set_arg(8, 4, &pending_cap);
             k_ca->set_arg(9, 4, &items_pad);
             k_ca->set_arg(10, 4, &se32);
@@ -2152,46 +2190,46 @@ RunStats DenseRun::run() {
             k_ca->set_arg(14, 4, &split_write_checked);
             // launch_overlap: phase A may run alongside count30 (both only
             // read the finished map; the barrier above follows the marks)
-            k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[slot]);
+            k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_cb->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
-            k_cb->set_arg(1, sizeof(b.checked[slot]), &b.checked[slot]);
+            k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+            k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
             k_cb->set_arg(2, 4, &chk_stride30);
             k_cb->set_arg(3, sizeof(b.c30_rest), &b.c30_rest);
             k_cb->set_arg(4, sizeof(b.c30_rtab), &b.c30_rtab);
-            k_cb->set_arg(5, sizeof(b.pending[slot]), &b.pending[slot]);
-            k_cb->set_arg(6, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
-            k_cb->set_arg(7, sizeof(b.leftovers[slot]), &b.leftovers[slot]);
-            k_cb->set_arg(8, sizeof(b.leftover_n[slot]), &b.leftover_n[slot]);
-            k_cb->set_arg(9, sizeof(q_first), &q_first);
-            k_cb->set_arg(10, sizeof(q_odds), &q_odds);
-            k_cb->set_arg(11, sizeof(seg_start), &seg_start);
+            k_cb->set_arg(5, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+            k_cb->set_arg(6, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+            k_cb->set_arg(7, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+            k_cb->set_arg(8, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+            k_cb->set_arg(9, sizeof(sg.q_first), &sg.q_first);
+            k_cb->set_arg(10, sizeof(sg.q_odds), &sg.q_odds);
+            k_cb->set_arg(11, sizeof(sg.seg_start), &sg.seg_start);
             k_cb->set_arg(12, 4, &pending_cap);
             k_cb->set_arg(13, 4, &split_write_checked);
-            k_cb->set_arg(14, 4, &ga1);
-            k_cb->set_arg(15, 4, &ga2);
-            k_cb->set_arg(16, 4, &off5);
-            k_cb->set_arg(17, sizeof(b.ridge[slot]), &b.ridge[slot]);
+            k_cb->set_arg(14, 4, &sg.ga1);
+            k_cb->set_arg(15, 4, &sg.ga2);
+            k_cb->set_arg(16, 4, &sg.off5);
+            k_cb->set_arg(17, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
             k_cb->set_arg(18, 4, &ridge_thresh_u32);
-            k_cb->set_arg(19, sizeof(b.p_hist[slot]), &b.p_hist[slot]);
-            k_cb->set_arg(20, sizeof(b.p_first[slot]), &b.p_first[slot]);
+            k_cb->set_arg(19, sizeof(b.p_hist[sg.slot]), &b.p_hist[sg.slot]);
+            k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
             k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
             k_cb->set_arg(22, 4, &tail_t);
-            k_cb->launch(ctx.list(), phase_b_groups, ev.check[slot]);  // grid-stride
+            k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
         } else if (sseg.ok) {
             // Class-split checker: [split_map -> barrier ->] phase A -> barrier
             // -> phase B (same pending / leftover buffers as the twin path).
             // Class mode: the map IS S1 / S5 (no split_map pass).
-            const uint32_t map32_words = uint32_t(2 * ((q_odds + 63) / 64));
+            const uint32_t map32_words = uint32_t(2 * ((sg.q_odds + 63) / 64));
             uint32_t s_words = std::min<uint32_t>(split_words, (map32_words + 2) / 3 + 1);
-            uint32_t* s1p = b.split_s1[slot];
-            uint32_t* s5p = b.split_s5[slot];
+            uint32_t* s1p = b.split_s1[sg.slot];
+            uint32_t* s5p = b.split_s5[sg.slot];
             if (c30) {
                 // merge30: S1 / S5 from the mod-30 class arrays. j -> class
                 // of residue (Q6 + 6j) mod 30, Q6 = first q of the mod-6 class
                 uint32_t kmap[2] = {0, 0};
                 for (int c = 0; c < 2; ++c) {
-                    const uint64_t Q6 = q_first + 2 * uint64_t(c ? sseg.phi5 : sseg.phi1);
+                    const uint64_t Q6 = sg.q_first + 2 * uint64_t(c ? sseg.phi5 : sseg.phi1);
                     for (uint32_t j = 0; j < 5; ++j) {
                         const uint32_t r = uint32_t((Q6 + 6 * j) % 30);
                         uint32_t k = 15;
@@ -2199,33 +2237,33 @@ RunStats DenseRun::run() {
                         kmap[c] |= k << (4 * j);
                     }
                 }
-                const uint32_t cw32 = 2 * c5w;
-                k_merge->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+                const uint32_t cw32 = 2 * sg.c5w;
+                k_merge->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
                 k_merge->set_arg(1, 4, &cw32);
-                k_merge->set_arg(2, sizeof(b.split_s1[slot]), &b.split_s1[slot]);
-                k_merge->set_arg(3, sizeof(b.split_s5[slot]), &b.split_s5[slot]);
+                k_merge->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
+                k_merge->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
                 k_merge->set_arg(4, 4, &s_words);
                 k_merge->set_arg(5, 4, &kmap[0]);
                 k_merge->set_arg(6, 4, &kmap[1]);
                 // q = 5 is prime but not stored mod 30: keep it in S5 (range bottom)
-                const uint64_t Q65 = q_first + 2 * uint64_t(sseg.phi5);
-                const uint32_t q5_t = (q_first <= 5 && Q65 <= 5) ? uint32_t((5 - Q65) / 6) : ~0u;
+                const uint64_t Q65 = sg.q_first + 2 * uint64_t(sseg.phi5);
+                const uint32_t q5_t = (sg.q_first <= 5 && Q65 <= 5) ? uint32_t((5 - Q65) / 6) : ~0u;
                 k_merge->set_arg(7, 4, &q5_t);
-                k_merge->launch(ctx.list(), (2 * ((s_words + 4) / 5) + WG_SIZE - 1) / WG_SIZE, ev.splitk[slot]);
+                k_merge->launch(ctx.list(), (2 * ((s_words + 4) / 5) + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
                 ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             } else if (class_mode) {
-                s_words = 2 * c5w;
-                s1p = reinterpret_cast<uint32_t*>(b.prime_map[slot]);
-                s5p = s1p + 2 * size_t(c5w);
+                s_words = 2 * sg.c5w;
+                s1p = reinterpret_cast<uint32_t*>(b.prime_map[sg.slot]);
+                s5p = s1p + 2 * size_t(sg.c5w);
             } else {
-                k_split->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
+                k_split->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
                 k_split->set_arg(1, sizeof(map32_words), &map32_words);
-                k_split->set_arg(2, sizeof(b.split_s1[slot]), &b.split_s1[slot]);
-                k_split->set_arg(3, sizeof(b.split_s5[slot]), &b.split_s5[slot]);
+                k_split->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
+                k_split->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
                 k_split->set_arg(4, sizeof(s_words), &s_words);
                 k_split->set_arg(5, sizeof(sseg.phi1), &sseg.phi1);
                 k_split->set_arg(6, sizeof(sseg.phi5), &sseg.phi5);
-                k_split->launch(ctx.list(), (s_words + WG_SIZE - 1) / WG_SIZE, ev.splitk[slot]);
+                k_split->launch(ctx.list(), (s_words + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
                 ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
             }
 
@@ -2235,12 +2273,12 @@ RunStats DenseRun::run() {
             k_sa->set_arg(0, sizeof(s1p), &s1p);
             k_sa->set_arg(1, sizeof(s5p), &s5p);
             k_sa->set_arg(2, sizeof(s_words), &s_words);
-            k_sa->set_arg(3, sizeof(b.checked[slot]), &b.checked[slot]);
+            k_sa->set_arg(3, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
             k_sa->set_arg(4, sizeof(chk_stride), &chk_stride);
             k_sa->set_arg(5, sizeof(b.split_cands), &b.split_cands);
             k_sa->set_arg(6, sizeof(b.split_meta), &b.split_meta);
-            k_sa->set_arg(7, sizeof(b.pending[slot]), &b.pending[slot]);
-            k_sa->set_arg(8, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
+            k_sa->set_arg(7, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+            k_sa->set_arg(8, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
             k_sa->set_arg(9, sizeof(pending_cap), &pending_cap);
             k_sa->set_arg(10, sizeof(items_pad), &items_pad);
             for (uint32_t c = 0; c < 3; ++c) {
@@ -2249,58 +2287,58 @@ RunStats DenseRun::run() {
                 k_sa->set_arg(17 + c, 4, &sseg.v[c]);
             }
             k_sa->set_arg(20, 4, &split_write_checked);
-            k_sa->launch(ctx.list(), 3 * items_pad / WG_SIZE, ev.checka[slot]);
+            k_sa->launch(ctx.list(), 3 * items_pad / WG_SIZE, ev.checka[sg.slot]);
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
 
-            k_sb->set_arg(0, sizeof(b.prime_map[slot]), &b.prime_map[slot]);
-            k_sb->set_arg(1, sizeof(b.checked[slot]), &b.checked[slot]);
+            k_sb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+            k_sb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
             k_sb->set_arg(2, sizeof(chk_stride), &chk_stride);
             k_sb->set_arg(3, sizeof(b.split_rest), &b.split_rest);
             for (uint32_t c = 0; c < 3; ++c) {
                 k_sb->set_arg(4 + c, 4, &split_plan.roff[c]);
                 k_sb->set_arg(7 + c, 4, &split_plan.rcnt[c]);
             }
-            k_sb->set_arg(10, sizeof(b.pending[slot]), &b.pending[slot]);
-            k_sb->set_arg(11, sizeof(b.pending_n[slot]), &b.pending_n[slot]);
-            k_sb->set_arg(12, sizeof(b.leftovers[slot]), &b.leftovers[slot]);
-            k_sb->set_arg(13, sizeof(b.leftover_n[slot]), &b.leftover_n[slot]);
-            k_sb->set_arg(14, sizeof(q_first), &q_first);
-            k_sb->set_arg(15, sizeof(q_odds), &q_odds);
-            k_sb->set_arg(16, sizeof(seg_start), &seg_start);
+            k_sb->set_arg(10, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+            k_sb->set_arg(11, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+            k_sb->set_arg(12, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+            k_sb->set_arg(13, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+            k_sb->set_arg(14, sizeof(sg.q_first), &sg.q_first);
+            k_sb->set_arg(15, sizeof(sg.q_odds), &sg.q_odds);
+            k_sb->set_arg(16, sizeof(sg.seg_start), &sg.seg_start);
             k_sb->set_arg(17, sizeof(pending_cap), &pending_cap);
             for (uint32_t c = 0; c < 3; ++c) k_sb->set_arg(18 + c, 4, &sseg.e0[c]);
             k_sb->set_arg(21, 4, &split_write_checked);
             k_sb->set_arg(22, 4, &cm_u32);
-            k_sb->set_arg(23, 4, &ga1);
-            k_sb->set_arg(24, 4, &ga2);
-            k_sb->set_arg(25, 4, &off5);
-            k_sb->set_arg(26, sizeof(b.ridge[slot]), &b.ridge[slot]);
+            k_sb->set_arg(23, 4, &sg.ga1);
+            k_sb->set_arg(24, 4, &sg.ga2);
+            k_sb->set_arg(25, 4, &sg.off5);
+            k_sb->set_arg(26, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
             k_sb->set_arg(27, 4, &ridge_thresh_u32);
-            k_sb->launch(ctx.list(), phase_b_groups, ev.check[slot]);  // grid-stride
+            k_sb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
         } else {
-            k_check.launch(ctx.list(), a_groups, ev.checka[slot]);
+            k_check.launch(ctx.list(), a_groups, ev.checka[sg.slot]);
             // Phase B consumes phase A's pending list (visibility: barrier).
             ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_check_b.set_arg(0, sizeof(b.prime_map[slot]),  &b.prime_map[slot]);
-            k_check_b.set_arg(1, sizeof(b.checked[slot]),    &b.checked[slot]);
+            k_check_b.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
+            k_check_b.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
             // Twin checker: phase B probes the uncovered candidates only.
             const uint32_t rest_count = uint32_t(rest_primes.size());
             const bool use_rest = b.rest_primes != nullptr;
             k_check_b.set_arg(2, sizeof(b.gb_primes),        use_rest ? &b.rest_primes : &b.gb_primes);
             k_check_b.set_arg(3, sizeof(gb_count),           use_rest ? &rest_count : &gb_count);
-            k_check_b.set_arg(4, sizeof(b.pending[slot]),    &b.pending[slot]);
-            k_check_b.set_arg(5, sizeof(b.pending_n[slot]),  &b.pending_n[slot]);
-            k_check_b.set_arg(6, sizeof(b.leftovers[slot]),  &b.leftovers[slot]);
-            k_check_b.set_arg(7, sizeof(b.leftover_n[slot]), &b.leftover_n[slot]);
-            k_check_b.set_arg(8, sizeof(q_first),            &q_first);
-            k_check_b.set_arg(9, sizeof(q_odds),             &q_odds);
-            k_check_b.set_arg(10, sizeof(seg_start),         &seg_start);
+            k_check_b.set_arg(4, sizeof(b.pending[sg.slot]),    &b.pending[sg.slot]);
+            k_check_b.set_arg(5, sizeof(b.pending_n[sg.slot]),  &b.pending_n[sg.slot]);
+            k_check_b.set_arg(6, sizeof(b.leftovers[sg.slot]),  &b.leftovers[sg.slot]);
+            k_check_b.set_arg(7, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+            k_check_b.set_arg(8, sizeof(sg.q_first),            &sg.q_first);
+            k_check_b.set_arg(9, sizeof(sg.q_odds),             &sg.q_odds);
+            k_check_b.set_arg(10, sizeof(sg.seg_start),         &sg.seg_start);
             const uint32_t b_from = 0u;   // twin: probe all candidates
             k_check_b.set_arg(11, sizeof(b_from),            &b_from);
             k_check_b.set_arg(12, sizeof(pending_cap),       &pending_cap);
-            k_check_b.set_arg(13, sizeof(b.ridge[slot]),     &b.ridge[slot]);
+            k_check_b.set_arg(13, sizeof(b.ridge[sg.slot]),     &b.ridge[sg.slot]);
             k_check_b.set_arg(14, 4, &ridge_thresh_u32);
-            k_check_b.launch(ctx.list(), phase_b_groups, ev.check[slot]);  // grid-stride
+            k_check_b.launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
         }
         const double enq_s = seconds_since(t_enq);
         const double launch_s = seconds_since(t_launch0);
@@ -2372,29 +2410,29 @@ RunStats DenseRun::run() {
                 "  phase seg %llu: prep %.1f ms (off %.1f tab %.1f)  enq %.1f ms "
                 "(args %.1f l1 %.2f l2 %.2f l3 %.2f)  wait %.1f ms  coll %.1f ms\n",
                 (unsigned long long)stats.segments,
-                prep_s * 1e3, offset_seconds - offset_before,
+                prep_s * 1e3, offset_seconds - sg.offset_before,
                 (table_seconds - table_before) * 1e3,
                 enq_s * 1e3, args_s * 1e3, l1_s * 1e3, (l2_s - l1_s) * 1e3,
                 (l3_s - l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
         }
 
-        prev_seg_start = seg_start;
-        prev_seg_evens = seg_evens;
+        prev_seg_start = sg.seg_start;
+        prev_seg_evens = sg.seg_evens;
 
         // Finalize the carry-over for this segment: its GPU work will be
         // collected in the NEXT loop iteration (or the drain) — that is the
         // point at which prev_seg_wall / prev_seg_offsets are consumed.
-        prev_seg_wall    = seconds_since(t_seg_wall);
-        prev_seg_offsets = offset_seconds - offset_before;
+        prev_seg_wall    = seconds_since(sg.t_seg_wall);
+        prev_seg_offsets = offset_seconds - sg.offset_before;
         prev_stat = seg_stat;
 
         ++stats.segments;
 
-        if (verbose && (stats.segments % 10 == 0 || seg_end == limit)) {
+        if (verbose && (stats.segments % 10 == 0 || sg.seg_end == limit)) {
             std::printf("  segment %llu: evens [%llu, %llu]  leftovers_total=%llu\n",
                         (unsigned long long)stats.segments,
-                        (unsigned long long)seg_start,
-                        (unsigned long long)seg_end,
+                        (unsigned long long)sg.seg_start,
+                        (unsigned long long)sg.seg_end,
                         (unsigned long long)total_leftovers);
         }
 
@@ -2402,7 +2440,7 @@ RunStats DenseRun::run() {
         // break, the for-loop increment lands exactly on limit and schedules
         // it again as a duplicate one-even segment, recreating the expensive
         // high-range tail pathology that the merge is intended to remove.
-        if (seg_end == limit) break;
+        if (sg.seg_end == limit) break;
     }
 
     // ---- Drain: collect the final segment --------------------------------
