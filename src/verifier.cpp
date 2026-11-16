@@ -238,16 +238,43 @@ void resolve_leftovers(Context& ctx, uint32_t* leftover_buf, uint32_t n_left,
     }
 }
 
-} // namespace
+// ---------------------------------------------------------------------------
+// run_gpu, split into phases.
+//
+// RunSetup holds the arguments and the host-only setup (no Level Zero: range
+// clamping, base primes); DenseRun adds the Level Zero state and runs the
+// phases in the order run_gpu always ran them. Every object a phase creates
+// is a member declared in the order run_gpu declared it as a local, so the
+// destructors (Kernel, Module, Context) run in the same order on return and
+// on an exception.
+// ---------------------------------------------------------------------------
+struct RunSetup {
+    // Arguments of run_gpu (limit / start_even / segment_even are clamped
+    // in place, as the parameters were).
+    uint64_t limit;
+    uint64_t segment_even;
+    const std::string& spv_path;
+    bool verbose;
+    uint64_t start_even;
+    uint32_t sieve_split_arg;
+    const char* prime_cache_path;
+    bool collect_segments;
 
-RunStats run_gpu(uint64_t limit,
-                 uint64_t segment_even,
-                 const std::string& spv_path,
-                 bool verbose,
-                 uint64_t start_even,
-                 uint32_t sieve_split_arg,
-                 const char* prime_cache_path,
-                 bool collect_segments) {
+    RunSetup(uint64_t limit_, uint64_t segment_even_, const std::string& spv_path_,
+             bool verbose_, uint64_t start_even_, uint32_t sieve_split_arg_,
+             const char* prime_cache_path_, bool collect_segments_)
+        : limit(limit_), segment_even(segment_even_), spv_path(spv_path_),
+          verbose(verbose_), start_even(start_even_), sieve_split_arg(sieve_split_arg_),
+          prime_cache_path(prime_cache_path_), collect_segments(collect_segments_) {}
+};
+
+class DenseRun : RunSetup {
+public:
+    using RunSetup::RunSetup;
+    RunStats run();
+};
+
+RunStats DenseRun::run() {
     if (limit < 4) throw std::runtime_error("limit < 4: no even n >= 4 to verify");
     gb::require_supported_limit(limit);
     // The last even n is limit rounded down (as run_gpu_sparse does). An odd
@@ -2256,6 +2283,21 @@ RunStats run_gpu(uint64_t limit,
     Context::free_mem(ctx.context(), b.ms32);
 
     return stats;
+}
+
+} // namespace
+
+RunStats run_gpu(uint64_t limit,
+                 uint64_t segment_even,
+                 const std::string& spv_path,
+                 bool verbose,
+                 uint64_t start_even,
+                 uint32_t sieve_split_arg,
+                 const char* prime_cache_path,
+                 bool collect_segments) {
+    DenseRun run(limit, segment_even, spv_path, verbose, start_even, sieve_split_arg,
+                 prime_cache_path, collect_segments);
+    return run.run();
 }
 
 // ------------------------------------------------------- CPU reference ----
