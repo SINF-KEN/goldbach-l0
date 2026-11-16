@@ -37,6 +37,20 @@ The host code is C++23, except `src/primes.cpp` and
 these four files with `-std=c++20` (g++ and em++), so they must stay valid
 C++20.
 
+**Dependencies and their updates.** The code uses only the C++ standard
+library, Level Zero and the Python standard library; nothing is vendored.
+
+| Dependency | Version source | Kept current by |
+|---|---|---|
+| GitHub Actions (`actions/checkout`, `actions/upload-artifact`) | major tags in the workflows | Dependabot: one grouped weekly PR (`.github/dependabot.yml`), merged automatically once CI passes |
+| Intel compute-runtime / ocloc | `CR_VER` pin in `ci.yml` | by hand: rebuild `kernels/*_bmg.spv` with the new ocloc and bump `CR_VER` in the same commit |
+| Level Zero loader, IGC, gcc, clang, CMake, Python | system packages | `pacman -Syu`; the local CI re-verifies the GPU stack after an update ([ci/README.md](../ci/README.md)) |
+| shellcheck, actionlint (CI static job) | release binaries in `~/.local/bin` on the runner machine | by hand from the projects' releases; a newer version can add findings that fail the static job, so run both on the repository first |
+| pandas, matplotlib (figures) | goldbach-tools `.venv` | by hand (`pip install -U`); `docs/make-plots.sh` must render the same figures |
+
+Dependabot cannot track the toolchain pin, the system packages or the
+user-local tools; only the Actions are in its scope.
+
 ## Tests
 
 | Command | Needs | What |
@@ -54,7 +68,11 @@ writes `goldbach_stats.state`, `goldbach_stats.log`, `goldbach_ridges.csv`,
 `goldbach_records.txt` and `goldbach_live.json`. Test and benchmark runs
 must point `GB_STATS_STATE`, `GB_STATS_LOG`, `GB_RIDGE_FILE`,
 `GB_RECORDS_FILE`, `GB_STATS_LIVE` at a scratch directory and set
-`GB_RECORD_HOOK=` (as `tests/gpu_validate.sh` and the CI do).
+`GB_RECORD_HOOK=` (as `tests/gpu_validate.sh` and the CI do). Use
+absolute paths: `tools/bench.py` starts every run with the working
+directory set to the checkout next to goldbach-tools
+(`../goldbach-l0`, the production tree on the campaign machine), so
+relative defaults would land in the campaign's files.
 
 ## Continuous integration
 
