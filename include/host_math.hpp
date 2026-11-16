@@ -158,6 +158,21 @@ void build_tile_first_table(uint32_t* tbl, uint32_t tiles, uint32_t sieve_split,
 std::pair<std::vector<uint64_t>, std::vector<uint32_t>>
 build_magic_reciprocals(const uint32_t* sieve_primes, uint32_t sieve_split);
 
+/// 32-bit reciprocals for the tile table path. The kernel jumps from the
+/// tile's first mark to a thread's 2048-bit range: d = my_bit0 - tf is
+/// always < BITS_PER_TILE = 2^17, so floor(d/p) is computable with a 32-bit
+/// reciprocal: with s = bit_width(BITS_PER_TILE * p) we have 2^s > BITS_PER_TILE*p,
+/// which makes floor(d*m/2^s) = floor(d/p) exact for every d < BITS_PER_TILE
+/// (for d divisible by p the product is k*p*(2^s+e)/2^s = k + k*e/2^s with
+/// k*e < BITS_PER_TILE < 2^s; otherwise d*e < (p - r)*2^s follows from
+/// d*e < BITS_PER_TILE*p < 2^s). m = ceil(2^s/p) <= 2*BITS_PER_TILE fits u32.
+/// Primes >= BITS_PER_TILE never use it (single mark per tile, range check).
+/// @pre   primes >= 3.
+/// @return sieve_split entries: m | (s << 32) for p < BITS_PER_TILE, 0 for
+///         the larger primes. The kernel computes floor(d/p) as
+///         (u32)((u64(d) * m) >> s), then ceil with k += (k * p < d).
+std::vector<uint64_t> build_tile_reciprocals32(const uint32_t* sieve_primes, uint32_t sieve_split);
+
 struct PackedLarge { std::vector<uint32_t> bases; std::vector<uint8_t> gaps; };
 /// Packs the large primes [split, count) for sieve_large_packed: one byte per
 /// prime (half-gap to the previous prime; 0 at every LARGE_PACK_GROUP-prime

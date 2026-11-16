@@ -1583,6 +1583,62 @@ void test_host_math_reciprocals()
     check(ceil_ok, "magic + correction gives ceil(d/p) exactly for every d < 2^33 (kernel jump)");
 }
 
+// 32-bit tile-table reciprocals: the kernel's floor(d/p) = (u32)((d * m) >> s)
+// and its ceil step, for every jump d < BITS_PER_TILE it can take.
+void test_host_math_reciprocals32()
+{
+    std::puts("host math: 32-bit tile-table reciprocals");
+    const std::vector<uint32_t> ps = odd_primes_up_to(1u << 20);   // > BITS_PER_TILE and the default split
+    const std::vector<uint64_t> ms = build_tile_reciprocals32(ps.data(), uint32_t(ps.size()));
+    check(ms.size() == ps.size(), "build_tile_reciprocals32 size");
+    const size_t covered = size_t(std::lower_bound(ps.begin(), ps.end(), uint32_t(BITS_PER_TILE)) - ps.begin());
+    check(ps[covered - 1] == 131071 && ps[covered] > BITS_PER_TILE, "largest covered prime is 2^17 - 1");
+    // entry format: s minimal with 2^s > BITS_PER_TILE * p, m = ceil(2^s / p) < 2^32; 0 above
+    bool fmt = true, zero_above = true;
+    for (size_t j = 0; j < ps.size(); ++j) {
+        const uint64_t p = ps[j], m = ms[j] & 0xffffffffu, s = ms[j] >> 32;
+        if (j >= covered) { zero_above &= ms[j] == 0; continue; }
+        fmt &= s < 64 && (1ull << s) > BITS_PER_TILE * p && (1ull << (s - 1)) <= BITS_PER_TILE * p &&
+               m == ((1ull << s) + p - 1) / p && m <= 2 * BITS_PER_TILE;
+    }
+    check(fmt, "reciprocal32 format: minimal s, m = ceil(2^s / p) <= 2 * BITS_PER_TILE");
+    check(zero_above, "reciprocal32 zero for every p >= BITS_PER_TILE");
+    // the kernel's arithmetic (u64 product, u32 quotient, ceil correction)
+    const auto exact = [&](size_t j, uint64_t d) {
+        const uint64_t p = ps[j];
+        const uint32_t k = uint32_t((d * uint32_t(ms[j])) >> uint32_t(ms[j] >> 32));
+        const uint32_t kc = k + ((uint64_t(k) * p < d) ? 1u : 0u);
+        return k == d / p && kc == (d + p - 1) / p;
+    };
+    // exhaustive d < BITS_PER_TILE: the smallest primes, the primes on both
+    // sides of every power of two (where s steps), and the largest covered one
+    std::vector<size_t> ex = {0, 1, 2, 3, 4, 5, 10, covered - 2, covered - 1};
+    for (uint64_t t = 4; t < BITS_PER_TILE; t *= 2) {
+        const size_t i = size_t(std::lower_bound(ps.begin(), ps.end(), uint32_t(t)) - ps.begin());
+        ex.push_back(i - 1);
+        ex.push_back(i);
+    }
+    std::sort(ex.begin(), ex.end());
+    ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
+    bool ok = true;
+    for (size_t j : ex)
+        for (uint64_t d = 0; d < BITS_PER_TILE; ++d) ok &= exact(j, d);
+    check(ok, "reciprocal32 floor / ceil exact for every d < BITS_PER_TILE (" + std::to_string(ex.size()) +
+              " edge primes)");
+    // random sample of the other covered primes: random d plus d near multiples of p
+    std::mt19937_64 rng(5021);
+    ok = true;
+    for (int r = 0; r < 4000; ++r) {
+        const size_t j = rng() % covered;
+        const uint64_t p = ps[j];
+        const uint64_t top = (BITS_PER_TILE - 1) / p * p;   // largest multiple below BITS_PER_TILE
+        uint64_t ds[12] = {BITS_PER_TILE - 1, top, top - 1, top ? top + 1 : 1, p, p - 1, p + 1, 0};
+        for (int k = 8; k < 12; ++k) ds[k] = rng() % BITS_PER_TILE;
+        for (uint64_t d : ds) ok &= d < BITS_PER_TILE ? exact(j, d) : true;
+    }
+    check(ok, "reciprocal32 floor / ceil exact on 4000 random covered primes (edge and random d)");
+}
+
 // Per-tile first-mark tables vs walking each prime's marks across the map.
 void test_host_math_tile_table()
 {
@@ -1723,6 +1779,7 @@ void test_host_math()
     test_host_math_segments();
     test_host_math_first_bits();
     test_host_math_reciprocals();
+    test_host_math_reciprocals32();
     test_host_math_tile_table();
     test_host_math_pack();
 }
