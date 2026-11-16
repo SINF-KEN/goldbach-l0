@@ -26,14 +26,15 @@ Current release: **v2.5.1**. Last full benchmark (v2.3.0): **64.6 billion
 even numbers per second** at 4×10¹⁸ (63.8 G at the top of the range, 2.8 J
 per 10⁹ evens) with exact statistics on — the whole [4×10¹⁸, 5×10¹⁸] in
 about **90 days** on one B580. v2.4–v2.5.1 add a few percent on top
-(+1.2%, +1.3% and +0.4% per change, measured individually: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §9.2u–v).
+(+1.2%, +1.3% and +0.4% per change, measured individually: [HISTORY.md §9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06)–[v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)).
 
 | Document | Contents |
 |---|---|
 | [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 audit |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | hardware and software, build, tests, CI, the kernel shipping procedure, reproducibility, production operation |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | how performance is measured and compared; raw data in [bench/](bench/) |
-| [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, kernels, host, and the log of every optimization kept or dropped (§9.2) |
+| [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, pipeline, kernels, host |
+| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2w, numbered as before), the per-version performance record, the removed wheel path |
 | [docs/PIPELINE.md](docs/PIPELINE.md) | the production run as a diagram, from `run_range.sh` to the journal |
 | [ci/README.md](ci/README.md) | the local CI: release gating, production control |
 
@@ -98,7 +99,7 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 ## Performance
 
 Last full release comparison (the v2.4–v2.5.1 changes were measured one at
-a time, PROJECT-REFERENCE.md §9.2u–v):
+a time, [HISTORY.md §9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06)–[v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)):
 
 | Window (bench.py, v2.3.0 vs v2.2.1, 8 paired rounds) | v2.3.0 | v2.2.1 | change |
 |---|---|---|---|
@@ -107,8 +108,8 @@ a time, PROJECT-REFERENCE.md §9.2u–v):
 
 Per 10¹¹ integers at 4×10¹⁸ (v2.3.0): large-prime sieve 473 ms (packed kernel + hit
 lists), tile sieve 204 ms, checker 92 ms. The history of every version and
-every measured change is in [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md)
-§9.2 and §13; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
+every measured change is in [HISTORY.md](docs/HISTORY.md)
+§9.2 and §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ![Timing waterfall, long window, by version](docs/images/waterfall-long-by-version.png)
 
@@ -120,7 +121,7 @@ the integers) chosen so that every even class reaches one of them, with
 candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (17× the
 dense path) but cannot produce the exact statistics (its map holds 12 of
 5760 classes), so the campaign runs the dense path. Design and validation:
-[PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §9.2k.
+[HISTORY.md §9.2k](docs/HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp).
 
 ## Goldbach ridge tracking (`My Top 30 Largest Goldbach Ridges`)
 

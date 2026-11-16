@@ -34,7 +34,7 @@ this one (`tools -> ../goldbach-tools`); without it only `goldbach_l0`,
 
 | Command | Needs | What |
 |---|---|---|
-| `ctest --test-dir build -LE gpu` | nothing | `host_tests` (host math vs brute force, cache and state damage, plans), `check_constants` (host <-> kernel constant mirrors), `cli_tests` (CLI contract), `stats_known` (p(n) vs Oliveira e Silva's table), `stats_tools`, `known_windows` (the reference table of an independent verifier's published windows, and the comparison logic) |
+| `ctest --test-dir build -LE gpu` | nothing | `host_tests` (host math vs brute force, cache and state damage, plans), `check_constants` (host <-> kernel constant mirrors, README version and C++ badge), `cli_tests` (CLI contract), `stats_known` (p(n) vs Oliveira e Silva's table), `stats_tools`, `known_windows` (the reference table of an independent verifier's published windows, and the comparison logic) |
 | `ctest --test-dir build -L gpu` | the GPU | `tests/gpu_validate.sh`: exact statistics vs `stats_ref` (incl. across 2^63), the published windows of `tests/known_windows.py`, end to end in every checker mode, hit lists / bucket ring vs a full rebuild, the bit-exact kernel validators (~12 min; `bash tests/gpu_validate.sh build quick` ~2 min) |
 | `python3 tests/test_ci.py` | nothing | the local CI's logic (journal chain, caches, gates) |
 | `./build/debug_map`, `debug_check_hi`, ... | the GPU, tools | the kernel validators individually |
@@ -89,7 +89,7 @@ instead).
 4. Keep a winner: set its default, rebuild `kernels/goldbach_bmg.spv` with
    the pinned ocloc (byte-identical to the benchmarked module), run
    `ctest -LE gpu`, document the result (kept or dropped) in
-   [PROJECT-REFERENCE.md](PROJECT-REFERENCE.md) §9.2, commit, push; push
+   [HISTORY.md](HISTORY.md) §9.2, commit, push; push
    the next change only after the local CI passed on this one.
 
 ## Reproducibility
