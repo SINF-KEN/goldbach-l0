@@ -267,6 +267,7 @@ struct Segment {
     clock_::time_point t_enq, t_launch0;
     double args_s = 0.0;
     double l1_s = 0.0;
+    double l2_s = 0.0;
     double table_before = 0.0;
     double prep_s = 0.0;
     clock_::time_point t_seg_wall;
@@ -530,6 +531,11 @@ private:
 
     // ---- per-segment steps -------------------------------------------------------
     void enqueue_sieve(Segment& sg);
+    void enqueue_large_primes(Segment& sg);
+    void enqueue_hitlists(const Segment& sg, uint32_t& hl_jb);
+    void enqueue_buckets(const Segment& sg);
+    void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
+    void enqueue_bucket_verify(const Segment& sg);
     void prepare_segment_tables(Segment& sg);
     void begin_segment(Segment& sg);
 };
@@ -1779,6 +1785,268 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     sg.l1_s = seconds_since(sg.t_launch0);
 }
 
+/// Per-segment step 4: the large primes after the tile sieve: hit lists or
+/// the bucket ring, the packed large-prime kernel, and the GB_BUCKET_VERIFY
+/// reference map.
+void DenseRun::enqueue_large_primes(Segment& sg) {
+    // --- sieve_large_primes: one work-item per large base prime.
+    // The explicit event wait is LOAD-BEARING even though the list is
+    // created in-order: the large kernel's atomic ANDs must never overlap
+    // the tile kernel's whole-word map stores (a store landing after an
+    // atomic clear would restore a composite as "prime" and silently
+    // corrupt the verification; observed as nondeterministic map
+    // corruption when only implicit ordering was relied on).
+    // Bucket sieve FIRST, then the packed kernel (v1.10.0, +1.9%): the
+    // bucket drain streams ~70 MB of entries through L3; run before the
+    // packed kernel, that eviction no longer lands between the packed
+    // kernel's ~23M atomics and the map. Both only AND-clear map bits
+    // (monotone), so their relative order does not matter for the result;
+    // the barrier after bucket_activate orders the tile kernel's stores
+    // before bucket_process, and the packed block keeps its own barrier.
+    uint32_t hl_jb = 0;   // this segment's list (hit lists)
+    if (hitlist) {
+        enqueue_hitlists(sg, hl_jb);
+    } else if (bucket_on) {
+        enqueue_buckets(sg);
+    }
+    if (large_count > 0) {
+        enqueue_packed_large(sg, hl_jb);
+    }
+    if (bucket_verify && stats.segments % bucket_verify_every == 0) {
+        enqueue_bucket_verify(sg);
+    }
+    sg.l2_s = seconds_since(sg.t_launch0);
+}
+
+/// Step 4a: hit lists for primes [bucket_begin, sieve_count): the batch
+/// harvest at the first segment of each batch, then (unless fused into the
+/// packed kernel) hl_apply of this segment's list. Sets hl_jb.
+void DenseRun::enqueue_hitlists(const Segment& sg, uint32_t& hl_jb) {
+    // Hit lists for primes [bucket_begin, sieve_count): at the first
+    // segment of each batch of hl_K, harvest the whole batch; then
+    // mark this segment's list. The barrier before hl_apply orders
+    // the harvest's list stores and the tile kernel's map stores.
+    const uint32_t k_idx = uint32_t(stats.segments);
+    if (k_idx >= run_segments)
+        throw std::runtime_error("hit lists: segment index beyond the run");
+    const uint32_t jb = k_idx % hl_K;
+    hl_used[sg.slot] = false;
+    if (jb == 0) {
+        const uint32_t nseg = uint32_t(std::min<uint64_t>(hl_K, run_segments - k_idx));
+        const uint32_t qtail = uint32_t((k_idx + nseg == run_segments) ? run_last_q_odds
+                                                                      : q_odds_full);
+        const uint32_t delta32 = uint32_t(delta), qof32 = uint32_t(q_odds_full);
+        const uint32_t a = bucket_begin, bnd = sieve_count;
+        const float inv_delta = 1.0f / float(delta);
+        // unordered list: the harvest may overlap this segment's tile
+        // sieve and segment k-1's checker (it touches only the lists,
+        // their counts and the error flag; the barrier before
+        // segment k-1's checker ordered it after the last apply)
+        if (!g_unordered) ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+        k_hlh->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
+        k_hlh->set_arg(1, sizeof(a), &a);
+        k_hlh->set_arg(2, sizeof(bnd), &bnd);
+        k_hlh->set_arg(3, sizeof(sg.q_first), &sg.q_first);
+        k_hlh->set_arg(4, sizeof(delta32), &delta32);
+        k_hlh->set_arg(5, sizeof(qof32), &qof32);
+        k_hlh->set_arg(6, sizeof(nseg), &nseg);
+        k_hlh->set_arg(7, sizeof(qtail), &qtail);
+        k_hlh->set_arg(8, sizeof(inv_delta), &inv_delta);
+        k_hlh->set_arg(9, sizeof(d_hl_lists), &d_hl_lists);
+        k_hlh->set_arg(10, sizeof(hl_capg), &hl_capg);
+        k_hlh->set_arg(11, sizeof(d_hl_counts), &d_hl_counts);
+        k_hlh->set_arg(12, sizeof(bkt_err), &bkt_err);
+        k_hlh->launch_overlap(ctx.list(), hl_G, ev.hl[sg.slot]);   // exactly hl_G: the region layout
+        hl_used[sg.slot] = true;
+    }
+    hl_jb = jb;
+    if (!hl_fuse) {
+        ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+        const uint32_t q_odds32 = uint32_t(sg.q_odds);
+        k_hla->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+        k_hla->set_arg(1, sizeof(d_hl_lists), &d_hl_lists);
+        k_hla->set_arg(2, sizeof(hl_capg), &hl_capg);
+        k_hla->set_arg(3, sizeof(d_hl_counts), &d_hl_counts);
+        k_hla->set_arg(4, sizeof(jb), &jb);
+        k_hla->set_arg(5, sizeof(hl_G), &hl_G);
+        k_hla->set_arg(6, sizeof(q_odds32), &q_odds32);
+        k_hla->set_arg(7, sizeof(bkt_err), &bkt_err);
+        k_hla->set_arg(8, 4, &cm_u32);
+        k_hla->set_arg(9, 4, &sg.ga1);
+        k_hla->set_arg(10, 4, &sg.ga2);
+        k_hla->set_arg(11, 4, &sg.off5);
+        k_hla->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
+    }
+}
+
+/// Step 4b: bucket ring for primes [bucket_begin, sieve_count): activation,
+/// bucket_process of this segment's bucket, count reset.
+void DenseRun::enqueue_buckets(const Segment& sg) {
+    // Bucket sieve for primes [bucket_begin, sieve_count): activate
+    // the primes whose first hit entered the ring horizon, then drain
+    // this segment's bucket (marks + re-filing), then reset its count.
+    const uint32_t k_idx = uint32_t(stats.segments);
+    const uint64_t horizon = uint64_t(k_idx) + bucket_R - 1;
+    uint32_t act_to = act_next;
+    if (k_idx == 0) act_to = std::max(act_to, act_p2_begin);   // p*p < q_first0: all at once
+    while (act_to < sieve_count) {
+        const uint64_t p = sieve_primes[act_to];
+        if (bkt_first_seg((p * p - q_first0) >> 1) > horizon) break;
+        ++act_to;
+    }
+    if (act_to > act_next) {
+        const uint32_t a = act_next, bnd = act_to;
+        k_bact->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
+        k_bact->set_arg(1, sizeof(a), &a);
+        k_bact->set_arg(2, sizeof(bnd), &bnd);
+        k_bact->set_arg(3, sizeof(d_bkt_entries), &d_bkt_entries);
+        k_bact->set_arg(4, sizeof(d_bkt_counts), &d_bkt_counts);
+        k_bact->set_arg(5, sizeof(bucket_cap), &bucket_cap);
+        k_bact->set_arg(6, sizeof(bucket_R), &bucket_R);
+        k_bact->set_arg(7, sizeof(k_idx), &k_idx);
+        k_bact->set_arg(8, sizeof(q_first0), &q_first0);
+        k_bact->set_arg(9, sizeof(q_odds_full), &q_odds_full);
+        k_bact->set_arg(10, sizeof(delta), &delta);
+        k_bact->set_arg(11, sizeof(bkt_err), &bkt_err);
+        k_bact->set_arg(12, sizeof(d_bkt_entries1), &d_bkt_entries1);
+        k_bact->set_arg(13, sizeof(bkt_split), &bkt_split);
+        const uint64_t chunk = uint64_t(WG_SIZE) * 8;   // BKT_E
+        k_bact->launch(ctx.list(), uint32_t(std::min<uint64_t>(
+            (uint64_t(bnd - a) + chunk - 1) / chunk, 4096)));
+        act_next = act_to;
+    }
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const uint32_t bslot = k_idx % bucket_R;
+    const uint32_t is_last = (sg.seg_end == limit) ? 1u : 0u;
+    const float inv_delta = 1.0f / float(delta);
+    k_bproc->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_bproc->set_arg(1, sizeof(d_bkt_entries), &d_bkt_entries);
+    k_bproc->set_arg(2, sizeof(d_bkt_counts), &d_bkt_counts);
+    k_bproc->set_arg(3, sizeof(bucket_cap), &bucket_cap);
+    k_bproc->set_arg(4, sizeof(bucket_R), &bucket_R);
+    k_bproc->set_arg(5, sizeof(bslot), &bslot);
+    k_bproc->set_arg(6, sizeof(sg.q_odds), &sg.q_odds);
+    k_bproc->set_arg(7, sizeof(q_odds_full), &q_odds_full);
+    k_bproc->set_arg(8, sizeof(delta), &delta);
+    k_bproc->set_arg(9, sizeof(inv_delta), &inv_delta);
+    k_bproc->set_arg(10, sizeof(is_last), &is_last);
+    k_bproc->set_arg(11, sizeof(bkt_err), &bkt_err);
+    const uint32_t qfw = uint32_t(sg.q_first % WHEEL_W);
+    k_bproc->set_arg(12, sizeof(qfw), &qfw);
+    k_bproc->set_arg(13, sizeof(d_bkt_entries1), &d_bkt_entries1);
+    k_bproc->set_arg(14, sizeof(bkt_split), &bkt_split);
+    k_bproc->set_arg(15, 4, &cm_u32);
+    k_bproc->set_arg(16, 4, &sg.ga1);
+    k_bproc->set_arg(17, 4, &sg.ga2);
+    k_bproc->set_arg(18, 4, &sg.off5);
+    k_bproc->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
+    // The drained bucket is refilled only from segment k+1's
+    // activation on (horizon k+R); the next segment's barriers order
+    // this reset before any such push. The reset is a write after
+    // bucket_process's read of the same counter; the in-order list
+    // serializes them, so no barrier is needed there. The unordered
+    // list does not: there the barrier is required.
+    if (g_unordered)
+        ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const uint32_t zero_count = 0;
+    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), d_bkt_counts + bslot, &zero_count, 4, 4,
+                                           nullptr, 0, nullptr));
+}
+
+/// Step 4c: the packed large-prime kernel (with the fused hl_apply when
+/// hl_fuse; hl_jb is this segment's list).
+void DenseRun::enqueue_packed_large(const Segment& sg, uint32_t hl_jb) {
+    // BARRIER, not just an event wait: the large kernel's atomic ANDs
+    // must see the tile kernel's whole-word stores. On this driver an
+    // event wait alone does not make those stores visible, which
+    // manifested as nondeterministic lost composite marks
+    // (tools/debug_map.cpp: the map vs Miller-Rabin diff varied run
+    // to run until the barrier was added).
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    Kernel& kl = hl_fuse ? *k_hla : k_large;
+    kl.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    kl.set_arg(1, sizeof(d_large_bases),  &d_large_bases);
+    kl.set_arg(2, sizeof(d_large_gaps),   &d_large_gaps);
+    kl.set_arg(3, sizeof(packed_count),   &packed_count);
+    kl.set_arg(4, sizeof(sg.q_odds),         &sg.q_odds);
+    kl.set_arg(5, sizeof(sg.q_first),        &sg.q_first);
+    kl.set_arg(6, sizeof(sg.q_last),         &sg.q_last);
+    kl.set_arg(7, 4, &cm_u32);
+    kl.set_arg(8, 4, &sg.ga1);
+    kl.set_arg(9, 4, &sg.ga2);
+    kl.set_arg(10, 4, &sg.off5);
+    if (hl_fuse) {
+        kl.set_arg(11, sizeof(d_hl_lists), &d_hl_lists);
+        kl.set_arg(12, sizeof(hl_capg), &hl_capg);
+        kl.set_arg(13, sizeof(d_hl_counts), &d_hl_counts);
+        kl.set_arg(14, sizeof(hl_jb), &hl_jb);
+        kl.set_arg(15, sizeof(hl_G), &hl_G);
+        kl.set_arg(16, sizeof(bkt_err), &bkt_err);
+    }
+    const uint64_t large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
+    if (large_items > 0)
+        kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
+                       ev.large[sg.slot]);
+}
+
+/// Step 4d (GB_BUCKET_VERIFY): rebuild the map without buckets into the
+/// scratch map and count differing words (checked at collection).
+void DenseRun::enqueue_bucket_verify(const Segment& sg) {
+    // Rebuild this segment's map without buckets into the scratch map
+    // and count differing words (checked at collection).
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    k_sieve.set_arg(0, sizeof(d_verify_map), &d_verify_map);
+    k_sieve.launch(ctx.list(), uint32_t(sg.tiles_launch));
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    k_large_full->set_arg(0, sizeof(d_verify_map), &d_verify_map);
+    k_large_full->set_arg(1, sizeof(d_full_bases), &d_full_bases);
+    k_large_full->set_arg(2, sizeof(d_full_gaps), &d_full_gaps);
+    k_large_full->set_arg(3, sizeof(large_count), &large_count);
+    k_large_full->set_arg(4, sizeof(sg.q_odds), &sg.q_odds);
+    k_large_full->set_arg(5, sizeof(sg.q_first), &sg.q_first);
+    k_large_full->set_arg(6, sizeof(sg.q_last), &sg.q_last);
+    k_large_full->set_arg(7, 4, &cm_u32);
+    k_large_full->set_arg(8, 4, &sg.ga1);
+    k_large_full->set_arg(9, 4, &sg.ga2);
+    k_large_full->set_arg(10, 4, &sg.off5);
+    const uint64_t items_full = (uint64_t(large_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
+    k_large_full->launch(ctx.list(), uint32_t((items_full + large_wg - 1) / large_wg));
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const uint64_t nwords = class_mode ? uint64_t(sg.cgeo.K) * sg.c5w : (sg.q_odds + 63) / 64;
+    k_cmp->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_cmp->set_arg(1, sizeof(d_verify_map), &d_verify_map);
+    k_cmp->set_arg(2, sizeof(nwords), &nwords);
+    k_cmp->set_arg(3, sizeof(verify_diff), &verify_diff);
+    k_cmp->launch(ctx.list(), 512);
+    if (env::present("GB_BUCKET_VERIFY_DUMP")) {
+        // Diagnostics: on the first differing segment, show which map
+        // is wrong by checking the differing bits with Miller-Rabin.
+        ctx.host_sync();
+        if (*verify_diff) {
+            std::vector<uint64_t> a(nwords), bref(nwords);
+            ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), a.data(), b.prime_map[sg.slot], nwords * 8, nullptr, 0, nullptr));
+            ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), bref.data(), d_verify_map, nwords * 8, nullptr, 0, nullptr));
+            ctx.host_sync();
+            int shown = 0;
+            for (uint64_t w = 0; w < nwords && shown < 12; ++w) {
+                uint64_t x = a[w] ^ bref[w];
+                while (x && shown < 12) {
+                    const int bb = __builtin_ctzll(x); x &= x - 1;
+                    const uint64_t bit = w * 64 + bb;
+                    const uint64_t q = !class_mode ? sg.q_first + 2 * bit
+                                     : sg.cgeo.Q[w / sg.c5w] + sg.cgeo.qmod * (bit - uint64_t(w / sg.c5w) * sg.c5w * 64);
+                    std::fprintf(stderr, "seg %llu bit %llu q=%llu bucket_map=%d reference=%d prime(MR)=%d\n",
+                                 (unsigned long long)stats.segments, (unsigned long long)bit,
+                                 (unsigned long long)q, int((a[w] >> bb) & 1), int((bref[w] >> bb) & 1),
+                                 int(is_prime_u64(q)));
+                    ++shown;
+                }
+            }
+            throw std::runtime_error("GB_BUCKET_VERIFY_DUMP: mismatch dumped");
+        }
+    }
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1806,237 +2074,7 @@ RunStats DenseRun::run() {
         prepare_segment_tables(sg);
         enqueue_sieve(sg);
 
-        // --- sieve_large_primes: one work-item per large base prime.
-        // The explicit event wait is LOAD-BEARING even though the list is
-        // created in-order: the large kernel's atomic ANDs must never overlap
-        // the tile kernel's whole-word map stores (a store landing after an
-        // atomic clear would restore a composite as "prime" and silently
-        // corrupt the verification; observed as nondeterministic map
-        // corruption when only implicit ordering was relied on).
-        // Bucket sieve FIRST, then the packed kernel (v1.10.0, +1.9%): the
-        // bucket drain streams ~70 MB of entries through L3; run before the
-        // packed kernel, that eviction no longer lands between the packed
-        // kernel's ~23M atomics and the map. Both only AND-clear map bits
-        // (monotone), so their relative order does not matter for the result;
-        // the barrier after bucket_activate orders the tile kernel's stores
-        // before bucket_process, and the packed block keeps its own barrier.
-        uint32_t hl_jb = 0;   // this segment's list (hit lists)
-        if (hitlist) {
-            // Hit lists for primes [bucket_begin, sieve_count): at the first
-            // segment of each batch of hl_K, harvest the whole batch; then
-            // mark this segment's list. The barrier before hl_apply orders
-            // the harvest's list stores and the tile kernel's map stores.
-            const uint32_t k_idx = uint32_t(stats.segments);
-            if (k_idx >= run_segments)
-                throw std::runtime_error("hit lists: segment index beyond the run");
-            const uint32_t jb = k_idx % hl_K;
-            hl_used[sg.slot] = false;
-            if (jb == 0) {
-                const uint32_t nseg = uint32_t(std::min<uint64_t>(hl_K, run_segments - k_idx));
-                const uint32_t qtail = uint32_t((k_idx + nseg == run_segments) ? run_last_q_odds
-                                                                              : q_odds_full);
-                const uint32_t delta32 = uint32_t(delta), qof32 = uint32_t(q_odds_full);
-                const uint32_t a = bucket_begin, bnd = sieve_count;
-                const float inv_delta = 1.0f / float(delta);
-                // unordered list: the harvest may overlap this segment's tile
-                // sieve and segment k-1's checker (it touches only the lists,
-                // their counts and the error flag; the barrier before
-                // segment k-1's checker ordered it after the last apply)
-                if (!g_unordered) ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-                k_hlh->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
-                k_hlh->set_arg(1, sizeof(a), &a);
-                k_hlh->set_arg(2, sizeof(bnd), &bnd);
-                k_hlh->set_arg(3, sizeof(sg.q_first), &sg.q_first);
-                k_hlh->set_arg(4, sizeof(delta32), &delta32);
-                k_hlh->set_arg(5, sizeof(qof32), &qof32);
-                k_hlh->set_arg(6, sizeof(nseg), &nseg);
-                k_hlh->set_arg(7, sizeof(qtail), &qtail);
-                k_hlh->set_arg(8, sizeof(inv_delta), &inv_delta);
-                k_hlh->set_arg(9, sizeof(d_hl_lists), &d_hl_lists);
-                k_hlh->set_arg(10, sizeof(hl_capg), &hl_capg);
-                k_hlh->set_arg(11, sizeof(d_hl_counts), &d_hl_counts);
-                k_hlh->set_arg(12, sizeof(bkt_err), &bkt_err);
-                k_hlh->launch_overlap(ctx.list(), hl_G, ev.hl[sg.slot]);   // exactly hl_G: the region layout
-                hl_used[sg.slot] = true;
-            }
-            hl_jb = jb;
-            if (!hl_fuse) {
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint32_t q_odds32 = uint32_t(sg.q_odds);
-            k_hla->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_hla->set_arg(1, sizeof(d_hl_lists), &d_hl_lists);
-            k_hla->set_arg(2, sizeof(hl_capg), &hl_capg);
-            k_hla->set_arg(3, sizeof(d_hl_counts), &d_hl_counts);
-            k_hla->set_arg(4, sizeof(jb), &jb);
-            k_hla->set_arg(5, sizeof(hl_G), &hl_G);
-            k_hla->set_arg(6, sizeof(q_odds32), &q_odds32);
-            k_hla->set_arg(7, sizeof(bkt_err), &bkt_err);
-            k_hla->set_arg(8, 4, &cm_u32);
-            k_hla->set_arg(9, 4, &sg.ga1);
-            k_hla->set_arg(10, 4, &sg.ga2);
-            k_hla->set_arg(11, 4, &sg.off5);
-            k_hla->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
-            }
-        } else if (bucket_on) {
-            // Bucket sieve for primes [bucket_begin, sieve_count): activate
-            // the primes whose first hit entered the ring horizon, then drain
-            // this segment's bucket (marks + re-filing), then reset its count.
-            const uint32_t k_idx = uint32_t(stats.segments);
-            const uint64_t horizon = uint64_t(k_idx) + bucket_R - 1;
-            uint32_t act_to = act_next;
-            if (k_idx == 0) act_to = std::max(act_to, act_p2_begin);   // p*p < q_first0: all at once
-            while (act_to < sieve_count) {
-                const uint64_t p = sieve_primes[act_to];
-                if (bkt_first_seg((p * p - q_first0) >> 1) > horizon) break;
-                ++act_to;
-            }
-            if (act_to > act_next) {
-                const uint32_t a = act_next, bnd = act_to;
-                k_bact->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
-                k_bact->set_arg(1, sizeof(a), &a);
-                k_bact->set_arg(2, sizeof(bnd), &bnd);
-                k_bact->set_arg(3, sizeof(d_bkt_entries), &d_bkt_entries);
-                k_bact->set_arg(4, sizeof(d_bkt_counts), &d_bkt_counts);
-                k_bact->set_arg(5, sizeof(bucket_cap), &bucket_cap);
-                k_bact->set_arg(6, sizeof(bucket_R), &bucket_R);
-                k_bact->set_arg(7, sizeof(k_idx), &k_idx);
-                k_bact->set_arg(8, sizeof(q_first0), &q_first0);
-                k_bact->set_arg(9, sizeof(q_odds_full), &q_odds_full);
-                k_bact->set_arg(10, sizeof(delta), &delta);
-                k_bact->set_arg(11, sizeof(bkt_err), &bkt_err);
-                k_bact->set_arg(12, sizeof(d_bkt_entries1), &d_bkt_entries1);
-                k_bact->set_arg(13, sizeof(bkt_split), &bkt_split);
-                const uint64_t chunk = uint64_t(WG_SIZE) * 8;   // BKT_E
-                k_bact->launch(ctx.list(), uint32_t(std::min<uint64_t>(
-                    (uint64_t(bnd - a) + chunk - 1) / chunk, 4096)));
-                act_next = act_to;
-            }
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint32_t bslot = k_idx % bucket_R;
-            const uint32_t is_last = (sg.seg_end == limit) ? 1u : 0u;
-            const float inv_delta = 1.0f / float(delta);
-            k_bproc->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_bproc->set_arg(1, sizeof(d_bkt_entries), &d_bkt_entries);
-            k_bproc->set_arg(2, sizeof(d_bkt_counts), &d_bkt_counts);
-            k_bproc->set_arg(3, sizeof(bucket_cap), &bucket_cap);
-            k_bproc->set_arg(4, sizeof(bucket_R), &bucket_R);
-            k_bproc->set_arg(5, sizeof(bslot), &bslot);
-            k_bproc->set_arg(6, sizeof(sg.q_odds), &sg.q_odds);
-            k_bproc->set_arg(7, sizeof(q_odds_full), &q_odds_full);
-            k_bproc->set_arg(8, sizeof(delta), &delta);
-            k_bproc->set_arg(9, sizeof(inv_delta), &inv_delta);
-            k_bproc->set_arg(10, sizeof(is_last), &is_last);
-            k_bproc->set_arg(11, sizeof(bkt_err), &bkt_err);
-            const uint32_t qfw = uint32_t(sg.q_first % WHEEL_W);
-            k_bproc->set_arg(12, sizeof(qfw), &qfw);
-            k_bproc->set_arg(13, sizeof(d_bkt_entries1), &d_bkt_entries1);
-            k_bproc->set_arg(14, sizeof(bkt_split), &bkt_split);
-            k_bproc->set_arg(15, 4, &cm_u32);
-            k_bproc->set_arg(16, 4, &sg.ga1);
-            k_bproc->set_arg(17, 4, &sg.ga2);
-            k_bproc->set_arg(18, 4, &sg.off5);
-            k_bproc->launch(ctx.list(), bucket_groups, ev.bucket[sg.slot]);
-            // The drained bucket is refilled only from segment k+1's
-            // activation on (horizon k+R); the next segment's barriers order
-            // this reset before any such push. The reset is a write after
-            // bucket_process's read of the same counter; the in-order list
-            // serializes them, so no barrier is needed there. The unordered
-            // list does not: there the barrier is required.
-            if (g_unordered)
-                ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint32_t zero_count = 0;
-            ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), d_bkt_counts + bslot, &zero_count, 4, 4,
-                                                   nullptr, 0, nullptr));
-        }
-        if (large_count > 0) {
-            // BARRIER, not just an event wait: the large kernel's atomic ANDs
-            // must see the tile kernel's whole-word stores. On this driver an
-            // event wait alone does not make those stores visible, which
-            // manifested as nondeterministic lost composite marks
-            // (tools/debug_map.cpp: the map vs Miller-Rabin diff varied run
-            // to run until the barrier was added).
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            Kernel& kl = hl_fuse ? *k_hla : k_large;
-            kl.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            kl.set_arg(1, sizeof(d_large_bases),  &d_large_bases);
-            kl.set_arg(2, sizeof(d_large_gaps),   &d_large_gaps);
-            kl.set_arg(3, sizeof(packed_count),   &packed_count);
-            kl.set_arg(4, sizeof(sg.q_odds),         &sg.q_odds);
-            kl.set_arg(5, sizeof(sg.q_first),        &sg.q_first);
-            kl.set_arg(6, sizeof(sg.q_last),         &sg.q_last);
-            kl.set_arg(7, 4, &cm_u32);
-            kl.set_arg(8, 4, &sg.ga1);
-            kl.set_arg(9, 4, &sg.ga2);
-            kl.set_arg(10, 4, &sg.off5);
-            if (hl_fuse) {
-                kl.set_arg(11, sizeof(d_hl_lists), &d_hl_lists);
-                kl.set_arg(12, sizeof(hl_capg), &hl_capg);
-                kl.set_arg(13, sizeof(d_hl_counts), &d_hl_counts);
-                kl.set_arg(14, sizeof(hl_jb), &hl_jb);
-                kl.set_arg(15, sizeof(hl_G), &hl_G);
-                kl.set_arg(16, sizeof(bkt_err), &bkt_err);
-            }
-            const uint64_t large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
-            if (large_items > 0)
-                kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
-                               ev.large[sg.slot]);
-        }
-        if (bucket_verify && stats.segments % bucket_verify_every == 0) {
-            // Rebuild this segment's map without buckets into the scratch map
-            // and count differing words (checked at collection).
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_sieve.set_arg(0, sizeof(d_verify_map), &d_verify_map);
-            k_sieve.launch(ctx.list(), uint32_t(sg.tiles_launch));
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_large_full->set_arg(0, sizeof(d_verify_map), &d_verify_map);
-            k_large_full->set_arg(1, sizeof(d_full_bases), &d_full_bases);
-            k_large_full->set_arg(2, sizeof(d_full_gaps), &d_full_gaps);
-            k_large_full->set_arg(3, sizeof(large_count), &large_count);
-            k_large_full->set_arg(4, sizeof(sg.q_odds), &sg.q_odds);
-            k_large_full->set_arg(5, sizeof(sg.q_first), &sg.q_first);
-            k_large_full->set_arg(6, sizeof(sg.q_last), &sg.q_last);
-            k_large_full->set_arg(7, 4, &cm_u32);
-            k_large_full->set_arg(8, 4, &sg.ga1);
-            k_large_full->set_arg(9, 4, &sg.ga2);
-            k_large_full->set_arg(10, 4, &sg.off5);
-            const uint64_t items_full = (uint64_t(large_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
-            k_large_full->launch(ctx.list(), uint32_t((items_full + large_wg - 1) / large_wg));
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            const uint64_t nwords = class_mode ? uint64_t(sg.cgeo.K) * sg.c5w : (sg.q_odds + 63) / 64;
-            k_cmp->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_cmp->set_arg(1, sizeof(d_verify_map), &d_verify_map);
-            k_cmp->set_arg(2, sizeof(nwords), &nwords);
-            k_cmp->set_arg(3, sizeof(verify_diff), &verify_diff);
-            k_cmp->launch(ctx.list(), 512);
-            if (env::present("GB_BUCKET_VERIFY_DUMP")) {
-                // Diagnostics: on the first differing segment, show which map
-                // is wrong by checking the differing bits with Miller-Rabin.
-                ctx.host_sync();
-                if (*verify_diff) {
-                    std::vector<uint64_t> a(nwords), bref(nwords);
-                    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), a.data(), b.prime_map[sg.slot], nwords * 8, nullptr, 0, nullptr));
-                    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), bref.data(), d_verify_map, nwords * 8, nullptr, 0, nullptr));
-                    ctx.host_sync();
-                    int shown = 0;
-                    for (uint64_t w = 0; w < nwords && shown < 12; ++w) {
-                        uint64_t x = a[w] ^ bref[w];
-                        while (x && shown < 12) {
-                            const int bb = __builtin_ctzll(x); x &= x - 1;
-                            const uint64_t bit = w * 64 + bb;
-                            const uint64_t q = !class_mode ? sg.q_first + 2 * bit
-                                             : sg.cgeo.Q[w / sg.c5w] + sg.cgeo.qmod * (bit - uint64_t(w / sg.c5w) * sg.c5w * 64);
-                            std::fprintf(stderr, "seg %llu bit %llu q=%llu bucket_map=%d reference=%d prime(MR)=%d\n",
-                                         (unsigned long long)stats.segments, (unsigned long long)bit,
-                                         (unsigned long long)q, int((a[w] >> bb) & 1), int((bref[w] >> bb) & 1),
-                                         int(is_prime_u64(q)));
-                            ++shown;
-                        }
-                    }
-                    throw std::runtime_error("GB_BUCKET_VERIFY_DUMP: mismatch dumped");
-                }
-            }
-        }
-        const double l2_s = seconds_since(sg.t_launch0);
+        enqueue_large_primes(sg);
 
         // --- check_numbers args
         // Twin checker: phase A reads the twin map with the twin list.
@@ -2432,8 +2470,8 @@ RunStats DenseRun::run() {
                 (unsigned long long)stats.segments,
                 sg.prep_s * 1e3, offset_seconds - sg.offset_before,
                 (table_seconds - sg.table_before) * 1e3,
-                enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (l2_s - sg.l1_s) * 1e3,
-                (l3_s - l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
+                enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (sg.l2_s - sg.l1_s) * 1e3,
+                (l3_s - sg.l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
         }
 
         prev_seg_start = sg.seg_start;
