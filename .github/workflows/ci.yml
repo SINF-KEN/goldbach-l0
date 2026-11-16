@@ -221,7 +221,7 @@ jobs:
         run: actionlint -color
 
       - name: Python syntax
-        run: python3 -m py_compile tests/*.py scripts/*.py ci/*.py
+        run: python3 -m py_compile tests/*.py scripts/*.py ci/*.py ci/gbci/*.py
 
       - name: Local CI logic (journal chain, reference cache, exact gates, ledger)
         run: python3 tests/test_ci.py
