@@ -1198,6 +1198,144 @@ void test_env_parsing()
     }
 }
 
+// Malformed records in the statistics state and the gap state: refused
+// (constructor throws, file untouched) like a cut-off state, never parsed as 0.
+void test_stats_state_malformed()
+{
+    std::puts("statistics state file (malformed records)");
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("gb_state_bad_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    const std::string st = (dir / "st").string(), gst = st + ".gaps";
+    ::setenv("GB_STATS_STATE", st.c_str(), 1);
+    ::setenv("GB_STATS_LOG", (dir / "log").string().c_str(), 1);
+    ::setenv("GB_RECORDS_FILE", (dir / "rec").string().c_str(), 1);
+    ::setenv("GB_STATS_LIVE", (dir / "live").string().c_str(), 1);
+    const auto cands = odd_primes_up_to(MAX_GB_PRIME);
+    const StatsPlan plan = make_stats_plan(cands, STATS_K_DEFAULT, CHECK30_TAIL);
+    const uint64_t S = 1000000000000ull;
+    {   // a valid state with a first occurrence (p = 3001)
+        GoldbachStats g(cands, plan, CHECK30_TAIL);
+        std::vector<uint32_t> fp(MAX_GB_PRIME / 2 + 1, ~0u);
+        fp[3001 / 2] = 7;
+        g.add_first(S, fp.data());
+        g.finish_run(S, S + 1000, 501);
+        g.commit("test", 0);
+    }
+    const std::string full = slurp_file(st);
+    const auto put = [](const std::string& p, const std::string& s) {
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        std::fwrite(s.data(), 1, s.size(), f);
+        std::fclose(f);
+    };
+    const auto loads = [&] {
+        try { GoldbachStats g(cands, plan, CHECK30_TAIL); } catch (const std::runtime_error&) { return false; }
+        return true;
+    };
+    check(loads(), "valid state loads");
+    // replaces the whole line starting with @p key (the first one) by @p line
+    const auto with_line = [&](const std::string& key, const std::string& line) {
+        std::string s = full;
+        const size_t p = s.find("\n" + key);
+        if (p == std::string::npos) return std::string();
+        const size_t e = s.find('\n', p + 1);
+        return s.replace(p + 1, e - p - 1, line);
+    };
+    const std::string np1(cands.size(), ',');               // np + 1 empty entries
+    const std::vector<std::pair<std::string, std::string>> bad = {
+        {"evens ", "evens 12x 501"},
+        {"evens ", "evens -1 501"},
+        {"evens ", "evens 99999999999999999999 501"},
+        {"evens ", "evens 501"},
+        {"evens ", "evens 501 0 0"},
+        {"evens ", "evens  501 0"},
+        {"evens ", "evens 501 0 "},
+        {"range ", "range " + std::to_string(S)},
+        {"range ", "range " + std::to_string(S + 1000) + " " + std::to_string(S)},
+        {"range ", "rbnge " + std::to_string(S) + " " + std::to_string(S + 1000)},
+        {"primes30 ", "primes30 1 2 3 4 5 6 7"},
+        {"primes30 ", "primes30 1 2 3 4 5 6 7 x"},
+        {"twins30 ", "twins30 1 2 3 4"},
+        {"tail_t ", "tail_t 3001abc"},
+        {"first ", "first 9 5"},
+        {"first ", "first 3001"},
+        {"sampled 3 ", "sampled 3"},
+        {"sampled 3 ", "sampled 3 1,x"},
+        {"sampled 3 ", "sampled 3 1;2"},
+        {"sampled 3 ", "sampled 15 "},
+        {"sampled 3 ", "sampled 2 "},                       // class 2 twice, class 3 missing
+        {"tailcls 4 ", "tailcls 4 " + np1},
+        {"tailagg ", "tailagg 1,-2"},
+    };
+    for (const auto& [key, line] : bad) {
+        const std::string s = with_line(key, line);
+        if (s.empty()) { check(false, "malformed-state test: no '" + key + "' record to replace"); continue; }
+        put(st, s);
+        check(!loads() && slurp_file(st) == s, "state record '" + line + "' refused, state untouched");
+    }
+    {   // a repeated record
+        std::string s = full;
+        const size_t p = s.find("\nevens ");
+        s.insert(p + 1, s.substr(p + 1, s.find('\n', p + 1) - p));
+        put(st, s);
+        check(!loads(), "repeated evens record refused");
+    }
+    put(st, full);
+    check(loads(), "restored state loads again");
+    // gap state (.gaps)
+    const std::string gfull =
+        "# gap state\n"
+        "gaps_range 10 20\n"
+        "gaps_evens 5 5\n"
+        "gaps 3 12\n"
+        "gaps_walk 3 12 50 200 900\n"
+        "gaps_samp \n"
+        "gaps_max 6 13 1\n"
+        "gaps_tail 700 1 1000\n"
+        "end\n";
+    put(gst, gfull);
+    check(loads(), "valid gap state loads");
+    const std::vector<std::pair<std::string, std::string>> gbad = {
+        {"gaps_range 10 20", "gaps_range 10"},
+        {"gaps_range 10 20", "gaps_range 20 10"},
+        {"gaps_evens 5 5", "gaps_evens 5 5x"},
+        {"gaps 3 12", "gaps 3"},
+        {"gaps 3 12", "gaps 3 -12"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200 900 1"},
+        {"gaps_walk 3 12 50 200 900", "gaps_walk 3 12 50 200 340282366920938463463374607431768211456"},
+        {"gaps_samp ", "gaps_samp 1,a"},
+        {"gaps_max 6 13 1", "gaps_max 6 13 2"},
+        {"gaps_max 6 13 1", "gaps_max 6 13"},
+        {"gaps_tail 700 1 1000", "gaps_tail 4294967296 1 1000"},
+        {"gaps_tail 700 1 1000", "gaps_tail 700 1"},
+        {"end", "end junk"},
+        {"gaps_evens 5 5", "gaps_evns 5 5"},
+    };
+    for (const auto& [from, to] : gbad) {
+        std::string s = gfull;
+        s.replace(s.find(from), from.size(), to);
+        put(gst, s);
+        check(!loads() && slurp_file(gst) == s, "gap state record '" + to + "' refused, untouched");
+    }
+    {
+        std::string s = gfull;
+        s.insert(s.find("gaps 3 12"), "gaps 3 12\n");
+        put(gst, s);
+        check(!loads(), "repeated gaps record refused");
+    }
+    {   // u128 sums at the top of their range still parse
+        std::string s = gfull;
+        s.replace(s.find("gaps_walk 3 12 50 200 900"), 25,
+                  "gaps_walk 3 12 50 200 340282366920938463463374607431768211455");
+        put(gst, s);
+        check(loads(), "gap state with a 2^128 - 1 moment sum loads");
+    }
+    for (const char* v : {"GB_STATS_STATE", "GB_STATS_LOG", "GB_RECORDS_FILE", "GB_STATS_LIVE"}) ::unsetenv(v);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 int main()
 {
     test_prime_lists();
@@ -1214,6 +1352,7 @@ int main()
     test_stats_state();
     test_gap_stats();
     test_env_parsing();
+    test_stats_state_malformed();
     std::printf("host_tests: %d checks, %d failed -> %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
