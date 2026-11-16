@@ -166,8 +166,11 @@ def main():
     cmake = read("CMakeLists.txt")
     ver = re.search(r'inline\s+constexpr\s+const\s+char\s*\*\s*VERSION\s*=\s*"([^"]+)"',
                     read("include/config.hpp"))
-    rel = re.search(r"Current release: \*\*v([^*]+)\*\*", readme)
-    same("VERSION (config.hpp) / README 'Current release'",
+    # the release the README's headline figures are for: "**v2.5.1: 69.6 billion
+    # ..." (or the older "Current release: **v2.5.1**")
+    rel = (re.search(r"^\*\*v(\d+\.\d+\.\d+):", readme, re.M)
+           or re.search(r"Current release: \*\*v([^*]+)\*\*", readme))
+    same("VERSION (config.hpp) / README headline release",
          ver.group(1) if ver else "unparsed", rel.group(1) if rel else "unparsed", doc)
     pv = re.search(r"project\s*\([^)]*\bVERSION\s+([0-9.]+)", cmake)
     if pv:                                           # only if CMake declares one

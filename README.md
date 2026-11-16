@@ -1,7 +1,7 @@
 <h1 align="center">goldbach-l0</h1>
 
 <p align="center">
-  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: ~70 billion even numbers per second on one B580.</b><br>
+  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 69.6 billion even numbers per second on one B580.</b><br>
   <a href="https://goldbach.net01.io">Live campaign</a> ·
   <a href="docs/CORRECTNESS.md">Correctness</a> ·
   <a href="docs/BENCHMARKING.md">Benchmarks</a> ·
@@ -22,16 +22,9 @@ compiled to SPIR-V and a C++23 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts, prime gaps).
 
-Current release: **v2.5.1**, plus the SLM-contention round of
-[HISTORY.md §9.2w](docs/HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)
-(on `main` and in production since 2026-11-15, not yet a tagged release).
-Latest measurement (§9.2w, bench.py, 10 paired rounds): **69.9 billion even
-numbers per second** at 4×10¹⁸ (69.2 G at the top of the range) with exact
-statistics on, prime gaps included — the whole [4×10¹⁸, 5×10¹⁸] in about
-**83 days** on one B580. Live campaign on 2026-11-16: **14.2% done**, the
-B580 averaging 65.5 G evens/s over its production slices, ~76 days left
-([goldbach.net01.io](https://goldbach.net01.io); browsers work down from
-5×10¹⁸).
+**v2.5.1: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
+top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
+on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580.
 
 | Document | Contents |
 |---|---|
@@ -103,41 +96,23 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
-Every change since v2.3.0, each measured against its parent (bench.py,
-interleaved paired rounds; absolute rates drift a little between sessions,
-so compare within a row):
-
-| Change | long — 10¹¹ at 4×10¹⁸ | long-end — 10¹¹ ending at 5×10¹⁸ |
-|---|---|---|
-| v2.4.0 fused hit-list apply, one-walk harvest, 467.5M segments ([§9.2u](docs/HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06), 5 rounds) | 64.60 → 67.67 G (+4.76%) | 63.75 → 66.89 G (+4.94%) |
-| v2.4.0 exact prime-gap statistics (every gap, every segment) | ~11% GPU time | |
-| v2.5.0 unordered list: the next segment's sieve overlaps the checker ([§9.2v](docs/HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18), 3 pairs) | +1.31% | +1.25% |
-| v2.5.1 gap-stream loads bypass L3 (8 rounds) | +0.37% | +0.46% |
-| SLM contention round, on `main` ([§9.2w](docs/HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15), 10 rounds) | 66.19 → **69.85 G** (+5.53%) | 65.64 → **69.16 G** (+5.37%) |
-
-Per 10¹¹ integers at 4×10¹⁸ (v2.5.1, the §9.2w base): GPU 755 ms —
-large-prime sieve 429 ms (packed kernel + hit lists), tile sieve 197 ms,
-checker + count30 (statistics, gaps) 143 ms; §9.2w took the tile sieve to
-~171 ms and the checker to ~130 ms. A full 5×10¹³ production slice: 376 →
-354 s.
-
-Last full release comparison (all windows, with energy):
-
-| Window (bench.py, v2.3.0 vs v2.2.1, 8 paired rounds) | v2.3.0 | v2.2.1 | change |
+| Window (bench.py, v2.5.1 vs v2.3.0, 12 paired rounds) | v2.5.1 | v2.3.0 | change |
 |---|---|---|---|
-| long — 10¹¹ at 4×10¹⁸ | **64.62 G evens/s** | 59.54 G | +8.54% |
-| long-end — 10¹¹ ending at 5×10¹⁸ | **63.77 G** | 58.38 G | +9.23% |
+| long — 10¹¹ at 4×10¹⁸ | **69.61 G evens/s** | 64.30 G | +8.24% |
+| long-end — 10¹¹ ending at 5×10¹⁸ | **68.87 G** | 63.38 G | +8.52% |
 
-v2.3.0 per 10¹¹ integers: large-prime sieve 473 ms, tile sieve 204 ms,
-checker 92 ms; 2.8 J per 10⁹ evens. The history of every version and every
-measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and §13.2;
-methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
+Measured 2026-11-16 with production's release binary and configuration
+(exact statistics including the exact prime-gap walk, `GB_BUCKET_VERIFY=500`),
+each version at its own default segment; the paired 95% intervals are
+±0.12% and ±0.19%. v2.3.0 recorded no prime gaps: v2.5.1 is faster while
+doing that extra work. Per 10¹¹ integers at 4×10¹⁸: large-prime sieve
+431 ms (packed kernel + hit lists), tile sieve 168 ms, checker and
+statistics 175 ms; the next segment's sieve overlaps the checker, so the
+parts add up to more than the 718 ms GPU time. The history of every version and
+every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and
+[PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ![Timing waterfall, long window, by version](docs/images/waterfall-long-by-version.png)
-
-*Figure: the bench.py journal ([bench/](bench/)) through v2.3.0. v2.4.0 and
-later have only paired A/B rounds so far (table above), no full benchmark
-session; `bash docs/make-plots.sh` redraws it once one is recorded.*
 
 ### The sparse path (`--sparse`, opt-in)
 

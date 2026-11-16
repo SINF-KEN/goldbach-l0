@@ -184,6 +184,11 @@ failure. A failed run never changes the active release.
 - **Compilers**: a gcc / clang update can add `-Werror` warnings, failing
   builds until fixed (production unaffected); the first commit afterwards
   takes the full GPU path (new code fingerprint).
+- **Not covered by `pacman -Syu`**: `shellcheck` and `actionlint` (the
+  `static` job) are release binaries in `~/.local/bin`, updated by hand; run
+  both on the repository before replacing them, since a newer version can
+  add findings, and keep the old binary for a rollback. The Actions
+  themselves are bumped by Dependabot.
 - **Reboots**: services are enabled with linger; the daemon recovers
   (retry queue, production resume) and the runners reconnect by themselves.
 

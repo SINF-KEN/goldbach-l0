@@ -2,7 +2,8 @@
 
 The detailed reference: configuration, CLI, environment, pipeline, kernels
 and host components. The log of every optimization kept or dropped (§9.2,
-§13.2 and §15, under the same numbers) is in [HISTORY.md](HISTORY.md).
+the pre-v2 measurements of §13.2, and §15, under the same numbers) is in
+[HISTORY.md](HISTORY.md); the current measurement stays in §13.2 here.
 Companion documents: [CORRECTNESS.md](CORRECTNESS.md) (the argument and its
 invariants), [DEVELOPMENT.md](DEVELOPMENT.md) (build, tests, CI, shipping),
 [BENCHMARKING.md](BENCHMARKING.md) (methodology), [PIPELINE.md](PIPELINE.md)
@@ -72,7 +73,7 @@ goldbach-l0/
 │   ├── config.hpp          tuning constants and VERSION (see §4)
 │   ├── env.hpp             strict GB_* environment parsing (§7)
 │   ├── host_math.hpp       pure host math of the dense pipeline (§8)
-│   ├── l0_context.hpp      RAII Level Zero wrappers + ZE_CHECK
+│   ├── l0_context.hpp      RAII Level Zero wrappers, ZE_CHECK, kernel timestamps
 │   ├── primes.hpp          prime lists, cache view, mask tables, Miller-Rabin
 │   ├── verifier.hpp        RunStats / SegmentStats, run_gpu, verify_cpu
 │   ├── check30.hpp         mod-30 checker plan; split_check.hpp: legacy checker plans
@@ -212,23 +213,42 @@ evens in range were verified (or leftovers resolved on CPU).
 --------------------------------------------------------------------------
 ## 6. Output formats
 
-Human (default): banner `goldbach-l0 v1.9.0` + limit, start, segments,
-leftovers, init/gpu/sieve/large/verify/offsets/sync times, total,
-evens/second, `result: PASS`.
+All of it is printed by src/main.cpp with `std::print` / `std::println`
+(C++23). These formats are a contract: the `--csv` line is the production
+journal's row, and `tools/run_range.sh`, `ci/goldbach_ci.py` and `bench.py`
+parse it. The switch from printf was verified byte-identical; a later
+format change has to keep every existing key and its formatting.
 
-`--csv`: ONE line, exactly 23 `key=value` pairs (main.cpp):
+Human (default): banner `goldbach-l0 v<VERSION>` (+ ` (sparse)`), then
+limit, start, segments, leftovers, init / gpu / sieve / large sieve /
+verify / offsets / sync-other times (`%.3f s`), total, evens/second
+(`%.3g`), `EU arbitration` (the `GB_SCHED` policy in force), `result:
+PASS`. With statistics on: a `Goldbach statistics` block (log / state
+paths, largest p(n), tail and sampled even counts, primes, twin pairs).
+With a ridge floor: the `My Top 30 Largest Goldbach Ridges` table.
+
+`--csv`: ONE line of 35 `key=value` pairs:
 `version limit start segment split segments leftovers result init_s
 init_cache_s init_module_s init_upload_s gpu_s total_s sieve_s large_s
-check_s offsets_s table_s sync_s evens_per_sec tiles large_items`.
-Gotchas: `split=` echoes the CLI ARGUMENT (0 when auto) — the RESOLVED
-split appears only in `--per-seg`'s `split` column; `evens_per_sec` =
-total_evens / gpu_seconds (init excluded); `large_items`/`tiles` are sums
-over segments.
+check_s offsets_s table_s sync_s evens_per_sec tiles large_items ridge_min
+ridge_found ridge_dropped ridge_max stats stats_tail stats_sampled
+stats_pmax primes twins split_used sched`. Times `%.4f`, `evens_per_sec`
+`%.6g`, `stats` 0/1. Gotchas: `split=` echoes the CLI ARGUMENT (0 when
+auto) — the resolved dense split is `split_used=` (0 on the sparse path)
+and the per-segment `split` column; `evens_per_sec` = total_evens /
+gpu_seconds (init excluded); `large_items` / `tiles` are sums over
+segments; `ridge_max` is the largest kept ridge (0 when none).
 
-`--json`: pretty-printed object with the same fields plus `spv` and
-`per_segment` array when collected (`seg, start, end, evens, tiles,
-large_items, split, mask_count, leftovers, sieve_s, large_s, check_s,
-offset_s, wall_s`).
+`--json`: pretty-printed object: `version limit start segment split`
+(`split_used` when non-zero) `sched spv segments leftovers result`, the
+times as `*_seconds` (init, gpu, total, sieve, large, verify, offset,
+table, sync), `evens_per_second total_tiles total_large_items ridge_min
+ridge_found ridge_dropped`, a `ridge_top` array (`rank, ridge, even, p, q,
+segment`), a `stats` object when statistics are on (`tail_evens,
+sampled_evens, pmax, primes, twins`) and a `per_segment` array when
+collected (`seg, start, end, evens, tiles, large_items, split, mask_count,
+leftovers, sieve_s, large_s, check_s, offset_s, wall_s`). It omits the
+`init_*_s` split of the CSV.
 
 `--per-seg` (non-JSON): fixed-width table `#seg evens [start, end] tiles
 large_items split sieve_s large_s check_s offset_s wall_s left`.
@@ -495,9 +515,14 @@ confuse its presence with an active stage.
   HOST_VISIBLE | KERNEL_TIMESTAMP), `resolve_leftovers` (Miller-Rabin
   fallback; throws on an index outside the segment or a real
   counterexample), `parallel_for`.
-- Timing: kernel times from event timestamps; device timer resolution via
-  DEVICE_PROPERTIES_1_2 (base struct "returns garbage" comment); deltas
-  skipped when end < start (clock anomalies on some driver builds).
+- Timing: kernel times from event timestamps through
+  `kernel_seconds(event, timer_hz)` (l0_context.hpp; `std::optional`, empty
+  when the query fails, the timer frequency is unknown or end <= start —
+  clock anomalies on some driver builds) and `kernel_ticks(event)` for the
+  raw ticks of the `GB_PHASE` trace. A missing timestamp only leaves a
+  timing at 0, so these never throw; the calls the verification depends on
+  go through `ZE_CHECK` and fail the run. Device timer resolution via
+  DEVICE_PROPERTIES_1_2 (base struct "returns garbage" comment).
 - sync_seconds = max(0, gpu - sieve - large - verify) — "residual, may
   overlap"; offset_seconds is ~0 in the dense path since the work moved
   GPU-side.
@@ -570,11 +595,25 @@ kept only when its 95% interval clears the base on both. Methodology:
 a 2e9 window at 250M spans with `sweep.py`; its numbers are start-up
 dominated and not comparable.)
 
-### 13.2 Measured performance — moved to HISTORY.md
+### 13.2 Measured performance
 
-The per-version measurements (v1.6.2 – v1.8.0, with the figures in
-`docs/images/`) are in [HISTORY.md §13.2](HISTORY.md#132-measured-performance);
-later results are in each round's §9.2 entry there and in the README.
+- v2.5.1 (bench.py, 2026-11-16, production's release binary bb3a96f and
+  configuration: exact statistics incl. the prime-gap walk,
+  `GB_BUCKET_VERIFY=500`; paired against a v2.3.0 build, each at its
+  default segment): long **69.61 G** ev/s (v2.3.0 64.30, +8.24% ±0.12%,
+  12 rounds), long-end **68.87 G** (63.38, +8.52% ±0.19%); steady 65.54 G
+  (+11.0% ±1.0%), end 65.05 G (+11.3% ±0.4%), bench 38.49 G (+6.2% ±1.6%),
+  8 rounds each. 2.74 J per 1e9 evens (long); full [4e18, 5e18] ~83 days.
+  Per 1e11 at 4e18: large 431 ms, tile sieve 168 ms, checker + statistics
+  175 ms, GPU 718 ms (the sieve overlaps the checker, §9.2v).
+  Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`):
+
+  ![steady window by version](images/waterfall-steady-by-version.png)
+  ![current version by window](images/waterfall-current-by-window.png)
+
+Earlier measurements (v1.6.2 – v1.8.0) are in
+[HISTORY.md §13.2](HISTORY.md#132-measured-performance); the per-change
+results of later rounds are in each round's §9.2 entry there.
 
 
 ### 13.3 Bottleneck profile (why the large sieve is closed on one B580)

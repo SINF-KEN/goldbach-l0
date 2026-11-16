@@ -1211,10 +1211,8 @@ Measured and dropped in the same round:
   bench window 16.6 G, steady (2e10 @4e18) **17.7 G**, end (2e10 below
   5e18) 17.3 G ev/s, CV <= 1.1%; 8.1-8.3 J per 1e9 evens in steady state.
   Full [4e18, 5e18] ~320 days. Journal: bench-results.csv.
-  Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`):
-
-  ![steady window by version](images/waterfall-steady-by-version.png)
-  ![v1.8.0 by window](images/waterfall-current-by-window.png)
+  (Its figures were redrawn by later sessions; the current ones are in
+  PROJECT-REFERENCE.md §13.2.)
 - v1.8.0 (bench.py, 9 paired runs vs v1.7.0 and v1.6.2): bench 19.1 G,
   steady **20.5 G**, end **20.0 G** ev/s; 7.2-7.4 J per 1e9 evens; full
   [4e18, 5e18] ~290 days (§9.2c).
