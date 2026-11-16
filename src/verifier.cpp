@@ -371,7 +371,24 @@ private:
 
     void configure_checkers();
     void configure_ridges_and_stats();
+    // ---- size_buffers ---------------------------------------------------------
+    GpuBuffers b;                    // every device / shared buffer (allocated below)
+    uint64_t map_words = 0;          // prime map per slot (whole tiles)
+    uint32_t chk_stride = 0;         // class-split checker: words per class of checked[]
+    uint32_t chk_stride30 = 0;       // mod-30 checker: the same
+    uint64_t chk_words = 0;          // checked[] per slot
+    uint32_t split_words = 0;        // split maps S1 / S5 per slot
+    uint32_t pending_cap = 0;        // two-phase checker: pending list capacity
+    uint64_t table_bytes = 0;        // per-tile first-mark table per slot
+    bool use_table = false;
+    uint32_t use_table_u32 = 0;
+    uint32_t mask_period = 0;        // GB_MASK_PERIOD
+    uint32_t mask_groups_n = 0;      // fused mask groups (0: per-prime mask loop)
+    size_t mask_group_words = 0;
+    uint32_t* d_group_desc = nullptr;
+
     void set_group_sizes();
+    void size_buffers();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -672,15 +689,11 @@ void DenseRun::set_group_sizes() {
     }
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
+/// Phase 4: sizes of the per-slot buffers (map, checked, split maps, pending
+/// list, tile table) and the fused small-prime mask grouping (allocates and
+/// fills its shared descriptor table).
+void DenseRun::size_buffers() {
     // ------------------------------------------------- Persistent buffers -
-    GpuBuffers b;
     // q range spans [seg_start - 9781, seg_end - 3]: that is the segment plus a
     // 9781 back-extension, i.e. segment_even + ~4891 ODD values.
     // The sieve writes WHOLE tiles (one work-group = 16,384 words), so the map
@@ -696,19 +709,19 @@ RunStats DenseRun::run() {
     // Class mode: two class arrays of tpc_max whole tiles each (<= dense + 2).
     const uint64_t tpc_max = (max_odds / (c30 ? 15 : 3) + 2 + BITS_PER_TILE - 1) / BITS_PER_TILE;
     const uint64_t map_tiles  = class_mode ? std::max(dense_tiles, ncls_map * tpc_max) : dense_tiles;
-    const uint64_t map_words  = map_tiles * TILE_WORDS;
+    map_words  = map_tiles * TILE_WORDS;
     // Class-split checker: checked[] holds the three classes at chk_stride
     // words each; the split maps cover the whole map buffer.
-    const uint32_t chk_stride = uint32_t((max_segment_evens / 3 + 1 + 63) / 64 + 1);
-    const uint32_t chk_stride30 = uint32_t((max_segment_evens / 15 + 1 + 63) / 64 + 1);
-    const uint64_t chk_words  = std::max<uint64_t>(std::max<uint64_t>((max_segment_evens + 63) / 64,
+    chk_stride = uint32_t((max_segment_evens / 3 + 1 + 63) / 64 + 1);
+    chk_stride30 = uint32_t((max_segment_evens / 15 + 1 + 63) / 64 + 1);
+    chk_words  = std::max<uint64_t>(std::max<uint64_t>((max_segment_evens + 63) / 64,
                                                    split_on ? 3ull * chk_stride : 0ull),
                                                    c30chk ? 15ull * chk_stride30 : 0ull);
-    const uint32_t split_words = uint32_t((2 * map_words + 2) / 3 + 1);
+    split_words = uint32_t((2 * map_words + 2) / 3 + 1);
     // Two-phase checker: evens left unresolved by phase A (~0.6% at 4e18
     // with 128 candidates, ~2% with 96). Sized at 1/8 of the segment; the
     // host fails closed if a segment ever overflows it.
-    const uint32_t pending_cap = uint32_t(std::min<uint64_t>(
+    pending_cap = uint32_t(std::min<uint64_t>(
         std::max<uint64_t>(max_segment_evens / 8, 1u << 16), UINT32_MAX / 2));
 
     // Per-tile first-mark table (tile-major, u32): removes all 64-bit
@@ -716,11 +729,11 @@ RunStats DenseRun::run() {
     // u32 load per prime instead of a 64-bit mul_hi chain. Kept under a host
     // memory budget; beyond it the kernel falls back to the legacy in-kernel
     // reciprocal path (huge segments only).
-    const uint64_t table_bytes = uint64_t(own_end) * map_tiles * 4;
-    const bool use_table = own_end > mask_count &&
+    table_bytes = uint64_t(own_end) * map_tiles * 4;
+    use_table = own_end > mask_count &&
                            sieve_split > 0 &&
                            table_bytes * 2 <= uint64_t(1) << 30;
-    const uint32_t use_table_u32 = use_table ? 1u : 0u;
+    use_table_u32 = use_table ? 1u : 0u;
 
     // Fused small-prime mask stage (make_prime_map): grouped mask tables,
     // rebuilt per segment (q_first-dependent); the grouping itself is fixed.
@@ -731,18 +744,28 @@ RunStats DenseRun::run() {
     // (7 groups, 120 KB) and 0.1143 at 8192 — the tables must stay
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
-    const uint32_t mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
+    mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
         mask_groups0 = small_prime_group_masks(sieve_primes, mask_count, 3, mask_period);   // sizes only
-    const uint32_t mask_groups_n = (mask_groups_on && mask_groups0.count() <= 8)
+    mask_groups_n = (mask_groups_on && mask_groups0.count() <= 8)
                                  ? mask_groups0.count() : 0u;
-    const size_t mask_group_words = mask_groups0.words.size();
-    uint32_t* d_group_desc = nullptr;
+    mask_group_words = mask_groups0.words.size();
+    d_group_desc = nullptr;
     if (mask_groups_n > 0) {
         d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared(mask_groups0.desc.size() * 4));
         std::memcpy(d_group_desc, mask_groups0.desc.data(), mask_groups0.desc.size() * 4);
     }
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
     // count30's gap outputs as the kernel expects them before a segment
     const auto reset_gaps = [&](int s) {
         b.g_tail[s][0] = b.g_tail[s][1] = 0;
