@@ -139,7 +139,7 @@ void test_prime_cache()
         }
         bool tmp_left = false;
         for (const auto& de : fs::directory_iterator(dir))
-            if (de.path().filename().string().find(".tmp.") != std::string::npos) tmp_left = true;
+            if (de.path().filename().string().contains(".tmp.")) tmp_left = true;
         check(!tmp_left, "cache writes leave no temp files behind");
     }
     std::error_code ec;
