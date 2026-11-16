@@ -267,6 +267,10 @@ struct RunSetup {
           verbose(verbose_), start_even(start_even_), sieve_split_arg(sieve_split_arg_),
           prime_cache_path(prime_cache_path_), collect_segments(collect_segments_) {
         resolve_range();
+        load_base_primes();
+        // ---- Level Zero setup starts here: DenseRun's members follow.
+        t_module = clock_::now();
+        init_mark("pre-module");
     }
 
     // ---- resolve_range ----------------------------------------------------
@@ -277,7 +281,24 @@ struct RunSetup {
     clock_::time_point t_start;
     uint64_t total_evens = 0;        // evens in [start_even, limit]
 
+    // ---- load_base_primes -------------------------------------------------
+    gb::PrimeCacheView prime_view;
+    const uint32_t* sieve_primes = nullptr;  // mmap-backed (or owned) by prime_view
+    double cache_seconds = 0.0;
+    uint32_t mask_count = 0;         // primes < 64: the small-prime mask path
+    uint32_t sieve_count = 0;        // base primes
+    uint32_t sieve_split = 0;        // [0, split): tile walk; [split, count): large kernels
+    uint32_t large_count = 0;
+    bool init_trace = false;         // GB_INIT_TRACE
+    clock_::time_point t_mark;       // init_mark's previous mark
+    std::vector<uint32_t> gb_all;    // odd candidate primes <= MAX_GB_PRIME
+    std::vector<uint16_t> gb_primes;
+    std::vector<uint16_t> twin_primes;  // lower members of the twin pairs among them
+    clock_::time_point t_module;     // start of the Level Zero setup
+
     void resolve_range();
+    void load_base_primes();
+    void init_mark(const char* what);
 };
 
 class DenseRun : RunSetup {
@@ -332,25 +353,27 @@ void RunSetup::resolve_range() {
     }
 }
 
-RunStats DenseRun::run() {
+/// Phase 2: base primes (cache load), the tile-walk / large-prime split and
+/// the Goldbach candidate lists. No Level Zero call.
+void RunSetup::load_base_primes() {
     // ------------------------------------------------ CPU-side setup ------
     // Base primes for the segmented sieve: need p <= sqrt(max q) = sqrt(limit).
     // Segmented generator: O(block) memory instead of O(sqrt(limit)) — the
     // flat sieve would need a 2 GB bitmap at limit=4e18.
     const uint32_t sqrt_limit = gb::base_prime_bound(limit);
     const auto t_cache = clock_::now();
-    const gb::PrimeCacheView prime_view = gb::PrimeCacheView::load(
+    prime_view = gb::PrimeCacheView::load(
         std::max<uint64_t>(sqrt_limit, 64),
         prime_cache_path ? prime_cache_path : "base_primes.cache");
     // mmap-backed (or owned) read-only prime list; no intermediate copy.
-    const uint32_t* const sieve_primes = prime_view.data();
-    const double cache_seconds = seconds_since(t_cache);
+    sieve_primes = prime_view.data();
+    cache_seconds = seconds_since(t_cache);
 
     // Primes handled by the kernel's small-prime mask path (stage 3a): the
     // first mask_count entries of sieve_primes (ascending) are all < 64.
     // Keep in sync with MASK_MAX_P in kernels/goldbach.cl (table indexing
     // requires p < 64 so the phase fits the 64-entry per-prime table).
-    const uint32_t mask_count = uint32_t(
+    mask_count = uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + prime_view.size(), 64u) -
         sieve_primes);
 
@@ -363,8 +386,8 @@ RunStats DenseRun::run() {
     // 0 = auto: keep the tile walk's per-thread prime loop around 64K
     // iterations (pi(1e6) ~ 78K) and hand everything above to the large
     // kernel. Tunable via --split for the sweep tool.
-    const uint32_t sieve_count = uint32_t(prime_view.size());
-    uint32_t sieve_split = sieve_split_arg;
+    sieve_count = uint32_t(prime_view.size());
+    sieve_split = sieve_split_arg;
     // 0 = auto: 30000 (~350K) with 16 KB tiles (v1.8.1): moving primes out
     // of the global-atomic large kernel into the SLM medium stage pays until
     // its per-prime-per-tile setup dominates. 2e10 window at 4e18 (16 KB
@@ -377,29 +400,29 @@ RunStats DenseRun::run() {
     if (sieve_split == 0 || sieve_split > sieve_count)
         sieve_split = std::min<uint32_t>(sieve_count, 36000);
     sieve_split = std::max(sieve_split, mask_count);
-    const uint32_t large_count = sieve_count - sieve_split;
+    large_count = sieve_count - sieve_split;
 
     // Goldbach candidate primes: p <= 9781 (see config.hpp).
-    const bool init_trace = env::present("GB_INIT_TRACE");
-    auto t_mark = clock_::now();
-    const auto init_mark = [&](const char* what) {
-        if (!init_trace) return;
-        std::fprintf(stderr, "  init %-34s %7.1f ms\n", what, seconds_since(t_mark) * 1e3);
-        t_mark = clock_::now();
-    };
+    init_trace = env::present("GB_INIT_TRACE");
+    t_mark = clock_::now();
     init_mark("cache+setup");
-    std::vector<uint32_t> gb_all = odd_primes_up_to(MAX_GB_PRIME);
-    std::vector<uint16_t> gb_primes;
+    gb_all = odd_primes_up_to(MAX_GB_PRIME);
     gb_primes.reserve(gb_all.size());
     for (uint32_t p : gb_all) gb_primes.push_back(uint16_t(p));
     // Lower members of the twin pairs among the candidates (twin checker).
-    std::vector<uint16_t> twin_primes;
     for (size_t i = 0; i + 1 < gb_all.size(); ++i)
         if (gb_all[i + 1] == gb_all[i] + 2) twin_primes.push_back(uint16_t(gb_all[i]));
+}
 
+/// GB_INIT_TRACE: init time since the previous mark, to stderr.
+void RunSetup::init_mark(const char* what) {
+    if (!init_trace) return;
+    std::fprintf(stderr, "  init %-34s %7.1f ms\n", what, seconds_since(t_mark) * 1e3);
+    t_mark = clock_::now();
+}
+
+RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
-    const auto t_module = clock_::now();
-    init_mark("pre-module");
     Context ctx(true);   // unordered list, barrier per launch (§9.2v)
     Module  mod(ctx, spv_path);
     Kernel  k_sieve(mod, "make_prime_map");
