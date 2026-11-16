@@ -3,7 +3,9 @@
 // Every table and plan the verifier uploads is checked here against an
 // independent brute-force reference: prime lists and the disk cache,
 // Miller-Rabin, all small-prime mask table layouts, the
-// modular helpers of the sparse first-hit tables, and the three checker
+// modular helpers of the sparse first-hit tables, the dense pipeline's
+// segment / class geometry, first-bit and per-tile tables, reciprocals and
+// packed large primes (host_math.hpp), and the three checker
 // plans (coverage: phase A + phase B test every candidate; the sparse plan
 // validator accepts real plans and rejects corrupted ones). Runs in CI
 // (plain, and under ASan + UBSan) — no Level Zero device needed.
@@ -11,9 +13,11 @@
 // usage: host_tests            (exit 0 = all passed; failures are listed)
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <numeric>
@@ -24,6 +28,7 @@
 
 #include "check30.hpp"
 #include "gstats.hpp"
+#include "host_math.hpp"
 #include "config.hpp"
 #include "primes.hpp"
 #include "ridge.hpp"
@@ -1062,6 +1067,379 @@ void test_gap_stats()
     fs::remove_all(dir, ec);
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// host_math.hpp: the dense pipeline's segment geometry and sieve tables
+// against brute force (bit i <-> q = q_first + 2 i; class c index t <->
+// q = Q[c] + qmod t).
+// ---------------------------------------------------------------------------
+
+// Odd primes in [lo, hi) by a window sieve over trial primes < 2^16
+// (independent of primes.cpp; lo odd, hi <= 2^32).
+std::vector<uint32_t> odd_primes_in_window(uint64_t lo, uint64_t hi)
+{
+    std::vector<char> comp(size_t(hi - lo), 0);
+    for (uint64_t d = 3; d < 65536 && d * d < hi; d += 2)
+        for (uint64_t m = std::max(d * d, (lo + d - 1) / d * d); m < hi; m += d) comp[m - lo] = 1;
+    std::vector<uint32_t> out;
+    for (uint64_t x = lo | 1; x < hi; x += 2) if (!comp[x - lo]) out.push_back(uint32_t(x));
+    return out;
+}
+
+// The run_gpu segment loop over [start, limit]: segments tile the range
+// contiguously, the q side covers every n - p for odd p <= MAX_GB_PRIME.
+void test_host_math_segments()
+{
+    std::puts("host math: segment and class geometry");
+    parallel_for(0, 0, 4, [&](uint32_t, uint32_t) { check(false, "parallel_for: empty range runs nothing"); });
+    for (uint32_t begin : {0u, 7u})
+        for (uint32_t count : {1u, 2u, 15u, 16u, 17u, 1000u})
+            for (uint32_t workers : {1u, 3u, 16u, 64u}) {
+                std::vector<std::atomic<int>> hits(begin + count);
+                parallel_for(begin, begin + count, workers, [&](uint32_t a, uint32_t b) {
+                    for (uint32_t i = a; i < b; ++i) hits[i]++;
+                });
+                bool once = true;
+                for (uint32_t i = 0; i < begin + count; ++i) once &= hits[i] == (i >= begin ? 1 : 0);
+                check(once, "parallel_for covers [" + std::to_string(begin) + ", +" + std::to_string(count) +
+                            ") once with " + std::to_string(workers) + " workers");
+            }
+
+    const auto gbp = odd_primes_up_to(MAX_GB_PRIME);
+    struct Run { uint64_t start, limit, seg; bool cover; };
+    const Run runs[] = {
+        // A segment holding n = 4 alone (start 4 with segment 2 and limit >= 8,
+        // or limit 4) has q_last = 1 < q_first = 3 and q_odds wraps to 2^63:
+        // outside segment_geometry's domain, so not tested here (run_gpu
+        // reaches it for --limit 4 / --limit 8; see the hardening notes).
+        {4, 6, 2, true}, {6, 100, 2, true}, {4, 100, 4, true}, {4, 100, 10, true}, {4, 100, 98, true},
+        {4, 9790, 1000, true}, {4, 30000, 9782, true}, {4, 30000, 4096, true},
+        {9780, 9800, 4, true}, {9782, 9800, 2, true}, {9784, 9800, 6, true}, {9786, 40000, 7000, true},
+        {1'000'000'000'000ull, 1'000'000'020'000ull, 6000, true},
+        {MAX_SUPPORTED_LIMIT - 40'000, MAX_SUPPORTED_LIMIT, 5000, true},
+        // q_odds = (segment - 5 + MAX_GB_PRIME) / 2 + 1 = exactly one tile
+        {20000, 20000 + 3 * (2 * BITS_PER_TILE - MAX_GB_PRIME + 3), 2 * BITS_PER_TILE - MAX_GB_PRIME + 3, false},
+        {4, 2'000'000'000ull, 262'144'000ull, false},
+        {4'000'000'000'000'000'000ull, 4'000'000'100'000'000'000ull, 2'000'000'000ull, false},
+    };
+    for (const Run& r : runs) {
+        const std::string tag = "segments [" + std::to_string(r.start) + ", " + std::to_string(r.limit) +
+                                "] / " + std::to_string(r.seg);
+        bool ok = true, cover = true;
+        uint64_t expect = r.start, idx = 0;
+        for (uint64_t s = r.start; s <= r.limit; s += r.seg, ++idx) {
+            const SegmentGeometry g = segment_geometry(s, r.limit, r.seg, idx);
+            const bool last = g.seg_end == r.limit;
+            ok &= g.seg_start == s && s == expect && g.seg_end % 2 == 0 && g.seg_end >= s && g.seg_end <= r.limit;
+            ok &= last ? g.seg_end - s <= r.seg : g.seg_end - s == r.seg - 2;
+            ok &= g.seg_evens == (g.seg_end - s) / 2 + 1 && g.slot == (idx & 1);
+            const uint64_t want_qf = s >= MAX_GB_PRIME + 2 ? s - MAX_GB_PRIME : 3;
+            ok &= g.q_first == want_qf && g.q_first % 2 == 1 && g.q_first >= 3;
+            ok &= g.q_last == g.seg_end - 3 && g.q_last % 2 == 1 && g.q_last >= g.q_first;
+            ok &= g.q_odds == (g.q_last - g.q_first) / 2 + 1;
+            ok &= g.tiles * BITS_PER_TILE >= g.q_odds && (g.tiles - 1) * BITS_PER_TILE < g.q_odds;
+            if (r.cover)
+                for (uint64_t n = g.seg_start; n <= g.seg_end; n += 2)
+                    for (uint32_t p : gbp) {
+                        if (n < p + 3) break;
+                        const uint64_t q = n - p;
+                        cover &= q >= g.q_first && q <= g.q_last;
+                    }
+            expect = g.seg_end + 2;
+            if (last) break;
+        }
+        check(ok && expect == r.limit + 2, tag + ": contiguous, merged tail, odd q range");
+        if (r.cover) check(cover, tag + ": q range holds every n - p, p <= MAX_GB_PRIME");
+    }
+
+    // Class maps: each odd q of the dense map in exactly the class of its
+    // residue at index (q - Q[c]) / qmod, dense bit phi[c] + (qmod/2) t.
+    std::mt19937_64 rng(20261116);
+    std::vector<uint64_t> qfs = {3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33,
+                                 9781, 1'000'000'000'001ull, MAX_SUPPORTED_LIMIT - 1'000'001};
+    for (int i = 0; i < 12; ++i) qfs.push_back((rng() % (MAX_SUPPORTED_LIMIT / 2)) * 2 + 1);
+    for (uint32_t K : {2u, 8u}) {
+        const uint32_t qmod = K == 8 ? 30 : 6, dm = qmod / 2;
+        bool ok = true;
+        size_t cases = 0;
+        for (uint64_t qf : qfs)
+            for (uint64_t q_odds : {1ull, 2ull, 3ull, 14ull, 15ull, 16ull, 1000ull,
+                                    uint64_t(dm) * BITS_PER_TILE, uint64_t(dm) * BITS_PER_TILE + 1,
+                                    uint64_t(2 * dm) * BITS_PER_TILE + 7}) {
+                if (q_odds > 1000 && cases % 8) { ++cases; continue; }   // big cases on a subset
+                ++cases;
+                const ClassGeo g = class_geometry(qf, q_odds, K);
+                ok &= g.K == K && g.qmod == qmod;
+                uint64_t cnt[8] = {};
+                int cls_of[30];
+                std::fill(cls_of, cls_of + 30, -1);
+                for (uint32_t k = 0; k < K; ++k) cls_of[g.res(k)] = int(k);
+                for (uint32_t c = 0; c < K; ++c)
+                    ok &= g.phi[c] < dm && g.Q[c] == qf + 2ull * g.phi[c] && g.Q[c] % qmod == g.res(c);
+                for (uint64_t i = 0; i < q_odds; ++i) {
+                    const uint64_t q = qf + 2 * i;
+                    const uint32_t r = uint32_t(q % qmod);
+                    const int c = cls_of[r];
+                    if (std::gcd(r, qmod) != 1) { ok &= c < 0; continue; }
+                    ok &= c >= 0 && q >= g.Q[c] && (q - g.Q[c]) % qmod == 0 &&
+                          i == g.phi[c] + uint64_t(dm) * ((q - g.Q[c]) / qmod) &&
+                          (q - g.Q[c]) / qmod == cnt[c];
+                    if (c >= 0) ++cnt[c];
+                }
+                uint64_t nmax = 0;
+                for (uint32_t c = 0; c < K; ++c) { ok &= g.n[c] == cnt[c]; nmax = std::max(nmax, cnt[c]); }
+                ok &= g.tpc == std::max<uint64_t>(1, (nmax + BITS_PER_TILE - 1) / BITS_PER_TILE);
+            }
+        check(ok, "class_geometry K=" + std::to_string(K) + ": phases, first q, counts, tiles per class");
+    }
+}
+
+// First-bit tables: the smallest multiple of p (odd / in class c) at or
+// above max(p^2, q_first), found by walking multiples of p.
+void test_host_math_first_bits()
+{
+    std::puts("host math: first bits (dense and class maps)");
+    const auto primes = odd_primes_up_to(30000);
+    const uint32_t split = uint32_t(primes.size());
+    struct Rng { uint64_t q_first, q_odds; };
+    const Rng ranges[] = {
+        {3, 1}, {3, 5}, {3, 4000}, {5, 100}, {9, 3}, {25, 1}, {27, 1}, {119, 1}, {121, 1},
+        {3, 3 * BITS_PER_TILE + 5}, {9781, 50000},
+        {899'999'999ull, 70000},                   // around 30000^2
+        {1'000'000'000'001ull, 200000}, {MAX_SUPPORTED_LIMIT - 400'001, 200000},
+    };
+    for (const Rng& r : ranges) {
+        const uint64_t qf = r.q_first, ql = qf + 2 * (r.q_odds - 1);
+        const std::string tag = "[" + std::to_string(qf) + ", " + std::to_string(ql) + "]";
+        const auto fb = compute_first_bits(primes.data(), split, qf, ql);
+        bool ok = fb.size() == split;
+        for (uint32_t j = 0; j < split && ok; ++j) {
+            const uint64_t p = primes[j], lo = std::max(p * p, qf);
+            uint64_t want = ~0ull;
+            for (uint64_t m = (lo + p - 1) / p; m * p <= ql; ++m)
+                if (m % 2 == 1) { want = (m * p - qf) / 2; break; }
+            ok &= fb[j] == want;
+        }
+        check(ok, "compute_first_bits " + tag + " vs first odd multiple >= max(p^2, q_first)");
+
+        for (uint32_t K : {2u, 8u}) {
+            const ClassGeo g = class_geometry(qf, r.q_odds, K);
+            const uint32_t M = g.qmod;
+            std::vector<uint64_t> got(size_t(K) * split, 0x5A5A5A5A5A5A5A5Aull);
+            // two disjoint column ranges, the middle one left alone
+            const uint32_t a = split / 3, b = 2 * split / 3;
+            first_bits_class_range(got.data(), primes.data(), split, 0, a, qf, ql, g);
+            first_bits_class_range(got.data(), primes.data(), split, b, split, qf, ql, g);
+            bool cok = true;
+            for (uint32_t c = 0; c < K; ++c)
+                for (uint32_t j = 0; j < split; ++j) {
+                    const uint64_t v = got[size_t(c) * split + j];
+                    if (j >= a && j < b) { cok &= v == 0x5A5A5A5A5A5A5A5Aull; continue; }
+                    const uint64_t p = primes[j], lo = std::max(p * p, qf);
+                    uint64_t want = ~0ull;
+                    for (uint64_t m = (lo + p - 1) / p, e = m + M; m < e && m * p <= ql; ++m)
+                        if ((m * p) % M == g.res(c)) { want = (m * p - g.Q[c]) / M; break; }
+                    cok &= v == want;
+                }
+            check(cok, "first_bits_class_range K=" + std::to_string(K) + " " + tag +
+                       " vs first class multiple; untouched columns kept");
+        }
+    }
+}
+
+// Magic reciprocals: floor(d * m >> (64 + s)) == d / p, exhaustively over a
+// tile's bit span for edge primes, on random and edge d up to 2^33 for all.
+void test_host_math_reciprocals()
+{
+    std::puts("host math: magic reciprocals");
+    std::vector<uint32_t> ps = odd_primes_up_to(1u << 20);          // > the default split
+    const size_t small_count = ps.size();
+    // around 2^31 and the largest u32 primes (--split may reach the base-prime bound ~2^32)
+    for (uint32_t p : odd_primes_in_window((1ull << 31) + 1, (1ull << 31) + 600)) ps.push_back(p);
+    for (uint32_t p : odd_primes_in_window((1ull << 32) - 1500, 1ull << 32)) ps.push_back(p);
+    check(ps.back() == 4294967291u, "largest u32 prime in the reciprocal set");
+    const auto [magic, shift] = build_magic_reciprocals(ps.data(), uint32_t(ps.size()));
+    check(magic.size() == ps.size() && shift.size() == ps.size(), "build_magic_reciprocals sizes");
+    auto fl = [&](uint64_t d, size_t j) {
+        return uint64_t(((__uint128_t)d * magic[j]) >> (64 + shift[j]));
+    };
+    // exhaustive d < BITS_PER_TILE (the table path's tile-start jump; the kernel
+    // jumps < 2^27 within a segment) for the smallest, split-edge and largest primes
+    std::vector<size_t> ex = {0, 1, 2, 3, 10, 1000, small_count - 1, small_count, ps.size() - 1};
+    for (size_t j = 0; j < ps.size(); ++j) if (ps[j] > BITS_PER_TILE) { ex.push_back(j); ex.push_back(j - 1); break; }
+    bool ok = true;
+    for (size_t j : ex)
+        for (uint64_t d = 0; d < BITS_PER_TILE; ++d) ok &= fl(d, j) == d / ps[j];
+    check(ok, "magic floor(d/p) exact for every d < BITS_PER_TILE (" + std::to_string(ex.size()) + " primes)");
+    std::mt19937_64 rng(4133);
+    ok = true;
+    bool ceil_ok = true;
+    for (size_t j = 0; j < ps.size(); ++j) {
+        const uint64_t p = ps[j];
+        uint64_t ds[16] = {(1ull << 33) - 1, (1ull << 27) - 1, BITS_PER_TILE - 1,
+                           ((1ull << 33) / p) * p, ((1ull << 33) / p) * p - 1, p, p - 1, p + 1};
+        for (int k = 8; k < 16; ++k) ds[k] = rng() & ((1ull << 33) - 1);
+        for (uint64_t d : ds) {
+            const uint64_t k0 = fl(d, j);
+            // Exact floor below 2^31. Above, m = ceil(2^64 / p) can overshoot by
+            // one at d = -1 (mod p) near 2^33 (e.g. p = 4294967291, d = 2p - 1):
+            // the kernel only uses ceil(d/p), which the overshoot still gives.
+            ok &= p < (1ull << 31) ? k0 == d / p : (k0 == d / p || (k0 == d / p + 1 && d % p == p - 1));
+            const uint64_t kc = k0 + ((k0 * p < d) ? 1u : 0u);        // kernel's ceil step
+            ceil_ok &= kc == (d + p - 1) / p;
+        }
+    }
+    check(ok, "magic floor(d/p) on edge and random d < 2^33: exact for p < 2^31, at most +1 at d = -1 mod p above");
+    check(ceil_ok, "magic + correction gives ceil(d/p) exactly for every d < 2^33 (kernel jump)");
+}
+
+// Per-tile first-mark tables vs walking each prime's marks across the map.
+void test_host_math_tile_table()
+{
+    std::puts("host math: per-tile first-mark tables");
+    const auto primes = odd_primes_up_to(20000);
+    const uint32_t split = uint32_t(primes.size());
+    const auto [magic, shift] = build_magic_reciprocals(primes.data(), split);
+    for (uint64_t qf : {3ull, 1'000'000'000'001ull, MAX_SUPPORTED_LIMIT - 9'000'001ull}) {
+        // dense map: 3.5 tiles; walk f, f + p, ... (consecutive odd multiples)
+        const uint64_t q_odds = 3 * BITS_PER_TILE + BITS_PER_TILE / 2, ql = qf + 2 * (q_odds - 1);
+        const uint32_t tiles = uint32_t((q_odds + BITS_PER_TILE - 1) / BITS_PER_TILE);
+        const auto fb = compute_first_bits(primes.data(), split, qf, ql);
+        for (uint32_t own_end : {split, split / 2}) {
+            std::vector<uint32_t> tbl(size_t(tiles) * own_end, 7);
+            build_tile_first_table(tbl.data(), tiles, split, own_end, fb.data(), magic.data(),
+                                   shift.data(), primes.data());
+            bool ok = true;
+            for (uint32_t j = 0; j < own_end; ++j) {
+                std::vector<uint32_t> want(tiles, UINT32_MAX);
+                if (fb[j] != ~0ull)
+                    for (uint64_t b = fb[j]; b < uint64_t(tiles) * BITS_PER_TILE; b += primes[j]) {
+                        ok &= (qf + 2 * b) % primes[j] == 0;
+                        if (want[b / BITS_PER_TILE] == UINT32_MAX) want[b / BITS_PER_TILE] = uint32_t(b % BITS_PER_TILE);
+                    }
+                for (uint32_t t = 0; t < tiles; ++t) ok &= tbl[size_t(t) * own_end + j] == want[t];
+            }
+            check(ok, "build_tile_first_table dense q_first=" + std::to_string(qf) +
+                      " own_end=" + std::to_string(own_end) + " vs mark walk");
+        }
+        // class maps: K * tpc tiles; class c's marks of p are p apart in class index
+        for (uint32_t K : {2u, 8u}) {
+            const uint64_t qo = uint64_t(K == 8 ? 15 : 3) * (BITS_PER_TILE + BITS_PER_TILE / 3);
+            const uint64_t qlc = qf + 2 * (qo - 1);
+            const ClassGeo g = class_geometry(qf, qo, K);
+            std::vector<uint64_t> fbc(size_t(K) * split);
+            first_bits_class_range(fbc.data(), primes.data(), split, 0, split, qf, qlc, g);
+            const uint32_t own_end = split;
+            const uint32_t ct = K * g.tpc;
+            std::vector<uint32_t> tbl(size_t(ct) * own_end, 7);
+            build_tile_first_table(tbl.data(), ct, split, own_end, fbc.data(), magic.data(),
+                                   shift.data(), primes.data(), g.tpc);
+            bool ok = g.tpc == 2;
+            for (uint32_t c = 0; c < K; ++c)
+                for (uint32_t j = 0; j < own_end; ++j) {
+                    std::vector<uint32_t> want(g.tpc, UINT32_MAX);
+                    const uint64_t f = fbc[size_t(c) * split + j];
+                    if (f != ~0ull)
+                        for (uint64_t b = f; b < uint64_t(g.tpc) * BITS_PER_TILE; b += primes[j]) {
+                            ok &= (g.Q[c] + uint64_t(g.qmod) * b) % primes[j] == 0;
+                            if (want[b / BITS_PER_TILE] == UINT32_MAX) want[b / BITS_PER_TILE] = uint32_t(b % BITS_PER_TILE);
+                        }
+                    for (uint32_t t = 0; t < g.tpc; ++t)
+                        ok &= tbl[size_t(c * g.tpc + t) * own_end + j] == want[t];
+                }
+            check(ok, "build_tile_first_table class K=" + std::to_string(K) + " q_first=" +
+                      std::to_string(qf) + " vs mark walk");
+        }
+    }
+}
+
+// Packed large primes: decode exactly as kernels/goldbach.cl decode_large
+// (u32 gap words, subgroup exclusive scan, u32 prime rebuild).
+std::vector<uint32_t> decode_large_ref(const PackedLarge& pk, uint32_t large_count)
+{
+    constexpr uint32_t SG = 32, PPI = LARGE_PACK_PPI, WORDS = PPI / 4;
+    std::vector<uint32_t> out(large_count);
+    const uint32_t items = (large_count + PPI - 1) / PPI;
+    for (uint32_t sg0 = 0; sg0 < items; sg0 += SG) {
+        uint32_t sums[SG] = {}, gb[SG][PPI] = {};
+        for (uint32_t l = 0; l < SG; ++l) {
+            const uint32_t item = sg0 + l;
+            for (uint32_t k = 0; k < WORDS; ++k) {
+                uint32_t w = 0;
+                if (item * PPI + 4 * k < large_count)
+                    std::memcpy(&w, pk.gaps.data() + size_t(item * WORDS + k) * 4, 4);   // little endian
+                for (uint32_t b = 0; b < 4; ++b) { gb[l][4 * k + b] = (w >> (8 * b)) & 0xFF; sums[l] += gb[l][4 * k + b]; }
+            }
+        }
+        uint32_t excl = 0;
+        for (uint32_t l = 0; l < SG; ++l) {
+            const uint32_t item = sg0 + l;
+            uint32_t p = pk.bases[std::min(item / SG, (large_count - 1) / LARGE_PACK_GROUP)] + 2u * excl;
+            for (uint32_t k = 0; k < PPI; ++k) {
+                p += 2u * gb[l][k];
+                if (item * PPI + k < large_count) out[item * PPI + k] = p;
+            }
+            excl += sums[l];
+        }
+    }
+    return out;
+}
+
+void test_host_math_pack()
+{
+    std::puts("host math: packed large primes");
+    check(LARGE_PACK_GROUP == 32 * LARGE_PACK_PPI && LARGE_PACK_PPI == 16, "pack layout: SIMD32 x 16 primes");
+    const auto primes = odd_primes_up_to(3'000'000);
+    const uint32_t G = LARGE_PACK_GROUP, total = uint32_t(primes.size());
+    auto roundtrip = [&](const std::vector<uint32_t>& ps, uint32_t split, uint32_t count, const std::string& tag) {
+        const PackedLarge pk = pack_large_primes(ps.data(), split, count);
+        const uint64_t n = count - split;
+        const uint64_t items = (n + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
+        bool ok = pk.gaps.size() == std::max<uint64_t>(items, 1) * LARGE_PACK_PPI &&
+                  pk.bases.size() == std::max<uint64_t>((n + G - 1) / G, 1) && pk.gaps.size() % 16 == 0;
+        for (uint64_t i = 0; i < n; ++i)
+            if (i % G == 0) ok &= pk.gaps[i] == 0 && pk.bases[i / G] == ps[split + i];
+        for (uint64_t i = n; i < pk.gaps.size(); ++i) ok &= pk.gaps[i] == 0;
+        if (n > 0) {
+            const auto dec = decode_large_ref(pk, uint32_t(n));
+            ok &= std::equal(dec.begin(), dec.end(), ps.begin() + split);
+        }
+        check(ok, "pack_large_primes " + tag + ": layout and kernel decode round trip");
+    };
+    for (uint32_t n : {0u, 1u, 15u, 16u, 17u, G - 1, G, G + 1, 3 * G + 77, 100 * G})
+        roundtrip(primes, 1000, 1000 + n, std::to_string(n) + " primes");
+    roundtrip(primes, 36000, total, "[36000, all) of 3e6");
+    roundtrip(primes, 0, total, "all of 3e6");
+    const auto top = odd_primes_in_window((1ull << 32) - 50001, 1ull << 32);   // u32 rebuild at the top
+    roundtrip(top, 0, uint32_t(top.size()), "largest u32 primes");
+    // half-gap 255 fits; 256 or an odd gap fails closed; a group start takes any gap
+    std::vector<uint32_t> fake = {3, 5};
+    fake.push_back(fake.back() + 510);
+    while (fake.size() < G) fake.push_back(fake.back() + 2);
+    fake.push_back(fake.back() + 100000);                      // first prime of group 1
+    fake.push_back(fake.back() + 2);
+    roundtrip(fake, 0, uint32_t(fake.size()), "max half-gap 255, huge gap at a group start");
+    for (uint32_t bad_gap : {512u, 3u}) {
+        std::vector<uint32_t> bad = {3, 5, 7};
+        bad.push_back(bad.back() + bad_gap);
+        bool threw = false;
+        try { pack_large_primes(bad.data(), 0, uint32_t(bad.size())); } catch (const std::runtime_error&) { threw = true; }
+        check(threw, "pack_large_primes fails closed on gap " + std::to_string(bad_gap));
+    }
+}
+
+void test_host_math()
+{
+    test_host_math_segments();
+    test_host_math_first_bits();
+    test_host_math_reciprocals();
+    test_host_math_tile_table();
+    test_host_math_pack();
+}
+
+} // namespace
+
 int main()
 {
     test_prime_lists();
@@ -1077,6 +1455,7 @@ int main()
     test_ridge_store();
     test_stats_state();
     test_gap_stats();
+    test_host_math();
     std::printf("host_tests: %d checks, %d failed -> %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
