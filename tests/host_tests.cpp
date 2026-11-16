@@ -1453,7 +1453,7 @@ void test_host_math_segments()
         bool ok = true;
         size_t cases = 0;
         for (uint64_t qf : qfs)
-            for (uint64_t q_odds : {1ull, 2ull, 3ull, 14ull, 15ull, 16ull, 1000ull,
+            for (uint64_t q_odds : std::initializer_list<uint64_t>{1, 2, 3, 14, 15, 16, 1000,
                                     uint64_t(dm) * BITS_PER_TILE, uint64_t(dm) * BITS_PER_TILE + 1,
                                     uint64_t(2 * dm) * BITS_PER_TILE + 7}) {
                 if (q_odds > 1000 && cases % 8) { ++cases; continue; }   // big cases on a subset
