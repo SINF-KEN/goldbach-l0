@@ -457,6 +457,12 @@ private:
     clock_::time_point t_upload;
 
     void upload_tables();
+
+    // ---- pack_stats_buffers ---------------------------------------------------
+    void* stats_block[2] = {nullptr, nullptr};
+    std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
+
+    void pack_stats_buffers();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1307,19 +1313,9 @@ void DenseRun::upload_tables() {
     }
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    allocate_slot_buffers();
-    size_bucket_ring_and_hitlists();
-    allocate_large_prime_buffers();
-    upload_tables();
-
+/// Phase 9: re-points each slot's seven statistics buffers into one shared
+/// block (the original allocations stay allocated, unused; see below).
+void DenseRun::pack_stats_buffers() {
     // Statistics buffers: one shared allocation per slot instead of seven.
     // collect_stats reads and resets them on the host once per segment; as
     // separate shared allocations each one paid its own migration to the host
@@ -1338,8 +1334,6 @@ RunStats DenseRun::run() {
     // are sensitive to where the device allocations land (see the split_s1 /
     // split_s5 note above), so the block is added after every other buffer
     // and nothing that exists today moves.
-    void* stats_block[2] = {nullptr, nullptr};
-    std::vector<void*> stats_unpacked;   // the original allocations (freed at the end)
     if (stats_on) {
         const size_t ph_bytes = (size_t(MAX_GB_PRIME) / 2 + 1) * 4;
         size_t block_bytes = 0;
@@ -1378,6 +1372,22 @@ RunStats DenseRun::run() {
             reset_gaps(s);
         }
     }
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
+    allocate_slot_buffers();
+    size_bucket_ring_and_hitlists();
+    allocate_large_prime_buffers();
+    upload_tables();
+
+    pack_stats_buffers();
 
     const uint32_t gb_count = uint32_t(gb_primes.size());
     // The mask-table kernel arg is set per segment (the table CONTENT is
