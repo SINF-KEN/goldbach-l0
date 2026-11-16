@@ -421,6 +421,34 @@ private:
     uint32_t packed_end = 0;         // packed kernel primes [sieve_split, packed_end)
 
     void size_bucket_ring_and_hitlists();
+
+    // ---- allocate_large_prime_buffers ---------------------------------------------
+    uint32_t packed_count = 0;       // primes of the packed large kernel
+    bool hl_fuse = false;            // hl_apply fused into sieve_large_packed_hl
+    PackedLarge packed;
+    uint32_t* d_large_bases = nullptr;
+    uint32_t* d_large_gaps = nullptr;
+    uint64_t* d_bkt_entries = nullptr;   // bucket ring [0, bkt_split)
+    uint64_t* d_bkt_entries1 = nullptr;  // bucket ring [bkt_split, R)
+    uint32_t bkt_split = 0;
+    uint32_t* d_bkt_counts = nullptr;
+    uint32_t* bkt_err = nullptr;     // shared device error flags (buckets / hit lists)
+    uint32_t* d_hl_lists = nullptr;
+    uint32_t* d_hl_counts = nullptr;
+    uint32_t act_next = 0;           // primes [bucket_begin, act_next) are active
+    uint32_t act_p2_begin = 0;
+    std::unique_ptr<Kernel> k_bproc, k_bact, k_cmp, k_large_full, k_hlh, k_hla;
+    uint32_t bucket_groups = 0;      // GB_BUCKET_GROUPS or the mode default
+    uint32_t bucket_verify_every = 0;  // GB_BUCKET_VERIFY (0: off)
+    bool bucket_verify = false;
+    PackedLarge packed_full;
+    uint32_t* d_full_bases = nullptr;
+    uint32_t* d_full_gaps = nullptr;
+    uint64_t* d_verify_map = nullptr;
+    uint32_t* verify_diff = nullptr; // shared: differing words (map_compare)
+
+    void allocate_large_prime_buffers();
+    uint64_t bkt_first_seg(uint64_t G) const;
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1048,24 +1076,17 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     init_mark("bucket-geom+lambda");
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    allocate_slot_buffers();
-    size_bucket_ring_and_hitlists();
-    const uint32_t packed_count = packed_end - sieve_split;
+/// Phase 7: the packed large-prime lists (host packing + device buffers),
+/// the bucket ring or hit-list buffers and their kernels, and the
+/// GB_BUCKET_VERIFY reference path (full packed list, scratch map, kernels).
+void DenseRun::allocate_large_prime_buffers() {
+    packed_count = packed_end - sieve_split;
     // hl_apply fused into the packed kernel (sieve_large_packed_hl): the two
     // mark sets commute, and alone hl_apply was latency-bound. hl_apply runs
     // as its own launch only when no prime is packed.
-    const bool hl_fuse = hitlist && packed_count > 0;
-    PackedLarge packed;
-    uint32_t* d_large_bases = nullptr;
-    uint32_t* d_large_gaps = nullptr;
+    hl_fuse = hitlist && packed_count > 0;
+    d_large_bases = nullptr;
+    d_large_gaps = nullptr;
     if (packed_count > 0) {
         packed = pack_large_primes(sieve_primes, sieve_split, packed_end);
         init_mark("  pack (host)");
@@ -1073,13 +1094,13 @@ RunStats DenseRun::run() {
         d_large_gaps  = static_cast<uint32_t*>(ctx.alloc_device(packed.gaps.size()));
     }
     init_mark("  packed alloc");
-    uint64_t* d_bkt_entries = nullptr;
-    uint64_t* d_bkt_entries1 = nullptr;
-    uint32_t bkt_split = 0;
-    uint32_t* d_bkt_counts = nullptr;
-    uint32_t* bkt_err = nullptr;
-    uint32_t* d_hl_lists = nullptr;
-    uint32_t* d_hl_counts = nullptr;
+    d_bkt_entries = nullptr;
+    d_bkt_entries1 = nullptr;
+    bkt_split = 0;
+    d_bkt_counts = nullptr;
+    bkt_err = nullptr;
+    d_hl_lists = nullptr;
+    d_hl_counts = nullptr;
     if (hitlist) {
         d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4));
         d_hl_counts = static_cast<uint32_t*>(ctx.alloc_device(size_t(HL_MAX_K_HOST) * hl_G * 4));
@@ -1103,21 +1124,15 @@ RunStats DenseRun::run() {
                                                nullptr, 0, nullptr));
     }
     init_mark("  counts/err alloc+fill");
-    // Bucketed primes whose first hit is p*p (p*p >= q_first0) activate only
-    // once that hit is within the ring horizon; host-side pointer.
-    const auto bkt_first_seg = [&](uint64_t G) -> uint64_t {
-        return G < q_odds_full ? 0 : (G - q_odds_full) / delta + 1;
-    };
-    uint32_t act_next = bucket_begin;   // primes [bucket_begin, act_next) are active
-    const uint32_t act_p2_begin = bucket_on
+    act_next = bucket_begin;   // primes [bucket_begin, act_next) are active
+    act_p2_begin = bucket_on
         ? uint32_t(std::lower_bound(sieve_primes + bucket_begin, sieve_primes + sieve_count,
                                     q_first0, [](uint32_t p, uint64_t q) {
                                         return uint64_t(p) * p < q; }) - sieve_primes)
         : sieve_count;
-    std::unique_ptr<Kernel> k_bproc, k_bact, k_cmp, k_large_full, k_hlh, k_hla;
     // Class map: 2048 groups (per 1e11: -0.2% at 4e18, -0.4% at 5e18); the
     // dense map measured 2048 no better than 1024.
-    const uint32_t bucket_groups = bucket_groups_env ? bucket_groups_env
+    bucket_groups = bucket_groups_env ? bucket_groups_env
                                                      : class_mode ? 2 * BUCKET_GROUPS : BUCKET_GROUPS;
     if (hitlist) {
         k_hlh = std::make_unique<Kernel>(mod, "hl_harvest");
@@ -1137,14 +1152,13 @@ RunStats DenseRun::run() {
     // GB_BUCKET_VERIFY=N checks every Nth segment (1 = all; e.g. 100 costs
     // ~1% and is a cheap production safety net: an end-to-end PASS cannot
     // reveal a lost bucket mark — other candidates still resolve the evens).
-    const uint32_t bucket_verify_every = env::present("GB_BUCKET_VERIFY")
+    bucket_verify_every = env::present("GB_BUCKET_VERIFY")
         ? env::u32("GB_BUCKET_VERIFY", 0u, 1u) : 0u;
-    const bool bucket_verify = bucket_on && bucket_verify_every > 0;
-    PackedLarge packed_full;
-    uint32_t* d_full_bases = nullptr;
-    uint32_t* d_full_gaps = nullptr;
-    uint64_t* d_verify_map = nullptr;
-    uint32_t* verify_diff = nullptr;
+    bucket_verify = bucket_on && bucket_verify_every > 0;
+    d_full_bases = nullptr;
+    d_full_gaps = nullptr;
+    d_verify_map = nullptr;
+    verify_diff = nullptr;
     if (bucket_verify) {
         packed_full = pack_large_primes(sieve_primes, sieve_split, sieve_count);
         d_full_bases = static_cast<uint32_t*>(ctx.alloc_device(packed_full.bases.size() * 4));
@@ -1157,6 +1171,25 @@ RunStats DenseRun::run() {
         k_cmp->set_group_size(WG_SIZE);
         k_large_full->set_group_size(large_wg);
     }
+}
+
+/// Bucketed primes whose first hit is p*p (p*p >= q_first0) activate only
+/// once that hit is within the ring horizon; host-side pointer.
+uint64_t DenseRun::bkt_first_seg(uint64_t G) const {
+    return G < q_odds_full ? 0 : (G - q_odds_full) / delta + 1;
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
+    allocate_slot_buffers();
+    size_bucket_ring_and_hitlists();
+    allocate_large_prime_buffers();
     // Reciprocal tables are consumed only by the tile kernel, whose loop ends
     // at sieve_split. At 4e18 the complete prime list is ~98M entries, while
     // the default split is only 78K; sizing these to the full list wasted
