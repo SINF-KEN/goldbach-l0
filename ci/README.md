@@ -54,7 +54,7 @@ fresh run: if the candidate matches `primecount` but not the cache, the
 reference is re-run before anything fails. `"ci_slice": 0` switches to the
 old mode: the last banked slice in full (~28 min) against its journal row.
 
-Thresholds: `DEFAULTS` at the top of `goldbach_ci.py`, overridable in
+Thresholds: `DEFAULTS` in `ci/gbci/core.py`, overridable in
 `ci-state/config.json`.
 
 ## Watching it
@@ -210,3 +210,15 @@ private. Needs `primecount` (PATH, `~/.local/src/primecount/build`, or
 `"primecount"` in the config; without it the count checks warn), `ocloc` for
 kernel freshness, a systemd user session. The CI's own logic is tested by
 `tests/test_ci.py` (GitHub job `static`).
+
+## Code layout
+
+`ci/goldbach_ci.py` is the entry point and the import surface; the code is in
+`ci/gbci/`, one module per responsibility (core, journal, prodstate,
+releases, report, production, primecount, gpustack, build, gates, bench,
+ledger, run, audit, daemon, cli; the layering is in `gbci/__init__.py`).
+Scripts and tests import `goldbach_ci` with `ci/` on `sys.path` and use
+`goldbach_ci.<name>`: every name is re-exported there, and assigning
+`goldbach_ci.<name>` (a test's monkeypatch) also rebinds it in the `gbci`
+modules that use it. Keep `ci/gbci/` next to `goldbach_ci.py`; the workflows
+run the production tree's copy of both.
