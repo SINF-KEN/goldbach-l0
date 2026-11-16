@@ -279,6 +279,15 @@ RunStats run_gpu(uint64_t limit,
     // segment_even is an integer span, so it covers segment_even/2 evens.
     if (segment_even > total_evens)
         segment_even = std::max<uint64_t>(total_evens & ~uint64_t(1), 2);
+    // n = 4 = 2 + 2 has no odd-prime partition, so a segment must not hold it
+    // alone (no odd q to sieve; segment_geometry throws): the first segment
+    // spans at least [4, 6], and [4, 4] is not a GPU range at all.
+    if (start_even == 4) {
+        if (limit < 6)
+            throw std::runtime_error("the GPU path needs limit >= 6 (n = 4 = 2 + 2 has no "
+                                     "odd-prime partition; --cpu-check 4 verifies it)");
+        segment_even = std::max<uint64_t>(segment_even, 4);
+    }
 
     // ------------------------------------------------ CPU-side setup ------
     // Base primes for the segmented sieve: need p <= sqrt(max q) = sqrt(limit).

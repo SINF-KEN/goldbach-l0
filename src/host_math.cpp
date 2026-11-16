@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <string>
 
 namespace gb {
 
@@ -31,6 +32,12 @@ SegmentGeometry segment_geometry(uint64_t seg_start, uint64_t limit,
     if (qf >= seg_start) qf -= 1;                // safety (never triggers)
     g.q_first = (seg_start >= MAX_GB_PRIME + 2) ? qf : 3;
     g.q_last  = g.seg_end - 3;
+    // A segment holding n = 4 alone has no odd q (4 = 2 + 2): q_last = 1 <
+    // q_first = 3 would wrap q_odds to 2^63 and size every launch from it.
+    // run_gpu never builds one (segment span >= 4 at start 4, limit >= 6).
+    if (g.q_last < g.q_first)
+        throw std::runtime_error("segment [" + std::to_string(seg_start) + ", " +
+                                 std::to_string(g.seg_end) + "] has no odd q to sieve");
     g.q_odds  = (g.q_last - g.q_first) / 2 + 1;
     g.tiles   = (g.q_odds + BITS_PER_TILE - 1) / BITS_PER_TILE;
     return g;

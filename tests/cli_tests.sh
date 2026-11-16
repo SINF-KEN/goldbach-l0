@@ -40,6 +40,8 @@ expect_rc 2 "--start 200 --limit 100 (reversed)" --start 200 --limit 100
 expect_rc 2 "--start 101 --limit 101 (no even)" --start 101 --limit 101
 expect_rc 2 "--start 4000000000000000001 --limit 4000000000000000001" --start 4000000000000000001 --limit 4000000000000000001
 expect_rc 2 "--limit 3 (no even >= 4)" --limit 3
+# n = 4 alone has no odd q: used to wrap q_odds to 2^63 and size the launch from it
+expect_rc 1 "--limit 4 (n = 4 = 2 + 2 only; GPU path needs limit >= 6)" --limit 4
 expect_rc 2 "--start 18446744073709551615 (odd max, wraps when rounded)" --start 18446744073709551615 --limit 18446744073709551615
 expect_rc 2 "--split 4294967296 (> 2^32 - 1)" --split 4294967296 --limit 1e6
 expect_rc 2 "--wheel (removed in v2.3.0)" --wheel --limit 1e6

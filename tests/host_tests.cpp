@@ -1393,12 +1393,15 @@ void test_host_math_segments()
             }
 
     const auto gbp = odd_primes_up_to(MAX_GB_PRIME);
+    for (const uint64_t lim : {4ull, 8ull, 100ull}) {
+        bool threw = false;
+        try { (void)segment_geometry(4, lim, 2, 0); } catch (const std::runtime_error&) { threw = true; }
+        check(threw, "segment_geometry: [4, 4] alone (limit " + std::to_string(lim) + ") throws, no wrapped q_odds");
+    }
     struct Run { uint64_t start, limit, seg; bool cover; };
     const Run runs[] = {
-        // A segment holding n = 4 alone (start 4 with segment 2 and limit >= 8,
-        // or limit 4) has q_last = 1 < q_first = 3 and q_odds wraps to 2^63:
-        // outside segment_geometry's domain, so not tested here (run_gpu
-        // reaches it for --limit 4 / --limit 8; see the hardening notes).
+        // A segment holding n = 4 alone has no odd q: segment_geometry throws
+        // (checked below) and run_gpu never builds one.
         {4, 6, 2, true}, {6, 100, 2, true}, {4, 100, 4, true}, {4, 100, 10, true}, {4, 100, 98, true},
         {4, 9790, 1000, true}, {4, 30000, 9782, true}, {4, 30000, 4096, true},
         {9780, 9800, 4, true}, {9782, 9800, 2, true}, {9784, 9800, 6, true}, {9786, 40000, 7000, true},
