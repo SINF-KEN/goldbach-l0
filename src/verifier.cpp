@@ -268,6 +268,7 @@ struct Segment {
     double args_s = 0.0;
     double l1_s = 0.0;
     double l2_s = 0.0;
+    double enq_s = 0.0, launch_s = 0.0, l3_s = 0.0;
     double table_before = 0.0;
     double prep_s = 0.0;
     clock_::time_point t_seg_wall;
@@ -536,6 +537,12 @@ private:
     void enqueue_buckets(const Segment& sg);
     void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
     void enqueue_bucket_verify(const Segment& sg);
+    void enqueue_check(Segment& sg);
+    void enqueue_count30(const Segment& sg, bool sampled);
+    void enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
+    void enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32);
+    void enqueue_check_split(const Segment& sg, const SplitSeg& sseg, uint32_t ridge_thresh_u32);
+    void enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t ridge_thresh_u32);
     void prepare_segment_tables(Segment& sg);
     void begin_segment(Segment& sg);
 };
@@ -2047,6 +2054,367 @@ void DenseRun::enqueue_bucket_verify(const Segment& sg) {
     }
 }
 
+/// Per-segment step 5: the checker. Sets the twin checker's phase-A
+/// arguments (the fallback), picks this segment's checker (mod-30, class
+/// split, twin), its ridge threshold and statistics sampling, then enqueues
+/// count30 (statistics) and the chosen checker's phases.
+void DenseRun::enqueue_check(Segment& sg) {
+    // --- check_numbers args
+    // Twin checker: phase A reads the twin map with the twin list.
+    const uint32_t twin_count = uint32_t(twin_primes.size());
+    k_check.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
+    k_check.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
+    k_check.set_arg(2, sizeof(b.twin_primes),  &b.twin_primes);
+    k_check.set_arg(3, sizeof(twin_count),     &twin_count);
+    k_check.set_arg(4, sizeof(b.pending[sg.slot]),   &b.pending[sg.slot]);
+    k_check.set_arg(5, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_check.set_arg(6, sizeof(sg.q_first),        &sg.q_first);
+    k_check.set_arg(7, sizeof(sg.q_odds),         &sg.q_odds);
+    k_check.set_arg(8, sizeof(sg.seg_start),      &sg.seg_start);
+    k_check.set_arg(9, sizeof(sg.seg_evens),      &sg.seg_evens);
+    k_check.set_arg(10, sizeof(twin_cap),    &twin_cap);
+    k_check.set_arg(11, sizeof(pending_cap), &pending_cap);
+    const uint32_t twin_u32 = 1u;
+    k_check.set_arg(12, sizeof(twin_u32),    &twin_u32);
+
+    // The check kernel must SEE the completed map from BOTH sieve
+    // kernels (memory visibility, not just execution ordering — see the
+    // barrier note above). Same for the leftover_n fill at the top of
+    // the segment: the check kernel's atomic increments must not race
+    // it. Each check work-item covers 4 x 64 = 256 evens.
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const uint64_t evens_per_a_group = uint64_t(WG_SIZE) * a_w64 * 64;
+    const uint32_t a_groups =
+        uint32_t((sg.seg_evens + evens_per_a_group - 1) / evens_per_a_group);
+    const SplitSeg sseg = split_on ? split_segment(sg.seg_start, sg.seg_evens, sg.q_first, split_plan)
+                                   : SplitSeg{};
+    const Seg30 s30 = c30chk ? seg30(sg.seg_start, sg.seg_evens, sg.q_first) : Seg30{};
+    // Recording threshold: the current Kth largest ridge (ratchets up as
+    // the top list fills; ~0u disables every append).
+    const uint32_t seg_ceiling = s30.ok ? ceil_c30 : sseg.ok ? ceil_split : ceil_fallback;
+    const uint32_t ridge_thresh_u32 =
+        ridges->active() ? std::max(ridges->thresh(), seg_ceiling) : 0xFFFFFFFFu;
+    split_used[sg.slot] = sseg.ok && (!class_mode || c30) && !s30.ok;  // split_map / merge30 timing
+    if (class_mode && (!sseg.ok || (!c30 && (sseg.phi1 != sg.cgeo.phi[0] || sseg.phi5 != sg.cgeo.phi[1]))))
+        throw std::runtime_error("class map: split checker geometry rejected");
+    if (stats_on && !s30.ok)
+        throw std::runtime_error("statistics: segment geometry outside the mod-30 checker");
+    // Every stats_sample-th segment of the run (segment 0 always) gets the
+    // full exact p(n) histogram; the others record the tail in check30_b.
+    const bool sampled = stats_on && stats.segments % stats_sample == 0;
+    sampled_slot[sg.slot] = sampled;
+    slot_evens[sg.slot] = sg.seg_evens;
+    if (sampled) sampled_evens += sg.seg_evens;
+    xs_used[sg.slot] = sampled;
+    if (stats_on) {
+        enqueue_count30(sg, sampled);
+    }
+    if (sampled) {
+        enqueue_check_sampled(sg, s30, ridge_thresh_u32);
+    } else if (s30.ok) {
+        enqueue_check30(sg, s30, ridge_thresh_u32);
+    } else if (sseg.ok) {
+        enqueue_check_split(sg, sseg, ridge_thresh_u32);
+    } else {
+        enqueue_check_twin(sg, a_groups, ridge_thresh_u32);
+    }
+    sg.enq_s = seconds_since(sg.t_enq);
+    sg.launch_s = seconds_since(sg.t_launch0);
+    sg.l3_s = seconds_since(sg.t_launch0);
+}
+
+/// Step 5a (statistics): count30 - prime / twin counts, the gap tail and,
+/// on walked segments, the gap histogram (timed under the splitk event).
+void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
+    // count30 (prime / twin counts; fusing it into check30_a measured
+    // no faster: the larger kernel slows phase A) is timed under the
+    // splitk event (added to check_s).
+    const uint32_t cw32 = 2 * sg.c5w;
+    const std::vector<uint32_t> lim = count30_limits(sg.seg_start, sg.seg_end, sg.cgeo.Q);
+    std::memcpy(b.x_lim[sg.slot], lim.data(), lim.size() * 4);
+    // class order by phase (gap kernels): ord / phis in ascending phi,
+    // phic by class; the smallest counted position
+    uint32_t g_ord = 0, g_phis = 0, g_phic = 0, g_poslo = ~0u;
+    {
+        uint32_t cls[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return sg.cgeo.phi[x] < sg.cgeo.phi[y]; });
+        for (uint32_t k = 0; k < 8; ++k) {
+            g_ord |= cls[k] << (4 * k);
+            g_phis |= sg.cgeo.phi[cls[k]] << (4 * k);
+            g_phic |= sg.cgeo.phi[k] << (4 * k);
+            if (lim[2 * cls[k]] < lim[2 * cls[k] + 1])
+                g_poslo = std::min(g_poslo, 30 * lim[2 * cls[k]] + 2 * sg.cgeo.phi[cls[k]]);
+        }
+    }
+    // count30 also finds every gap >= GAPS30_TAIL (bit-parallel) and the
+    // segment's first / last prime when the gap statistics are on, and
+    // on the walked segments walks every prime (the gap histogram) on a
+    // fixed grid of work-groups (one histogram flush each)
+    const uint32_t ctcap = gaps_on ? GAPS30_TCAP : 0u;
+    walked_slot[sg.slot] = gaps_on && (sampled || gaps_exact);
+    const uint32_t cwalk = walked_slot[sg.slot] ? 1u : 0u;
+    if (cw32 % COUNT30_CW) throw std::runtime_error("count30: class stride not a multiple of its lane width");
+    const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
+    slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
+    slot_qfirst[sg.slot] = sg.q_first;
+    k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_cnt->set_arg(1, 4, &cw32);
+    k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
+    k_cnt->set_arg(3, sizeof(b.x_cnt[sg.slot]), &b.x_cnt[sg.slot]);
+    k_cnt->set_arg(4, 4, &g_ord);
+    k_cnt->set_arg(5, 4, &g_phis);
+    k_cnt->set_arg(6, 4, &g_phic);
+    k_cnt->set_arg(7, 4, &g_poslo);
+    k_cnt->set_arg(8, sizeof(b.g_tail[sg.slot]), &b.g_tail[sg.slot]);
+    k_cnt->set_arg(9, 4, &ctcap);
+    k_cnt->set_arg(10, 4, &cwalk);
+    k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
+    k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
+    k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    split_used[sg.slot] = true;
+}
+
+/// Step 5b (statistics, sampled segment): the full p(n) histogram checker,
+/// check30_xs8/6/4/3 (ascending prefix) -> barrier -> check30_xb.
+void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32) {
+    // Full histogram: check30_xs8/6/4/3 (ascending prefix) -> barrier
+    // -> check30_xb (ascending continuation).
+    const uint32_t cw32 = 2 * sg.c5w;
+    const uint32_t se32 = uint32_t(sg.seg_evens);
+    int first_xs = 0;
+    while (first_xs < 4 && !splan.vn[first_xs]) ++first_xs;
+    for (int v = 0; v < 4; ++v) {      // one launch per array-count variant
+        if (!splan.vn[v]) continue;
+        Kernel& kv = *k_cxs[v];
+        const uint32_t per_item = XS_W_HOST[v] * 32;
+        const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+        kv.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+        kv.set_arg(1, 4, &cw32);
+        kv.set_arg(2, sizeof(b.x_all), &b.x_all);
+        kv.set_arg(3, sizeof(b.x_tab), &b.x_tab);
+        kv.set_arg(4, sizeof(b.x_j), &b.x_j);
+        kv.set_arg(5, sizeof(b.x_ch), &b.x_ch);
+        kv.set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+        kv.set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+        kv.set_arg(8, 4, &pending_cap);
+        kv.set_arg(9, 4, &items_pad);
+        kv.set_arg(10, 4, &se32);
+        kv.set_arg(11, 4, &s30.sm30);
+        kv.set_arg(12, 4, &s30.tb);
+        kv.set_arg(13, 4, &s30.phik);
+        kv.set_arg(14, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
+        kv.set_arg(15, 8, &splan.vcls[v]);
+        // the first variant may overlap count30 (see phase A below)
+        const ze_event_handle_t xe = v == 3 ? ev.checka[sg.slot] : ev.xv[v][sg.slot];
+        if (v == first_xs) kv.launch_overlap(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
+        else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
+    }
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
+    k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
+    k_cxb->set_arg(3, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+    k_cxb->set_arg(4, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_cxb->set_arg(5, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+    k_cxb->set_arg(6, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+    k_cxb->set_arg(7, sizeof(sg.q_first), &sg.q_first);
+    k_cxb->set_arg(8, sizeof(sg.q_odds), &sg.q_odds);
+    k_cxb->set_arg(9, sizeof(sg.seg_start), &sg.seg_start);
+    k_cxb->set_arg(10, 4, &pending_cap);
+    k_cxb->set_arg(11, 4, &sg.ga1);
+    k_cxb->set_arg(12, 4, &sg.ga2);
+    k_cxb->set_arg(13, 4, &sg.off5);
+    k_cxb->set_arg(14, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
+    k_cxb->set_arg(15, 4, &ridge_thresh_u32);
+    k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
+    k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
+    k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
+    k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
+}
+
+/// Step 5c: the mod-30 checker, check30_a -> barrier -> check30_b.
+void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t ridge_thresh_u32) {
+    // Mod-30 checker: phase A on the class arrays -> barrier -> phase B.
+    const uint32_t cw32 = 2 * sg.c5w;
+    const uint32_t per_item = a_w64 * 64;
+    const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+    const uint32_t se32 = uint32_t(sg.seg_evens);
+    k_ca->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_ca->set_arg(1, 4, &cw32);
+    k_ca->set_arg(2, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_ca->set_arg(3, 4, &chk_stride30);
+    k_ca->set_arg(4, sizeof(b.c30_cands), &b.c30_cands);
+    k_ca->set_arg(5, sizeof(b.c30_meta), &b.c30_meta);
+    k_ca->set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+    k_ca->set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_ca->set_arg(8, 4, &pending_cap);
+    k_ca->set_arg(9, 4, &items_pad);
+    k_ca->set_arg(10, 4, &se32);
+    k_ca->set_arg(11, 4, &s30.sm30);
+    k_ca->set_arg(12, 4, &s30.tb);
+    k_ca->set_arg(13, 4, &s30.phik);
+    k_ca->set_arg(14, 4, &split_write_checked);
+    // launch_overlap: phase A may run alongside count30 (both only
+    // read the finished map; the barrier above follows the marks)
+    k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_cb->set_arg(2, 4, &chk_stride30);
+    k_cb->set_arg(3, sizeof(b.c30_rest), &b.c30_rest);
+    k_cb->set_arg(4, sizeof(b.c30_rtab), &b.c30_rtab);
+    k_cb->set_arg(5, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+    k_cb->set_arg(6, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_cb->set_arg(7, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+    k_cb->set_arg(8, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+    k_cb->set_arg(9, sizeof(sg.q_first), &sg.q_first);
+    k_cb->set_arg(10, sizeof(sg.q_odds), &sg.q_odds);
+    k_cb->set_arg(11, sizeof(sg.seg_start), &sg.seg_start);
+    k_cb->set_arg(12, 4, &pending_cap);
+    k_cb->set_arg(13, 4, &split_write_checked);
+    k_cb->set_arg(14, 4, &sg.ga1);
+    k_cb->set_arg(15, 4, &sg.ga2);
+    k_cb->set_arg(16, 4, &sg.off5);
+    k_cb->set_arg(17, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
+    k_cb->set_arg(18, 4, &ridge_thresh_u32);
+    k_cb->set_arg(19, sizeof(b.p_hist[sg.slot]), &b.p_hist[sg.slot]);
+    k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
+    k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
+    k_cb->set_arg(22, 4, &tail_t);
+    k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+}
+
+/// Step 5d: the class-split checker, [split_map / merge30 ->] check_split_a
+/// -> barrier -> check_split_b.
+void DenseRun::enqueue_check_split(const Segment& sg, const SplitSeg& sseg, uint32_t ridge_thresh_u32) {
+    // Class-split checker: [split_map -> barrier ->] phase A -> barrier
+    // -> phase B (same pending / leftover buffers as the twin path).
+    // Class mode: the map IS S1 / S5 (no split_map pass).
+    const uint32_t map32_words = uint32_t(2 * ((sg.q_odds + 63) / 64));
+    uint32_t s_words = std::min<uint32_t>(split_words, (map32_words + 2) / 3 + 1);
+    uint32_t* s1p = b.split_s1[sg.slot];
+    uint32_t* s5p = b.split_s5[sg.slot];
+    if (c30) {
+        // merge30: S1 / S5 from the mod-30 class arrays. j -> class
+        // of residue (Q6 + 6j) mod 30, Q6 = first q of the mod-6 class
+        uint32_t kmap[2] = {0, 0};
+        for (int c = 0; c < 2; ++c) {
+            const uint64_t Q6 = sg.q_first + 2 * uint64_t(c ? sseg.phi5 : sseg.phi1);
+            for (uint32_t j = 0; j < 5; ++j) {
+                const uint32_t r = uint32_t((Q6 + 6 * j) % 30);
+                uint32_t k = 15;
+                for (uint32_t cc = 0; cc < 8; ++cc) if (CLASS_RES30[cc] == r) k = cc;
+                kmap[c] |= k << (4 * j);
+            }
+        }
+        const uint32_t cw32 = 2 * sg.c5w;
+        k_merge->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+        k_merge->set_arg(1, 4, &cw32);
+        k_merge->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
+        k_merge->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
+        k_merge->set_arg(4, 4, &s_words);
+        k_merge->set_arg(5, 4, &kmap[0]);
+        k_merge->set_arg(6, 4, &kmap[1]);
+        // q = 5 is prime but not stored mod 30: keep it in S5 (range bottom)
+        const uint64_t Q65 = sg.q_first + 2 * uint64_t(sseg.phi5);
+        const uint32_t q5_t = (sg.q_first <= 5 && Q65 <= 5) ? uint32_t((5 - Q65) / 6) : ~0u;
+        k_merge->set_arg(7, 4, &q5_t);
+        k_merge->launch(ctx.list(), (2 * ((s_words + 4) / 5) + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
+        ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    } else if (class_mode) {
+        s_words = 2 * sg.c5w;
+        s1p = reinterpret_cast<uint32_t*>(b.prime_map[sg.slot]);
+        s5p = s1p + 2 * size_t(sg.c5w);
+    } else {
+        k_split->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+        k_split->set_arg(1, sizeof(map32_words), &map32_words);
+        k_split->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
+        k_split->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
+        k_split->set_arg(4, sizeof(s_words), &s_words);
+        k_split->set_arg(5, sizeof(sseg.phi1), &sseg.phi1);
+        k_split->set_arg(6, sizeof(sseg.phi5), &sseg.phi5);
+        k_split->launch(ctx.list(), (s_words + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
+        ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    }
+
+    const uint32_t per_item = a_w64 * 64;
+    const uint32_t ec_max = std::max({sseg.ec[0], sseg.ec[1], sseg.ec[2]});
+    const uint32_t items_pad = ((ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+    k_sa->set_arg(0, sizeof(s1p), &s1p);
+    k_sa->set_arg(1, sizeof(s5p), &s5p);
+    k_sa->set_arg(2, sizeof(s_words), &s_words);
+    k_sa->set_arg(3, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_sa->set_arg(4, sizeof(chk_stride), &chk_stride);
+    k_sa->set_arg(5, sizeof(b.split_cands), &b.split_cands);
+    k_sa->set_arg(6, sizeof(b.split_meta), &b.split_meta);
+    k_sa->set_arg(7, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+    k_sa->set_arg(8, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_sa->set_arg(9, sizeof(pending_cap), &pending_cap);
+    k_sa->set_arg(10, sizeof(items_pad), &items_pad);
+    for (uint32_t c = 0; c < 3; ++c) {
+        k_sa->set_arg(11 + c, 4, &sseg.ec[c]);
+        k_sa->set_arg(14 + c, 4, &sseg.e0[c]);
+        k_sa->set_arg(17 + c, 4, &sseg.v[c]);
+    }
+    k_sa->set_arg(20, 4, &split_write_checked);
+    k_sa->launch(ctx.list(), 3 * items_pad / WG_SIZE, ev.checka[sg.slot]);
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+
+    k_sb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_sb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_sb->set_arg(2, sizeof(chk_stride), &chk_stride);
+    k_sb->set_arg(3, sizeof(b.split_rest), &b.split_rest);
+    for (uint32_t c = 0; c < 3; ++c) {
+        k_sb->set_arg(4 + c, 4, &split_plan.roff[c]);
+        k_sb->set_arg(7 + c, 4, &split_plan.rcnt[c]);
+    }
+    k_sb->set_arg(10, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
+    k_sb->set_arg(11, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
+    k_sb->set_arg(12, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
+    k_sb->set_arg(13, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+    k_sb->set_arg(14, sizeof(sg.q_first), &sg.q_first);
+    k_sb->set_arg(15, sizeof(sg.q_odds), &sg.q_odds);
+    k_sb->set_arg(16, sizeof(sg.seg_start), &sg.seg_start);
+    k_sb->set_arg(17, sizeof(pending_cap), &pending_cap);
+    for (uint32_t c = 0; c < 3; ++c) k_sb->set_arg(18 + c, 4, &sseg.e0[c]);
+    k_sb->set_arg(21, 4, &split_write_checked);
+    k_sb->set_arg(22, 4, &cm_u32);
+    k_sb->set_arg(23, 4, &sg.ga1);
+    k_sb->set_arg(24, 4, &sg.ga2);
+    k_sb->set_arg(25, 4, &sg.off5);
+    k_sb->set_arg(26, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
+    k_sb->set_arg(27, 4, &ridge_thresh_u32);
+    k_sb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+}
+
+/// Step 5e: the twin checker (fallback), check_phase_a -> barrier ->
+/// check_phase_b.
+void DenseRun::enqueue_check_twin(const Segment& sg, uint32_t a_groups, uint32_t ridge_thresh_u32) {
+    k_check.launch(ctx.list(), a_groups, ev.checka[sg.slot]);
+    // Phase B consumes phase A's pending list (visibility: barrier).
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    k_check_b.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
+    k_check_b.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
+    // Twin checker: phase B probes the uncovered candidates only.
+    const uint32_t rest_count = uint32_t(rest_primes.size());
+    const bool use_rest = b.rest_primes != nullptr;
+    k_check_b.set_arg(2, sizeof(b.gb_primes),        use_rest ? &b.rest_primes : &b.gb_primes);
+    k_check_b.set_arg(3, sizeof(gb_count),           use_rest ? &rest_count : &gb_count);
+    k_check_b.set_arg(4, sizeof(b.pending[sg.slot]),    &b.pending[sg.slot]);
+    k_check_b.set_arg(5, sizeof(b.pending_n[sg.slot]),  &b.pending_n[sg.slot]);
+    k_check_b.set_arg(6, sizeof(b.leftovers[sg.slot]),  &b.leftovers[sg.slot]);
+    k_check_b.set_arg(7, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
+    k_check_b.set_arg(8, sizeof(sg.q_first),            &sg.q_first);
+    k_check_b.set_arg(9, sizeof(sg.q_odds),             &sg.q_odds);
+    k_check_b.set_arg(10, sizeof(sg.seg_start),         &sg.seg_start);
+    const uint32_t b_from = 0u;   // twin: probe all candidates
+    k_check_b.set_arg(11, sizeof(b_from),            &b_from);
+    k_check_b.set_arg(12, sizeof(pending_cap),       &pending_cap);
+    k_check_b.set_arg(13, sizeof(b.ridge[sg.slot]),     &b.ridge[sg.slot]);
+    k_check_b.set_arg(14, 4, &ridge_thresh_u32);
+    k_check_b.launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -2076,331 +2444,7 @@ RunStats DenseRun::run() {
 
         enqueue_large_primes(sg);
 
-        // --- check_numbers args
-        // Twin checker: phase A reads the twin map with the twin list.
-        const uint32_t twin_count = uint32_t(twin_primes.size());
-        k_check.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
-        k_check.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
-        k_check.set_arg(2, sizeof(b.twin_primes),  &b.twin_primes);
-        k_check.set_arg(3, sizeof(twin_count),     &twin_count);
-        k_check.set_arg(4, sizeof(b.pending[sg.slot]),   &b.pending[sg.slot]);
-        k_check.set_arg(5, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-        k_check.set_arg(6, sizeof(sg.q_first),        &sg.q_first);
-        k_check.set_arg(7, sizeof(sg.q_odds),         &sg.q_odds);
-        k_check.set_arg(8, sizeof(sg.seg_start),      &sg.seg_start);
-        k_check.set_arg(9, sizeof(sg.seg_evens),      &sg.seg_evens);
-        k_check.set_arg(10, sizeof(twin_cap),    &twin_cap);
-        k_check.set_arg(11, sizeof(pending_cap), &pending_cap);
-        const uint32_t twin_u32 = 1u;
-        k_check.set_arg(12, sizeof(twin_u32),    &twin_u32);
-
-        // The check kernel must SEE the completed map from BOTH sieve
-        // kernels (memory visibility, not just execution ordering — see the
-        // barrier note above). Same for the leftover_n fill at the top of
-        // the segment: the check kernel's atomic increments must not race
-        // it. Each check work-item covers 4 x 64 = 256 evens.
-        ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-        const uint64_t evens_per_a_group = uint64_t(WG_SIZE) * a_w64 * 64;
-        const uint32_t a_groups =
-            uint32_t((sg.seg_evens + evens_per_a_group - 1) / evens_per_a_group);
-        const SplitSeg sseg = split_on ? split_segment(sg.seg_start, sg.seg_evens, sg.q_first, split_plan)
-                                       : SplitSeg{};
-        const Seg30 s30 = c30chk ? seg30(sg.seg_start, sg.seg_evens, sg.q_first) : Seg30{};
-        // Recording threshold: the current Kth largest ridge (ratchets up as
-        // the top list fills; ~0u disables every append).
-        const uint32_t seg_ceiling = s30.ok ? ceil_c30 : sseg.ok ? ceil_split : ceil_fallback;
-        const uint32_t ridge_thresh_u32 =
-            ridges->active() ? std::max(ridges->thresh(), seg_ceiling) : 0xFFFFFFFFu;
-        split_used[sg.slot] = sseg.ok && (!class_mode || c30) && !s30.ok;  // split_map / merge30 timing
-        if (class_mode && (!sseg.ok || (!c30 && (sseg.phi1 != sg.cgeo.phi[0] || sseg.phi5 != sg.cgeo.phi[1]))))
-            throw std::runtime_error("class map: split checker geometry rejected");
-        if (stats_on && !s30.ok)
-            throw std::runtime_error("statistics: segment geometry outside the mod-30 checker");
-        // Every stats_sample-th segment of the run (segment 0 always) gets the
-        // full exact p(n) histogram; the others record the tail in check30_b.
-        const bool sampled = stats_on && stats.segments % stats_sample == 0;
-        sampled_slot[sg.slot] = sampled;
-        slot_evens[sg.slot] = sg.seg_evens;
-        if (sampled) sampled_evens += sg.seg_evens;
-        xs_used[sg.slot] = sampled;
-        if (stats_on) {
-            // count30 (prime / twin counts; fusing it into check30_a measured
-            // no faster: the larger kernel slows phase A) is timed under the
-            // splitk event (added to check_s).
-            const uint32_t cw32 = 2 * sg.c5w;
-            const std::vector<uint32_t> lim = count30_limits(sg.seg_start, sg.seg_end, sg.cgeo.Q);
-            std::memcpy(b.x_lim[sg.slot], lim.data(), lim.size() * 4);
-            // class order by phase (gap kernels): ord / phis in ascending phi,
-            // phic by class; the smallest counted position
-            uint32_t g_ord = 0, g_phis = 0, g_phic = 0, g_poslo = ~0u;
-            {
-                uint32_t cls[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-                std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return sg.cgeo.phi[x] < sg.cgeo.phi[y]; });
-                for (uint32_t k = 0; k < 8; ++k) {
-                    g_ord |= cls[k] << (4 * k);
-                    g_phis |= sg.cgeo.phi[cls[k]] << (4 * k);
-                    g_phic |= sg.cgeo.phi[k] << (4 * k);
-                    if (lim[2 * cls[k]] < lim[2 * cls[k] + 1])
-                        g_poslo = std::min(g_poslo, 30 * lim[2 * cls[k]] + 2 * sg.cgeo.phi[cls[k]]);
-                }
-            }
-            // count30 also finds every gap >= GAPS30_TAIL (bit-parallel) and the
-            // segment's first / last prime when the gap statistics are on, and
-            // on the walked segments walks every prime (the gap histogram) on a
-            // fixed grid of work-groups (one histogram flush each)
-            const uint32_t ctcap = gaps_on ? GAPS30_TCAP : 0u;
-            walked_slot[sg.slot] = gaps_on && (sampled || gaps_exact);
-            const uint32_t cwalk = walked_slot[sg.slot] ? 1u : 0u;
-            if (cw32 % COUNT30_CW) throw std::runtime_error("count30: class stride not a multiple of its lane width");
-            const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
-            slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
-            slot_qfirst[sg.slot] = sg.q_first;
-            k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_cnt->set_arg(1, 4, &cw32);
-            k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
-            k_cnt->set_arg(3, sizeof(b.x_cnt[sg.slot]), &b.x_cnt[sg.slot]);
-            k_cnt->set_arg(4, 4, &g_ord);
-            k_cnt->set_arg(5, 4, &g_phis);
-            k_cnt->set_arg(6, 4, &g_phic);
-            k_cnt->set_arg(7, 4, &g_poslo);
-            k_cnt->set_arg(8, sizeof(b.g_tail[sg.slot]), &b.g_tail[sg.slot]);
-            k_cnt->set_arg(9, 4, &ctcap);
-            k_cnt->set_arg(10, 4, &cwalk);
-            k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
-            k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
-            k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
-            split_used[sg.slot] = true;
-        }
-        if (sampled) {
-            // Full histogram: check30_xs8/6/4/3 (ascending prefix) -> barrier
-            // -> check30_xb (ascending continuation).
-            const uint32_t cw32 = 2 * sg.c5w;
-            const uint32_t se32 = uint32_t(sg.seg_evens);
-            int first_xs = 0;
-            while (first_xs < 4 && !splan.vn[first_xs]) ++first_xs;
-            for (int v = 0; v < 4; ++v) {      // one launch per array-count variant
-                if (!splan.vn[v]) continue;
-                Kernel& kv = *k_cxs[v];
-                const uint32_t per_item = XS_W_HOST[v] * 32;
-                const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
-                kv.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-                kv.set_arg(1, 4, &cw32);
-                kv.set_arg(2, sizeof(b.x_all), &b.x_all);
-                kv.set_arg(3, sizeof(b.x_tab), &b.x_tab);
-                kv.set_arg(4, sizeof(b.x_j), &b.x_j);
-                kv.set_arg(5, sizeof(b.x_ch), &b.x_ch);
-                kv.set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-                kv.set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-                kv.set_arg(8, 4, &pending_cap);
-                kv.set_arg(9, 4, &items_pad);
-                kv.set_arg(10, 4, &se32);
-                kv.set_arg(11, 4, &s30.sm30);
-                kv.set_arg(12, 4, &s30.tb);
-                kv.set_arg(13, 4, &s30.phik);
-                kv.set_arg(14, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
-                kv.set_arg(15, 8, &splan.vcls[v]);
-                // the first variant may overlap count30 (see phase A below)
-                const ze_event_handle_t xe = v == 3 ? ev.checka[sg.slot] : ev.xv[v][sg.slot];
-                if (v == first_xs) kv.launch_overlap(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
-                else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
-            }
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
-            k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
-            k_cxb->set_arg(3, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-            k_cxb->set_arg(4, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-            k_cxb->set_arg(5, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
-            k_cxb->set_arg(6, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
-            k_cxb->set_arg(7, sizeof(sg.q_first), &sg.q_first);
-            k_cxb->set_arg(8, sizeof(sg.q_odds), &sg.q_odds);
-            k_cxb->set_arg(9, sizeof(sg.seg_start), &sg.seg_start);
-            k_cxb->set_arg(10, 4, &pending_cap);
-            k_cxb->set_arg(11, 4, &sg.ga1);
-            k_cxb->set_arg(12, 4, &sg.ga2);
-            k_cxb->set_arg(13, 4, &sg.off5);
-            k_cxb->set_arg(14, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
-            k_cxb->set_arg(15, 4, &ridge_thresh_u32);
-            k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
-            k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
-            k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
-            k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
-        } else if (s30.ok) {
-            // Mod-30 checker: phase A on the class arrays -> barrier -> phase B.
-            const uint32_t cw32 = 2 * sg.c5w;
-            const uint32_t per_item = a_w64 * 64;
-            const uint32_t items_pad = ((s30.ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
-            const uint32_t se32 = uint32_t(sg.seg_evens);
-            k_ca->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_ca->set_arg(1, 4, &cw32);
-            k_ca->set_arg(2, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
-            k_ca->set_arg(3, 4, &chk_stride30);
-            k_ca->set_arg(4, sizeof(b.c30_cands), &b.c30_cands);
-            k_ca->set_arg(5, sizeof(b.c30_meta), &b.c30_meta);
-            k_ca->set_arg(6, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-            k_ca->set_arg(7, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-            k_ca->set_arg(8, 4, &pending_cap);
-            k_ca->set_arg(9, 4, &items_pad);
-            k_ca->set_arg(10, 4, &se32);
-            k_ca->set_arg(11, 4, &s30.sm30);
-            k_ca->set_arg(12, 4, &s30.tb);
-            k_ca->set_arg(13, 4, &s30.phik);
-            k_ca->set_arg(14, 4, &split_write_checked);
-            // launch_overlap: phase A may run alongside count30 (both only
-            // read the finished map; the barrier above follows the marks)
-            k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
-            k_cb->set_arg(2, 4, &chk_stride30);
-            k_cb->set_arg(3, sizeof(b.c30_rest), &b.c30_rest);
-            k_cb->set_arg(4, sizeof(b.c30_rtab), &b.c30_rtab);
-            k_cb->set_arg(5, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-            k_cb->set_arg(6, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-            k_cb->set_arg(7, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
-            k_cb->set_arg(8, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
-            k_cb->set_arg(9, sizeof(sg.q_first), &sg.q_first);
-            k_cb->set_arg(10, sizeof(sg.q_odds), &sg.q_odds);
-            k_cb->set_arg(11, sizeof(sg.seg_start), &sg.seg_start);
-            k_cb->set_arg(12, 4, &pending_cap);
-            k_cb->set_arg(13, 4, &split_write_checked);
-            k_cb->set_arg(14, 4, &sg.ga1);
-            k_cb->set_arg(15, 4, &sg.ga2);
-            k_cb->set_arg(16, 4, &sg.off5);
-            k_cb->set_arg(17, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
-            k_cb->set_arg(18, 4, &ridge_thresh_u32);
-            k_cb->set_arg(19, sizeof(b.p_hist[sg.slot]), &b.p_hist[sg.slot]);
-            k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
-            k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
-            k_cb->set_arg(22, 4, &tail_t);
-            k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
-        } else if (sseg.ok) {
-            // Class-split checker: [split_map -> barrier ->] phase A -> barrier
-            // -> phase B (same pending / leftover buffers as the twin path).
-            // Class mode: the map IS S1 / S5 (no split_map pass).
-            const uint32_t map32_words = uint32_t(2 * ((sg.q_odds + 63) / 64));
-            uint32_t s_words = std::min<uint32_t>(split_words, (map32_words + 2) / 3 + 1);
-            uint32_t* s1p = b.split_s1[sg.slot];
-            uint32_t* s5p = b.split_s5[sg.slot];
-            if (c30) {
-                // merge30: S1 / S5 from the mod-30 class arrays. j -> class
-                // of residue (Q6 + 6j) mod 30, Q6 = first q of the mod-6 class
-                uint32_t kmap[2] = {0, 0};
-                for (int c = 0; c < 2; ++c) {
-                    const uint64_t Q6 = sg.q_first + 2 * uint64_t(c ? sseg.phi5 : sseg.phi1);
-                    for (uint32_t j = 0; j < 5; ++j) {
-                        const uint32_t r = uint32_t((Q6 + 6 * j) % 30);
-                        uint32_t k = 15;
-                        for (uint32_t cc = 0; cc < 8; ++cc) if (CLASS_RES30[cc] == r) k = cc;
-                        kmap[c] |= k << (4 * j);
-                    }
-                }
-                const uint32_t cw32 = 2 * sg.c5w;
-                k_merge->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-                k_merge->set_arg(1, 4, &cw32);
-                k_merge->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
-                k_merge->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
-                k_merge->set_arg(4, 4, &s_words);
-                k_merge->set_arg(5, 4, &kmap[0]);
-                k_merge->set_arg(6, 4, &kmap[1]);
-                // q = 5 is prime but not stored mod 30: keep it in S5 (range bottom)
-                const uint64_t Q65 = sg.q_first + 2 * uint64_t(sseg.phi5);
-                const uint32_t q5_t = (sg.q_first <= 5 && Q65 <= 5) ? uint32_t((5 - Q65) / 6) : ~0u;
-                k_merge->set_arg(7, 4, &q5_t);
-                k_merge->launch(ctx.list(), (2 * ((s_words + 4) / 5) + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
-                ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            } else if (class_mode) {
-                s_words = 2 * sg.c5w;
-                s1p = reinterpret_cast<uint32_t*>(b.prime_map[sg.slot]);
-                s5p = s1p + 2 * size_t(sg.c5w);
-            } else {
-                k_split->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-                k_split->set_arg(1, sizeof(map32_words), &map32_words);
-                k_split->set_arg(2, sizeof(b.split_s1[sg.slot]), &b.split_s1[sg.slot]);
-                k_split->set_arg(3, sizeof(b.split_s5[sg.slot]), &b.split_s5[sg.slot]);
-                k_split->set_arg(4, sizeof(s_words), &s_words);
-                k_split->set_arg(5, sizeof(sseg.phi1), &sseg.phi1);
-                k_split->set_arg(6, sizeof(sseg.phi5), &sseg.phi5);
-                k_split->launch(ctx.list(), (s_words + WG_SIZE - 1) / WG_SIZE, ev.splitk[sg.slot]);
-                ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            }
-
-            const uint32_t per_item = a_w64 * 64;
-            const uint32_t ec_max = std::max({sseg.ec[0], sseg.ec[1], sseg.ec[2]});
-            const uint32_t items_pad = ((ec_max + per_item - 1) / per_item + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
-            k_sa->set_arg(0, sizeof(s1p), &s1p);
-            k_sa->set_arg(1, sizeof(s5p), &s5p);
-            k_sa->set_arg(2, sizeof(s_words), &s_words);
-            k_sa->set_arg(3, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
-            k_sa->set_arg(4, sizeof(chk_stride), &chk_stride);
-            k_sa->set_arg(5, sizeof(b.split_cands), &b.split_cands);
-            k_sa->set_arg(6, sizeof(b.split_meta), &b.split_meta);
-            k_sa->set_arg(7, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-            k_sa->set_arg(8, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-            k_sa->set_arg(9, sizeof(pending_cap), &pending_cap);
-            k_sa->set_arg(10, sizeof(items_pad), &items_pad);
-            for (uint32_t c = 0; c < 3; ++c) {
-                k_sa->set_arg(11 + c, 4, &sseg.ec[c]);
-                k_sa->set_arg(14 + c, 4, &sseg.e0[c]);
-                k_sa->set_arg(17 + c, 4, &sseg.v[c]);
-            }
-            k_sa->set_arg(20, 4, &split_write_checked);
-            k_sa->launch(ctx.list(), 3 * items_pad / WG_SIZE, ev.checka[sg.slot]);
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-
-            k_sb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-            k_sb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
-            k_sb->set_arg(2, sizeof(chk_stride), &chk_stride);
-            k_sb->set_arg(3, sizeof(b.split_rest), &b.split_rest);
-            for (uint32_t c = 0; c < 3; ++c) {
-                k_sb->set_arg(4 + c, 4, &split_plan.roff[c]);
-                k_sb->set_arg(7 + c, 4, &split_plan.rcnt[c]);
-            }
-            k_sb->set_arg(10, sizeof(b.pending[sg.slot]), &b.pending[sg.slot]);
-            k_sb->set_arg(11, sizeof(b.pending_n[sg.slot]), &b.pending_n[sg.slot]);
-            k_sb->set_arg(12, sizeof(b.leftovers[sg.slot]), &b.leftovers[sg.slot]);
-            k_sb->set_arg(13, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
-            k_sb->set_arg(14, sizeof(sg.q_first), &sg.q_first);
-            k_sb->set_arg(15, sizeof(sg.q_odds), &sg.q_odds);
-            k_sb->set_arg(16, sizeof(sg.seg_start), &sg.seg_start);
-            k_sb->set_arg(17, sizeof(pending_cap), &pending_cap);
-            for (uint32_t c = 0; c < 3; ++c) k_sb->set_arg(18 + c, 4, &sseg.e0[c]);
-            k_sb->set_arg(21, 4, &split_write_checked);
-            k_sb->set_arg(22, 4, &cm_u32);
-            k_sb->set_arg(23, 4, &sg.ga1);
-            k_sb->set_arg(24, 4, &sg.ga2);
-            k_sb->set_arg(25, 4, &sg.off5);
-            k_sb->set_arg(26, sizeof(b.ridge[sg.slot]), &b.ridge[sg.slot]);
-            k_sb->set_arg(27, 4, &ridge_thresh_u32);
-            k_sb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
-        } else {
-            k_check.launch(ctx.list(), a_groups, ev.checka[sg.slot]);
-            // Phase B consumes phase A's pending list (visibility: barrier).
-            ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-            k_check_b.set_arg(0, sizeof(b.prime_map[sg.slot]),  &b.prime_map[sg.slot]);
-            k_check_b.set_arg(1, sizeof(b.checked[sg.slot]),    &b.checked[sg.slot]);
-            // Twin checker: phase B probes the uncovered candidates only.
-            const uint32_t rest_count = uint32_t(rest_primes.size());
-            const bool use_rest = b.rest_primes != nullptr;
-            k_check_b.set_arg(2, sizeof(b.gb_primes),        use_rest ? &b.rest_primes : &b.gb_primes);
-            k_check_b.set_arg(3, sizeof(gb_count),           use_rest ? &rest_count : &gb_count);
-            k_check_b.set_arg(4, sizeof(b.pending[sg.slot]),    &b.pending[sg.slot]);
-            k_check_b.set_arg(5, sizeof(b.pending_n[sg.slot]),  &b.pending_n[sg.slot]);
-            k_check_b.set_arg(6, sizeof(b.leftovers[sg.slot]),  &b.leftovers[sg.slot]);
-            k_check_b.set_arg(7, sizeof(b.leftover_n[sg.slot]), &b.leftover_n[sg.slot]);
-            k_check_b.set_arg(8, sizeof(sg.q_first),            &sg.q_first);
-            k_check_b.set_arg(9, sizeof(sg.q_odds),             &sg.q_odds);
-            k_check_b.set_arg(10, sizeof(sg.seg_start),         &sg.seg_start);
-            const uint32_t b_from = 0u;   // twin: probe all candidates
-            k_check_b.set_arg(11, sizeof(b_from),            &b_from);
-            k_check_b.set_arg(12, sizeof(pending_cap),       &pending_cap);
-            k_check_b.set_arg(13, sizeof(b.ridge[sg.slot]),     &b.ridge[sg.slot]);
-            k_check_b.set_arg(14, 4, &ridge_thresh_u32);
-            k_check_b.launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
-        }
-        const double enq_s = seconds_since(sg.t_enq);
-        const double launch_s = seconds_since(sg.t_launch0);
-        const double l3_s = seconds_since(sg.t_launch0);
+        enqueue_check(sg);
 
         // ---- Collect the PREVIOUS segment's results (other slot) ----------
         // The host blocks here only after the next segment's work is already
@@ -2458,11 +2502,11 @@ RunStats DenseRun::run() {
             coll_s = seconds_since(t_coll);
         }
         sum_prep += sg.prep_s;
-        sum_enq += enq_s;
+        sum_enq += sg.enq_s;
         sum_wait += wait_s;
         sum_coll += coll_s;
         sum_args += sg.args_s;
-        sum_launch += launch_s;
+        sum_launch += sg.launch_s;
         if (phase_trace) {
             std::fprintf(stderr,
                 "  phase seg %llu: prep %.1f ms (off %.1f tab %.1f)  enq %.1f ms "
@@ -2470,8 +2514,8 @@ RunStats DenseRun::run() {
                 (unsigned long long)stats.segments,
                 sg.prep_s * 1e3, offset_seconds - sg.offset_before,
                 (table_seconds - sg.table_before) * 1e3,
-                enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (sg.l2_s - sg.l1_s) * 1e3,
-                (l3_s - sg.l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
+                sg.enq_s * 1e3, sg.args_s * 1e3, sg.l1_s * 1e3, (sg.l2_s - sg.l1_s) * 1e3,
+                (sg.l3_s - sg.l2_s) * 1e3, wait_s * 1e3, coll_s * 1e3);
         }
 
         prev_seg_start = sg.seg_start;
