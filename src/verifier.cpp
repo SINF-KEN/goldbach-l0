@@ -469,6 +469,33 @@ private:
     SlotEvents ev;
 
     void create_events();
+
+    // ---- begin_segment_loop: run-wide loop state -----------------------------------
+    clock_::time_point t_gpu;
+    uint64_t total_leftovers = 0;
+    double sieve_seconds = 0.0, large_seconds = 0.0;
+    double verify_seconds = 0.0, offset_seconds = 0.0, table_seconds = 0.0;
+    uint64_t prev_seg_start = 0;  // first even n of the previously enqueued segment
+    uint64_t prev_seg_evens = 0;  // its even count (leftover index bound)
+    // Carried from the last ENQUEUED segment to the iteration that collects
+    // it (one slot behind): host wall time inside that iteration and its
+    // host offset-generation share.
+    double prev_seg_wall = 0.0, prev_seg_offsets = 0.0;
+    double timer_hz = 0.0;           // device timer resolution
+    // Per-segment record for the segment currently being enqueued, plus the
+    // completed record of the segment enqueued one iteration earlier.
+    SegmentStats seg_stat, prev_stat;
+    uint64_t sum_tiles = 0, sum_large_items = 0;
+    bool phase_trace = false;        // GB_PHASE
+    bool hl_used[2] = {false, false};   // slot's segment launched a harvest (timing)
+    std::vector<uint64_t> fb_host;   // per-segment first bits (class mode: persistent)
+    double sum_prep = 0.0, sum_enq = 0.0, sum_wait = 0.0, sum_coll = 0.0;
+    double sum_args = 0.0, sum_launch = 0.0;
+    bool split_used[2] = {false, false};   // slot's segment ran the split checker
+    bool xs_used[2] = {false, false};      // slot's segment ran check30_xs8..3 (4 launches)
+
+    void begin_segment_loop();
+    bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1401,6 +1428,94 @@ void DenseRun::create_events() {
     stats.init_upload_s = seconds_since(t_upload);
 }
 
+/// Phase 11: the segment loop's run-wide state (timers, sums, carry-over of
+/// the previous segment, device timer resolution, GB_PHASE).
+void DenseRun::begin_segment_loop() {
+    // ------------------------------------------------------ Segment loop --
+    t_gpu = clock_::now();
+    total_leftovers = 0;
+    prev_seg_start = 0;  // first even n of the previously enqueued segment
+    prev_seg_evens = 0;  // its even count (leftover index bound)
+    // Carried from the last ENQUEUED segment to the iteration that collects
+    // it (one slot behind): host wall time inside that iteration and its
+    // host offset-generation share. Stored here because collection happens
+    // one pipeline slot after enqueue.
+
+    // Device timer resolution (1.2 stype; base struct returns garbage).
+    ze_device_properties_t dev_props{};
+    dev_props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2;
+    zeDeviceGetProperties(ctx.device(), &dev_props);
+    timer_hz = double(dev_props.timerResolution);
+
+    // Per-segment record for the segment currently being enqueued, plus the
+    // completed record of the segment enqueued one iteration earlier (its
+    // GPU timestamps become readable only when the NEXT iteration collects
+    // it, by which time seg_stat has been reused for the newer segment).
+    if (collect_segments) stats.per_segment.reserve(64);
+
+    // Env-gated host-phase trace (GB_PHASE=1): per-segment wall time split
+    // into prep (first-bits / table / masks), enqueue (args + resets +
+    // launches), wait (ev_check host sync) and collect (timestamp queries +
+    // leftover read). Printed to stderr; overhead is a few clock reads per
+    // segment and the gate defaults to off.
+    phase_trace = env::present("GB_PHASE");
+    fb_host.resize(class_mode ? size_t(ncls_map) * sieve_split : 0);   // per-segment first bits
+}
+
+/// Query the per-kernel GPU timestamps of the given slot: the sieve, large
+/// and check kernels SET ds / dl / dv, the extra kernels of a phase are
+/// ADDED to them. Returns true when one of the three yielded a valid
+/// timestamp. A kernel is skipped when the device clock reports
+/// end <= start (kernel_seconds: anomalies seen on some driver builds).
+/// With GB_PHASE=1, also log raw start/end ticks per segment so kernel
+/// overlap (or its absence) can be verified directly.
+bool DenseRun::query_slot(uint32_t slot, double& ds, double& dl, double& dv) {
+    bool any = false;
+    if (const auto t = kernel_seconds(ev.sieve[slot], timer_hz)) { ds = *t; any = true; }
+    if (const auto t = kernel_seconds(ev.large[slot], timer_hz)) { dl = *t; any = true; }
+    if (const auto t = kernel_seconds(ev.check[slot], timer_hz)) { dv = *t; any = true; }
+    if (hl_used[slot])   // large_s also counts the hit-list harvest
+        if (const auto t = kernel_seconds(ev.hl[slot], timer_hz)) {
+            dl += *t;
+            if (phase_trace) std::fprintf(stderr, "    hl_harvest %.3f ms\n", *t * 1e3);
+        }
+    if (bucket_on && !hl_fuse)   // large_s = packed kernel + bucket_process
+        if (const auto t = kernel_seconds(ev.bucket[slot], timer_hz)) {
+            dl += *t;
+            if (phase_trace)
+                std::fprintf(stderr, "    bucket_process %.3f ms (large total %.3f ms)\n",
+                             *t * 1e3, dl * 1e3);
+        }
+    // check_s = phase A + phase B (+ split_map)
+    if (const auto t = kernel_seconds(ev.checka[slot], timer_hz)) {
+        dv += *t;
+        if (phase_trace) std::fprintf(stderr, "    phase_a %.3f ms\n", *t * 1e3);
+    }
+    for (int v = 0; v < 3 && xs_used[slot]; ++v)
+        if (const auto t = kernel_seconds(ev.xv[v][slot], timer_hz)) {
+            dv += *t;
+            if (phase_trace) std::fprintf(stderr, "    phase_a variant %d %.3f ms\n", v, *t * 1e3);
+        }
+    if (split_used[slot])
+        if (const auto t = kernel_seconds(ev.splitk[slot], timer_hz)) {
+            dv += *t;
+            if (phase_trace) std::fprintf(stderr, "    split_map %.3f ms\n", *t * 1e3);
+        }
+    if (phase_trace)
+        if (const auto s = kernel_ticks(ev.sieve[slot]), l = kernel_ticks(ev.large[slot]),
+                       c = kernel_ticks(ev.check[slot]);
+            s && l && c)
+            std::fprintf(stderr,
+                "    ticks: sieve[%lld..%lld] large[%lld..%lld] check[%lld..%lld] "
+                "gap_s->l %+.1f ms gap_l->c %+.1f ms\n",
+                (long long)s->kernelStart, (long long)s->kernelEnd,
+                (long long)l->kernelStart, (long long)l->kernelEnd,
+                (long long)c->kernelStart, (long long)c->kernelEnd,
+                (double(int64_t(l->kernelStart) - int64_t(s->kernelEnd)) / timer_hz) * 1e3,
+                (double(int64_t(c->kernelStart) - int64_t(l->kernelEnd)) / timer_hz) * 1e3);
+    return any;
+}
+
 RunStats DenseRun::run() {
     // ------------------------------------------------ Level Zero setup ----
     // (ctx, mod and the first four kernels: DenseRun's member initializers)
@@ -1418,99 +1533,7 @@ RunStats DenseRun::run() {
 
     create_events();
 
-    // ------------------------------------------------------ Segment loop --
-    const auto t_gpu = clock_::now();
-    uint64_t total_leftovers = 0;
-    double sieve_seconds = 0.0, large_seconds = 0.0;
-    double verify_seconds = 0.0, offset_seconds = 0.0, table_seconds = 0.0;
-    uint64_t prev_seg_start = 0;  // first even n of the previously enqueued segment
-    uint64_t prev_seg_evens = 0;  // its even count (leftover index bound)
-    // Carried from the last ENQUEUED segment to the iteration that collects
-    // it (one slot behind): host wall time inside that iteration and its
-    // host offset-generation share. Stored here because collection happens
-    // one pipeline slot after enqueue.
-    double prev_seg_wall = 0.0, prev_seg_offsets = 0.0;
-
-    // Device timer resolution (1.2 stype; base struct returns garbage).
-    ze_device_properties_t dev_props{};
-    dev_props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2;
-    zeDeviceGetProperties(ctx.device(), &dev_props);
-    const double timer_hz = double(dev_props.timerResolution);
-
-    // Per-segment record for the segment currently being enqueued, plus the
-    // completed record of the segment enqueued one iteration earlier (its
-    // GPU timestamps become readable only when the NEXT iteration collects
-    // it, by which time seg_stat has been reused for the newer segment).
-    SegmentStats seg_stat, prev_stat;
-    uint64_t sum_tiles = 0, sum_large_items = 0;
-    if (collect_segments) stats.per_segment.reserve(64);
-
-    // Env-gated host-phase trace (GB_PHASE=1): per-segment wall time split
-    // into prep (first-bits / table / masks), enqueue (args + resets +
-    // launches), wait (ev_check host sync) and collect (timestamp queries +
-    // leftover read). Printed to stderr; overhead is a few clock reads per
-    // segment and the gate defaults to off.
-    const bool phase_trace = env::present("GB_PHASE");
-    bool hl_used[2] = {false, false};   // slot's segment launched a harvest (timing)
-    std::vector<uint64_t> fb_host(class_mode ? size_t(ncls_map) * sieve_split : 0);   // per-segment first bits
-    double sum_prep = 0.0, sum_enq = 0.0, sum_wait = 0.0, sum_coll = 0.0;
-    double sum_args = 0.0, sum_launch = 0.0;
-    bool split_used[2] = {false, false};   // slot's segment ran the split checker
-    bool xs_used[2] = {false, false};      // slot's segment ran check30_xs8..3 (4 launches)
-
-    // Query the per-kernel GPU timestamps of the given slot: the sieve, large
-    // and check kernels SET ds / dl / dv, the extra kernels of a phase are
-    // ADDED to them. Returns true when one of the three yielded a valid
-    // timestamp. A kernel is skipped when the device clock reports
-    // end <= start (kernel_seconds: anomalies seen on some driver builds).
-    // With GB_PHASE=1, also log raw start/end ticks per segment so kernel
-    // overlap (or its absence) can be verified directly.
-    const auto query_slot = [&](uint32_t slot, double& ds, double& dl, double& dv) {
-        bool any = false;
-        if (const auto t = kernel_seconds(ev.sieve[slot], timer_hz)) { ds = *t; any = true; }
-        if (const auto t = kernel_seconds(ev.large[slot], timer_hz)) { dl = *t; any = true; }
-        if (const auto t = kernel_seconds(ev.check[slot], timer_hz)) { dv = *t; any = true; }
-        if (hl_used[slot])   // large_s also counts the hit-list harvest
-            if (const auto t = kernel_seconds(ev.hl[slot], timer_hz)) {
-                dl += *t;
-                if (phase_trace) std::fprintf(stderr, "    hl_harvest %.3f ms\n", *t * 1e3);
-            }
-        if (bucket_on && !hl_fuse)   // large_s = packed kernel + bucket_process
-            if (const auto t = kernel_seconds(ev.bucket[slot], timer_hz)) {
-                dl += *t;
-                if (phase_trace)
-                    std::fprintf(stderr, "    bucket_process %.3f ms (large total %.3f ms)\n",
-                                 *t * 1e3, dl * 1e3);
-            }
-        // check_s = phase A + phase B (+ split_map)
-        if (const auto t = kernel_seconds(ev.checka[slot], timer_hz)) {
-            dv += *t;
-            if (phase_trace) std::fprintf(stderr, "    phase_a %.3f ms\n", *t * 1e3);
-        }
-        for (int v = 0; v < 3 && xs_used[slot]; ++v)
-            if (const auto t = kernel_seconds(ev.xv[v][slot], timer_hz)) {
-                dv += *t;
-                if (phase_trace) std::fprintf(stderr, "    phase_a variant %d %.3f ms\n", v, *t * 1e3);
-            }
-        if (split_used[slot])
-            if (const auto t = kernel_seconds(ev.splitk[slot], timer_hz)) {
-                dv += *t;
-                if (phase_trace) std::fprintf(stderr, "    split_map %.3f ms\n", *t * 1e3);
-            }
-        if (phase_trace)
-            if (const auto s = kernel_ticks(ev.sieve[slot]), l = kernel_ticks(ev.large[slot]),
-                           c = kernel_ticks(ev.check[slot]);
-                s && l && c)
-                std::fprintf(stderr,
-                    "    ticks: sieve[%lld..%lld] large[%lld..%lld] check[%lld..%lld] "
-                    "gap_s->l %+.1f ms gap_l->c %+.1f ms\n",
-                    (long long)s->kernelStart, (long long)s->kernelEnd,
-                    (long long)l->kernelStart, (long long)l->kernelEnd,
-                    (long long)c->kernelStart, (long long)c->kernelEnd,
-                    (double(int64_t(l->kernelStart) - int64_t(s->kernelEnd)) / timer_hz) * 1e3,
-                    (double(int64_t(c->kernelStart) - int64_t(l->kernelEnd)) / timer_hz) * 1e3);
-        return any;
-    };
+    begin_segment_loop();
 
     for (uint64_t seg_start = start_even; seg_start <= limit; seg_start += segment_even) {
         const SegmentGeometry g = segment_geometry(seg_start, limit, segment_even,
