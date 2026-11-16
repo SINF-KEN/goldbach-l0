@@ -70,6 +70,8 @@ goldbach-l0/
 ├── build.sh                cmake configure + build
 ├── include/
 │   ├── config.hpp          tuning constants and VERSION (see §4)
+│   ├── env.hpp             strict GB_* environment parsing (§7)
+│   ├── host_math.hpp       pure host math of the dense pipeline (§8)
 │   ├── l0_context.hpp      RAII Level Zero wrappers + ZE_CHECK
 │   ├── primes.hpp          prime lists, cache view, mask tables, Miller-Rabin
 │   ├── verifier.hpp        RunStats / SegmentStats, run_gpu, verify_cpu
@@ -81,7 +83,8 @@ goldbach-l0/
 │   ├── main.cpp            CLI + human / --csv / --json / --per-seg output
 │   ├── l0_context.cpp      Context (immediate in-order list), Module, Kernel
 │   ├── primes.cpp          segmented sieve, GBPR cache, masks, Miller-Rabin
-│   ├── verifier.cpp        run_gpu (dense pipeline), verify_cpu, device info
+│   ├── verifier.cpp        run_gpu (dense pipeline: RunSetup / DenseRun phases), verify_cpu, device info
+│   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
 │   └── sparse.cpp          run_gpu_sparse
 ├── kernels/
 │   ├── goldbach.cl         dense kernels: make_prime_map, sieve_large_packed,
@@ -279,6 +282,19 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 --------------------------------------------------------------------------
 ## 8. Pipeline (src/verifier.cpp `run_gpu`)
 
+`run_gpu` builds a `DenseRun` (src/verifier.cpp). `RunSetup` resolves the
+range and loads the base primes without touching the device; `DenseRun::run`
+then calls, in order: `configure_checkers`, `configure_ridges_and_stats`,
+`set_group_sizes`, `size_buffers`, `allocate_slot_buffers`,
+`size_bucket_ring_and_hitlists`, `allocate_large_prime_buffers`,
+`upload_tables`, `pack_stats_buffers`, `create_events`, `segment_loop`
+(per segment: `begin_segment`, `prepare_segment_tables`, `enqueue_sieve`,
+`enqueue_large_primes`, `enqueue_check`, `collect_previous_segment`,
+`end_iteration`; then `drain_final_segment`), `assemble_run_stats`,
+`release_device_objects`. The pure math those phases use (segment geometry,
+first-bit and tile tables, reciprocals, packed primes) is in
+include/host_math.hpp, tested against brute force by host_tests.
+
 ```
 CPU setup: base primes to sqrt(limit) via mmap'd GBPR cache (segmented
            sieve on miss); goldbach candidates p<=9781 as u16; magic
@@ -343,7 +359,7 @@ reset).
   - TABLE path (use_table=1, production): host precomputed
     `tile_first[tile*split + j]` (u32, 0xffffffff = none) so the kernel
     does NO 64-bit math; p < TILE_BITS jumps to my range with an exact
-    32-bit reciprocal (d < 2^19 proven in ms32 comment, verifier.cpp);
+    32-bit reciprocal (d < 2^17 = BITS_PER_TILE: `build_tile_reciprocals32`, include/host_math.hpp; exhaustive host test);
     p >= TILE_BITS has at most one mark, range-check only. Loads are
     software-pipelined in TABLE_BATCH=8 batches (latency-bound broadcast
     loads; two live batches = 16 loads in flight).

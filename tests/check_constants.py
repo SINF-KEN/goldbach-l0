@@ -117,6 +117,8 @@ def main():
     same("MAX_MASK_GROUPS (verifier.cpp)", int(mg.group(1)), gbl["MAX_MASK_GROUPS"])
     rmax = re.search(r"bucket_R\s*>\s*(\d+)", read("src/verifier.cpp"))
     same("bucket ring limit / BKT_MAX_R", int(rmax.group(1)), gbl["BKT_MAX_R"])
+    hk = re.search(r"HL_MAX_K_HOST\s*=\s*(\d+)", read("src/verifier.cpp"))
+    same("HL_MAX_K_HOST (verifier.cpp) / HL_MAX_K", int(hk.group(1)), gbl["HL_MAX_K"])
 
     print("sparse.hpp <-> kernels/sparse.cl")
     sp = host_constants("include/sparse.hpp")
