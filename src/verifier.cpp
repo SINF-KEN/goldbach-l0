@@ -265,7 +265,19 @@ struct RunSetup {
              const char* prime_cache_path_, bool collect_segments_)
         : limit(limit_), segment_even(segment_even_), spv_path(spv_path_),
           verbose(verbose_), start_even(start_even_), sieve_split_arg(sieve_split_arg_),
-          prime_cache_path(prime_cache_path_), collect_segments(collect_segments_) {}
+          prime_cache_path(prime_cache_path_), collect_segments(collect_segments_) {
+        resolve_range();
+    }
+
+    // ---- resolve_range ----------------------------------------------------
+    uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS
+    uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
+    uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
+    RunStats stats;
+    clock_::time_point t_start;
+    uint64_t total_evens = 0;        // evens in [start_even, limit]
+
+    void resolve_range();
 };
 
 class DenseRun : RunSetup {
@@ -274,7 +286,10 @@ public:
     RunStats run();
 };
 
-RunStats DenseRun::run() {
+/// Phase 1: validates and clamps the range and segment span (run_gpu's
+/// preconditions; the n = 4 fail-closed rule) and reads the grid-stride
+/// work-group counts. No Level Zero call.
+void RunSetup::resolve_range() {
     if (limit < 4) throw std::runtime_error("limit < 4: no even n >= 4 to verify");
     gb::require_supported_limit(limit);
     // The last even n is limit rounded down (as run_gpu_sparse does). An odd
@@ -285,12 +300,11 @@ RunStats DenseRun::run() {
     // Grid-stride work-group counts, validated before any GPU work: env_grid
     // refuses 0, which would skip phase B (pending evens never checked) or the
     // hit-list / bucket marks (composites left "prime") and still PASS.
-    const uint32_t phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK_PHASE_B_GROUPS);
-    const uint32_t stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
-    const uint32_t bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
-    RunStats stats;
+    phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK_PHASE_B_GROUPS);
+    stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
+    bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
     stats.limit = limit;
-    const auto t_start = clock_::now();
+    t_start = clock_::now();
 
     // Scale-test entry point: verify [start, limit] instead of [4, limit].
     // Clamp to an even value >= 4 and below limit.
@@ -303,7 +317,7 @@ RunStats DenseRun::run() {
     // Guarantee at least two segments so the two-slot pipeline overlaps host
     // enqueue with GPU execution even for small runs (one giant segment gives
     // the driver a single huge launch and no overlap at all).
-    const uint64_t total_evens = (limit - start_even) / 2 + 1;
+    total_evens = (limit - start_even) / 2 + 1;
     // segment_even is an integer span, so it covers segment_even/2 evens.
     if (segment_even > total_evens)
         segment_even = std::max<uint64_t>(total_evens & ~uint64_t(1), 2);
@@ -316,7 +330,9 @@ RunStats DenseRun::run() {
                                      "odd-prime partition; --cpu-check 4 verifies it)");
         segment_even = std::max<uint64_t>(segment_even, 4);
     }
+}
 
+RunStats DenseRun::run() {
     // ------------------------------------------------ CPU-side setup ------
     // Base primes for the segmented sieve: need p <= sqrt(max q) = sqrt(limit).
     // Segmented generator: O(block) memory instead of O(sqrt(limit)) — the
@@ -2282,7 +2298,7 @@ RunStats DenseRun::run() {
     Context::free_mem(ctx.context(), b.shifts);
     Context::free_mem(ctx.context(), b.ms32);
 
-    return stats;
+    return std::move(stats);   // a member now: move, not copy
 }
 
 } // namespace
