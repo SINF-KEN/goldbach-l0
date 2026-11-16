@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .bench import benchmark_session
 from .build import build_release
-from .core import BENCH_PROFILES, FINAL, ROOT, STATE, UNIT, cfg, flock, git, load_json, log, now_iso, save_json, stamp
+from .core import BENCH_PROFILES, FINAL, ROOT, STATE, UNIT, cfg, flock, git, load_json, log, log_exc, now_iso, save_json, stamp
 from .daemon import poll_once, recover
 from .gpustack import GPU_STACK_FAILED, gpu_stack
 from .ledger import candidates, ledger, ledger_append, list_refs, mark_seen, queue_edit
@@ -112,8 +112,8 @@ def cmd_daemon(a):
                 else:
                     try:
                         poll_once()
-                    except Exception as e:
-                        log(f"daemon: poll {type(e).__name__}: {e}")
+                    except Exception as e:  # the daemon outlives any one poll; the next one retries
+                        log_exc(f"daemon: poll {type(e).__name__}: {e}", key="daemon-poll")
             time.sleep(cfg()["poll_s"])
 
 

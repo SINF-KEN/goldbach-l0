@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent      # ci/gbci/core.py -> the checkout
@@ -114,6 +115,22 @@ def log(msg):
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / "ci.log", "a") as f:
         f.write(line + "\n")
+
+
+_last_tb = {}
+
+
+def log_exc(line, key=None):
+    """log(line), then the traceback of the exception being handled. With a
+    key, a traceback identical to that key's previous one is not repeated
+    (the daemon hitting the same error on every poll); line still is."""
+    tb = traceback.format_exc().rstrip()
+    if key is not None:
+        if _last_tb.get(key) == tb:
+            log(line + " (same traceback as before)")
+            return
+        _last_tb[key] = tb
+    log(line + "\n" + tb)
 
 
 def load_json(p, default):

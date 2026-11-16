@@ -9,7 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .core import ROOT, RUN_RANGE, STATE, UNIT, cfg, log, save_json, set_phase
+from .core import ROOT, RUN_RANGE, STATE, UNIT, cfg, log, log_exc, save_json, set_phase
 from .journal import chain_next, journal_audit, median_slice_wall, read_journal
 from .prodstate import find_run_range, pgrep, prod_conf, prod_live, prod_paths, save_prod_conf
 from .releases import active_release, release_meta
@@ -230,7 +230,7 @@ def production_paused(reason, state=None):
                 set_phase(state, "resume_production")
             try:
                 info.update(start_production())
-            except Exception as e:
+            except Exception as e:      # whatever failed: record, log, alert; never mask the body's outcome
                 info["resume_error"] = str(e)
-                log(f"could NOT resume production: {e}")
+                log_exc(f"could NOT resume production: {e}")
                 alert("CI could not resume run_range", str(e))

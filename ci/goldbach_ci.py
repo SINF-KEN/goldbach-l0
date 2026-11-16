@@ -71,7 +71,8 @@ from gbci.cli import (cmd_benchmark, cmd_bootstrap, cmd_count_check, cmd_daemon,
 from gbci.core import (BENCH, BENCH_PROFILES, DEFAULTS, EXACT_CSV, FINAL, GPU_LOCK, NOTIFY_ENV,  # noqa: E402,F401
                        ON_ACTIONS, RESULT_COLS, ROOT, RUN_RANGE, STATE, STATS_NEW_OK, STATS_STATEFUL, TIMING_KEYS,
                        UNIT, WATERFALL, CIFail, cfg, csv_header, csv_rows, flock, git, hms, is_ancestor, killpg, kv,
-                       load_json, log, now_iso, plot_python, read_lines, save_json, set_phase, sh, stamp)
+                       load_json, log, log_exc, now_iso, plot_python, read_lines, save_json, set_phase, sh,
+                       stamp)
 from gbci.daemon import poll_once, recover  # noqa: E402,F401
 from gbci.gates import ci_figures, compare, isolated_env, ref_key, run_bench, run_slice  # noqa: E402,F401
 from gbci.gpustack import (GPU_STACK_FAILED, GPU_STACK_PKGS, gpu_stack, gpu_stack_change,  # noqa: E402,F401

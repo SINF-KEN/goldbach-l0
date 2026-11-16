@@ -88,7 +88,7 @@ def benchmark_session(out_dir, profile="full", pause=True, state=None):
         for label, commit in c["bench_history"].items():
             try:
                 sel.append((label, {}, history_build(label, commit, logf)))
-            except Exception as e:
+            except (RuntimeError, OSError) as e:     # sh / git (check=True), worktree files
                 log(f"benchmark: history build {label} failed: {e}")
 
     def arm(label, env, d):

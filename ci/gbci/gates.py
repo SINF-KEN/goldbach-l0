@@ -13,7 +13,7 @@ import sys
 import time
 
 from .core import (BENCH, EXACT_CSV, NOTIFY_ENV, ROOT, STATS_NEW_OK, STATS_STATEFUL, WATERFALL, cfg,
-                   csv_header, csv_rows, killpg, kv, log, plot_python, sh)
+                   csv_header, csv_rows, killpg, kv, log_exc, plot_python, sh)
 from .journal import stats_line
 
 
@@ -154,6 +154,6 @@ def ci_figures(run_dir, slices):
                         "--label", "active,cand", "--per", "1e10", "-o", png], logf=run_dir / "figures.log", timeout=300)
             if rc == 0 and png.exists():
                 figs.append(png.name)
-    except Exception as e:
-        log(f"figures: {type(e).__name__}: {e}")
+    except Exception as e:     # figures are cosmetic: no figure must ever change a verdict
+        log_exc(f"figures: {type(e).__name__}: {e}")
     return figs

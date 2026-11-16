@@ -6,7 +6,7 @@ import time
 from .bench import benchmark_session
 from .build import build_release
 from .core import (EXACT_CSV, GPU_LOCK, NOTIFY_ENV, STATE, TIMING_KEYS, CIFail, cfg, flock, git, is_ancestor,
-                   load_json, log, now_iso, save_json, set_phase, sh, stamp)
+                   load_json, log, log_exc, now_iso, save_json, set_phase, sh, stamp)
 from .gates import ci_figures, compare, ref_key, run_bench, run_slice
 from .gpustack import GPU_STACK_FAILED, gpu_stack
 from .journal import read_journal, stats_line
@@ -225,13 +225,14 @@ class Run:
                         try:
                             self.rec["benchmark"] = benchmark_session(self.dir / "benchmark", prof, pause=False,
                                                                       state=self.state)
-                        except Exception as e:
+                        except Exception as e:   # after promotion: informational, the PASS stands
                             self.rec["benchmark"] = {"error": f"{type(e).__name__}: {e}"}
-                            log(f"CI {self.id}: benchmark error (the PASS stands): {e}")
+                            log_exc(f"CI {self.id}: benchmark error (the PASS stands): {e}")
         except CIFail as e:
             self.rec["status"], self.rec["reason"] = "FAIL", str(e)
-        except Exception as e:                  # infrastructure error: same safe path
+        except Exception as e:                  # infrastructure error: same safe path (ERROR, no promotion)
             self.rec["status"], self.rec["reason"] = "ERROR", f"{type(e).__name__}: {e}"
+            log_exc(f"CI {self.id}: ERROR {type(e).__name__}: {e}")
         if self.state.get("no_resume"):
             pc = prod_conf()
             pc["desired"] = "stopped"

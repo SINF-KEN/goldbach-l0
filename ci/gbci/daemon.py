@@ -7,7 +7,7 @@ import shutil
 import signal
 
 from .audit import count_check, recheck
-from .core import STATE, cfg, load_json, log, now_iso, save_json
+from .core import STATE, cfg, load_json, log, log_exc, now_iso, save_json
 from .gpustack import gpu_stack_check_due
 from .ledger import attempts, candidates, judged, ledger_append, mark_seen, queue_edit
 from .primecount import primecount_bin
@@ -54,8 +54,9 @@ def recover():
             log("recovery: production should be running; resuming it")
             try:
                 start_production()
-            except Exception as e:
-                log(f"recovery: resume failed: {e}")
+            except Exception as e:      # production stays down: log and alert, the daemon goes on
+                log_exc(f"recovery: resume failed: {e}")
+                alert("CI recovery could not resume run_range", str(e))
 
 
 def poll_once():
@@ -63,8 +64,8 @@ def poll_once():
     if c["count_check"] and primecount_bin() and prod_conf():
         try:
             count_check(stop_on_mismatch=c["count_check_stop"], limit_blocks=2)
-        except Exception as e:
-            log(f"count-check error: {e}")
+        except Exception as e:          # a broken count check must not hold up the CI runs below
+            log_exc(f"count-check error: {e}", key="count-check")
     ran = 0
     change = gpu_stack_check_due() if active_release() else {}
     if change:
