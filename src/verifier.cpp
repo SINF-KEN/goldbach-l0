@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -449,6 +450,13 @@ private:
 
     void allocate_large_prime_buffers();
     uint64_t bkt_first_seg(uint64_t G) const;
+
+    // ---- upload_tables --------------------------------------------------------
+    std::vector<uint64_t> magic;     // per-prime magic reciprocals, [0, sieve_split)
+    std::vector<uint32_t> shift;
+    clock_::time_point t_upload;
+
+    void upload_tables();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -1179,17 +1187,11 @@ uint64_t DenseRun::bkt_first_seg(uint64_t G) const {
     return G < q_odds_full ? 0 : (G - q_odds_full) / delta + 1;
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    allocate_slot_buffers();
-    size_bucket_ring_and_hitlists();
-    allocate_large_prime_buffers();
+/// Phase 8: the tile kernel's reciprocal tables (magic / shift / ms32) and
+/// every read-only upload: staged copies of the candidate lists, plans and
+/// packed lists, direct DMA of the base-prime ranges the kernels read, one
+/// completion sync, then the staging buffers are freed.
+void DenseRun::upload_tables() {
     // Reciprocal tables are consumed only by the tile kernel, whose loop ends
     // at sieve_split. At 4e18 the complete prime list is ~98M entries, while
     // the default split is only 78K; sizing these to the full list wasted
@@ -1202,7 +1204,7 @@ RunStats DenseRun::run() {
     // the kernel can do division-free jumps to each thread's owned range.
     // magic/shift are segment-independent; first_bits is per-segment.
     init_mark("pack+bucket-alloc(before magic)");
-    const auto [magic, shift] = build_magic_reciprocals(sieve_primes, sieve_split);
+    std::tie(magic, shift) = build_magic_reciprocals(sieve_primes, sieve_split);
 
     // 32-bit reciprocals for the tile table path. The kernel jumps from the
     // tile's first mark to a thread's 2048-bit range: d = my_bit0 - tf is
@@ -1229,7 +1231,7 @@ RunStats DenseRun::run() {
     // Upload the read-only tables once; never touched again per segment.
     // The DMA copies also double as the clock warm-up before the segment loop.
     init_mark("magic+ms32");
-    const auto t_upload = clock_::now();
+    t_upload = clock_::now();
     {
         void* stage1 = stage_upload(ctx,
             gb_primes.data(), gb_primes.size() * 2, b.gb_primes);
@@ -1303,6 +1305,20 @@ RunStats DenseRun::run() {
         if (stage8) Context::free_mem(ctx.context(), stage8);
         if (stage9) Context::free_mem(ctx.context(), stage9);
     }
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
+    allocate_slot_buffers();
+    size_bucket_ring_and_hitlists();
+    allocate_large_prime_buffers();
+    upload_tables();
 
     // Statistics buffers: one shared allocation per slot instead of seven.
     // collect_stats reads and resets them on the host once per segment; as
