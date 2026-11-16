@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -346,7 +347,25 @@ private:
     std::unique_ptr<Kernel> k_ca, k_cb;
     uint32_t cm_u32 = 0;             // kernel class-mode argument (0 / 1 / 2)
 
+    // ---- configure_ridges_and_stats ---------------------------------------------
+    // optional: constructed (it reads GB_RIDGE*) where run_gpu constructed it
+    std::optional<RidgeTracker> ridges;
+    std::string ridge_path;          // GB_RIDGE_FILE
+    const char* ridge_file = nullptr;  // ridge_path.c_str()
+    uint32_t ceil_fallback = 0;      // phase-A ceilings per checker (ridge floor)
+    uint32_t ceil_split = 0;
+    uint32_t ceil_c30 = 0;
+    bool stats_on = false;           // exact statistics (GB_STATS, mod-30 checker)
+    bool gaps_on = false;            // prime gaps (GB_GAPS)
+    bool gaps_exact = false;         // count30 walk on every segment
+    uint32_t gaps_groups = 0;        // GB_GAPS_GROUPS
+    StatsPlan splan;
+    std::unique_ptr<GoldbachStats> gstats;
+    std::unique_ptr<Kernel> k_cxs[4], k_cxb, k_cnt;
+    uint32_t stats_sample = 0;       // GB_STATS_SAMPLE
+
     void configure_checkers();
+    void configure_ridges_and_stats();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -529,10 +548,9 @@ void DenseRun::configure_checkers() {
     cm_u32 = class_mode ? (c30 ? 2u : 1u) : 0u;
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
+/// Phase 3b: Goldbach ridge tracking (floor clamp, store load) and the exact
+/// statistics (GB_STATS / GB_GAPS: plan, state, count30 / check30_x kernels).
+void DenseRun::configure_ridges_and_stats() {
     // ---- Goldbach ridge tracking (include/ridge.hpp) -----------------------
     // The phase-B checkers record the smallest witness of every pending even
     // they resolve (their rest lists are ascending, so the first hit is the
@@ -543,9 +561,9 @@ RunStats DenseRun::run() {
     // with a ridge >= 3000 reaches phase B: the top list is complete there
     // (below the bound phase A may resolve an even first; kept entries are
     // exact either way).
-    RidgeTracker ridges(&gb_all);
-    const std::string ridge_path = env::path("GB_RIDGE_FILE", "goldbach_ridges.csv");
-    const char* ridge_file = ridge_path.c_str();
+    ridges.emplace(&gb_all);
+    ridge_path = env::path("GB_RIDGE_FILE", "goldbach_ridges.csv");
+    ridge_file = ridge_path.c_str();
     // Phase-A ceilings: every candidate a checker's phase A tests is below
     // its ceiling, so an even whose ridge reaches the ceiling fails phase A
     // and phase B records its exact ridge. Below it phase A may resolve the
@@ -554,29 +572,29 @@ RunStats DenseRun::run() {
     // GB_C30_PLAN without a bound prefix gets 9782, i.e. no kernel ridges)
     // and segments on a fallback checker record from that one's ceiling.
     const size_t twin_n = std::min<size_t>(twin_cap, twin_primes.size());
-    const uint32_t ceil_fallback = twin_n ? twin_primes[twin_n - 1] + 3u : 0u;
-    const uint32_t ceil_split = split_on ? split_plan.max_member + 1u : 0u;
-    const uint32_t ceil_c30 = c30chk ? plan30.member_lt : 0u;
+    ceil_fallback = twin_n ? twin_primes[twin_n - 1] + 3u : 0u;
+    ceil_split = split_on ? split_plan.max_member + 1u : 0u;
+    ceil_c30 = c30chk ? plan30.member_lt : 0u;
     const uint32_t a_ceiling = c30chk ? ceil_c30 : split_on ? ceil_split : ceil_fallback;
-    if (ridges.active() && a_ceiling) ridges.clamp_floor_above(a_ceiling - 1u);
+    if (ridges->active() && a_ceiling) ridges->clamp_floor_above(a_ceiling - 1u);
     // Load the store only after the clamp: load() filters by the floor, and
     // entries below the clamped floor (a low GB_RIDGE_MIN) would otherwise
     // stay in the top list and set the kernel threshold from a region the
     // kernels no longer record completely.
-    if (ridges.active()) ridges.load(ridge_file);
+    if (ridges->active()) ridges->load(ridge_file);
     // ---- Exact statistics (include/gstats.hpp) -----------------------------
     // p(n) for every even, prime / twin counts. Needs the mod-30 checker and
     // a start far above MAX_GB_PRIME (futile-last candidate order); GB_STATS=0
     // turns it off (plain verification, check30_a / check30_b).
     const bool stats_env = env::onoff("GB_STATS", true);
-    const bool stats_on = c30chk && start_even >= STATS_MIN_START && stats_env;
+    stats_on = c30chk && start_even >= STATS_MIN_START && stats_env;
     // prime gaps (count30's tail and walk): with the statistics unless GB_GAPS=0
     const std::string gaps_env = env::choice("GB_GAPS", "exact", {"exact", "1", "sampled", "0"}, true);
-    const bool gaps_on = stats_on && gaps_env != "0";
+    gaps_on = stats_on && gaps_env != "0";
     // default: the full gap walk (count30) on every segment -- exact N(g) and
     // moments everywhere. GB_GAPS=sampled walks only the
     // sampled segments (count30's exact count / tail / maximum everywhere).
-    const bool gaps_exact = gaps_on && gaps_env != "sampled";
+    gaps_exact = gaps_on && gaps_env != "sampled";
     // count30 grid on walked segments (work-groups striding over the segment;
     // GB_GAPS_GROUPS tunes it). The default keeps the B580-tuned share of the
     // device: GAPS30_GROUPS per GAPS30_REF_EUS EUs, scaled by this device's
@@ -591,12 +609,9 @@ RunStats DenseRun::run() {
                 (uint64_t(GAPS30_GROUPS) * eus + GAPS30_REF_EUS / 2) / GAPS30_REF_EUS, 1, GAPS30_GROUPS_MAX));
         }
     }
-    const uint32_t gaps_groups = env::u32("GB_GAPS_GROUPS", gaps_default, 1u, GAPS30_GROUPS_MAX);
+    gaps_groups = env::u32("GB_GAPS_GROUPS", gaps_default, 1u, GAPS30_GROUPS_MAX);
     const uint32_t stats_k = env::u32("GB_STATS_K", STATS_K_DEFAULT, 1u, STATS_KMAX);
-    StatsPlan splan;
-    std::unique_ptr<GoldbachStats> gstats;
-    std::unique_ptr<Kernel> k_cxs[4], k_cxb, k_cnt;
-    const uint32_t stats_sample = env::u32("GB_STATS_SAMPLE", STATS_SAMPLE_DEFAULT, 1u);
+    stats_sample = env::u32("GB_STATS_SAMPLE", STATS_SAMPLE_DEFAULT, 1u);
     if (stats_on) {
         splan = make_stats_plan(gb_all, stats_k, plan30.member_lt);
         gstats = std::make_unique<GoldbachStats>(gb_all, splan, plan30.member_lt);
@@ -609,6 +624,13 @@ RunStats DenseRun::run() {
         std::fprintf(stderr, "note: Goldbach statistics off below start %llu\n",
                      (unsigned long long)STATS_MIN_START);
     }
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
     // Tile-walk split between the thread-owned walk (primes < MED_MIN_P,
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
@@ -1827,7 +1849,7 @@ RunStats DenseRun::run() {
         // the top list fills; ~0u disables every append).
         const uint32_t seg_ceiling = s30.ok ? ceil_c30 : sseg.ok ? ceil_split : ceil_fallback;
         const uint32_t ridge_thresh_u32 =
-            ridges.active() ? std::max(ridges.thresh(), seg_ceiling) : 0xFFFFFFFFu;
+            ridges->active() ? std::max(ridges->thresh(), seg_ceiling) : 0xFFFFFFFFu;
         split_used[slot] = sseg.ok && (!class_mode || c30) && !s30.ok;  // split_map / merge30 timing
         if (class_mode && (!sseg.ok || (!c30 && (sseg.phi1 != cgeo.phi[0] || sseg.phi5 != cgeo.phi[1]))))
             throw std::runtime_error("class map: split checker geometry rejected");
@@ -2152,7 +2174,7 @@ RunStats DenseRun::run() {
             // Read the 4-byte counter directly from shared memory (no D2H copy).
             const uint32_t n_left = *b.leftover_n[prev];
             total_leftovers += n_left;
-            ridges.merge(b.ridge[prev], prev_seg_start);
+            ridges->merge(b.ridge[prev], prev_seg_start);
             if (stats_on) collect_stats(prev, prev_seg_start);
 
             if (collect_segments) {
@@ -2169,9 +2191,9 @@ RunStats DenseRun::run() {
 
             if (n_left > 0)
                 resolve_leftovers(ctx, b.leftovers[prev], n_left, prev_seg_start,
-                                  prev_seg_evens, gb_primes, verbose, stats.segments - 1, &ridges,
+                                  prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
                                   gstats.get(), sampled_slot[prev]);
-            ridges.save(ridge_file);
+            ridges->save(ridge_file);
             coll_s = seconds_since(t_coll);
         }
         sum_prep += prep_s;
@@ -2238,7 +2260,7 @@ RunStats DenseRun::run() {
             throw std::runtime_error("two-phase checker: pending list overflow");
         const uint32_t n_left = *b.leftover_n[last];
         total_leftovers += n_left;
-        ridges.merge(b.ridge[last], prev_seg_start);
+        ridges->merge(b.ridge[last], prev_seg_start);
         if (stats_on) collect_stats(last, prev_seg_start);
 
         if (collect_segments) {
@@ -2256,9 +2278,9 @@ RunStats DenseRun::run() {
 
         if (n_left > 0)
             resolve_leftovers(ctx, b.leftovers[last], n_left, prev_seg_start,
-                              prev_seg_evens, gb_primes, verbose, stats.segments - 1, &ridges,
+                              prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
                               gstats.get(), sampled_slot[last]);
-        ridges.save(ridge_file);
+        ridges->save(ridge_file);
     }
 
     stats.gpu_seconds = seconds_since(t_gpu);
@@ -2289,10 +2311,10 @@ RunStats DenseRun::run() {
     stats.split_used     = sieve_split;
     stats.total_tiles       = sum_tiles;
     stats.total_large_items = sum_large_items;
-    stats.ridge_min    = ridges.active() ? ridges.floor() : 0;
-    stats.ridge_found  = ridges.appends();
-    stats.ridge_dropped = ridges.dropped();
-    stats.ridge_top    = ridges.top();
+    stats.ridge_min    = ridges->active() ? ridges->floor() : 0;
+    stats.ridge_found  = ridges->appends();
+    stats.ridge_dropped = ridges->dropped();
+    stats.ridge_top    = ridges->top();
     if (stats_on) {
         gstats->finish_run(start_even, limit, total_evens);
         stats.stats_on     = true;
@@ -2304,7 +2326,7 @@ RunStats DenseRun::run() {
         stats.stats_tail    = gstats->run_tail();
         gstats->commit(VERSION, sampled_evens);
     }
-    if (ridges.overflowed())
+    if (ridges->overflowed())
         std::fprintf(stderr, "warning: ridge append buffer over capacity; excess appends were "
                              "dropped by the kernel (%u per segment; should not happen at the "
                              "default floor once the top list fills)\n", RIDGE_CAP);
