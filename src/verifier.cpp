@@ -364,8 +364,14 @@ private:
     std::unique_ptr<Kernel> k_cxs[4], k_cxb, k_cnt;
     uint32_t stats_sample = 0;       // GB_STATS_SAMPLE
 
+    // ---- set_group_sizes ------------------------------------------------------
+    uint32_t own_end = 0;            // primes [0, own_end): thread-owned tile walk
+    double module_seconds = 0.0;
+    uint32_t large_wg = 0;           // GB_LARGE_WG
+
     void configure_checkers();
     void configure_ridges_and_stats();
+    void set_group_sizes();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -626,20 +632,18 @@ void DenseRun::configure_ridges_and_stats() {
     }
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
+/// Phase 3c: the tile walk's thread-owned prime range (own_end), the end of
+/// the module timing, and the work-group size of every kernel created so far.
+void DenseRun::set_group_sizes() {
     // Tile-walk split between the thread-owned walk (primes < MED_MIN_P,
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
     const uint32_t med_min_p = env::u32("GB_MED_P", class_mode ? MED_MIN_P_CLASS : MED_MIN_P);
-    const uint32_t own_end = std::clamp<uint32_t>(uint32_t(
+    own_end = std::clamp<uint32_t>(uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_split, med_min_p) -
         sieve_primes), mask_count, sieve_split);
-    const double module_seconds = seconds_since(t_module);
+    module_seconds = seconds_since(t_module);
     init_mark("module");
 
     k_sieve.set_group_size(WG_SIZE);
@@ -647,7 +651,7 @@ RunStats DenseRun::run() {
     // kernel indexes by global id). N must be a non-zero multiple of the
     // SIMD32 subgroup: 0 would divide the launch by zero, anything else
     // splits a subgroup.
-    const uint32_t large_wg = env::wg32("GB_LARGE_WG", LARGE_WG_SIZE);
+    large_wg = env::wg32("GB_LARGE_WG", LARGE_WG_SIZE);
     k_large.set_group_size(large_wg);
     k_check.set_group_size(WG_SIZE);
     k_check_b.set_group_size(WG_SIZE);
@@ -666,6 +670,14 @@ RunStats DenseRun::run() {
         k_cxb->set_group_size(WG_SIZE);
         k_cnt->set_group_size(WG_SIZE);
     }
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
 
     // ------------------------------------------------- Persistent buffers -
     GpuBuffers b;
