@@ -96,6 +96,8 @@ struct GpuBuffers {
 
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
+inline constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
+static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
 /// Copies host data to a device buffer through a shared staging allocation.
 /// (Device memory is not host-accessible.)
@@ -403,6 +405,22 @@ private:
     void allocate_slot_buffers();
     void reset_gaps(int s);
     void collect_stats(uint32_t sl, uint64_t seg_start_sl);
+
+    // ---- size_bucket_ring_and_hitlists -------------------------------------------
+    uint64_t delta = 0;              // q-bit advance per segment (segment_even / 2)
+    uint64_t q_odds_full = 0;        // map bits of a full segment
+    uint64_t q_first0 = 0;           // first segment's q_first
+    uint32_t bucket_begin = 0;       // first bucketed / hit-listed prime index
+    uint32_t bucket_R = 0;           // bucket ring size
+    uint32_t bucket_cap = 0;         // entries per bucket
+    bool bucket_on = false;          // primes [bucket_begin, count) leave the packed kernel
+    bool hitlist = false;            // ... into hit lists (GB_HITLIST), else the ring
+    uint32_t hl_K = 0;               // hit lists: segments per harvest
+    uint32_t hl_G = 1, hl_capg = 64; // harvest regions, entries per region
+    uint64_t run_segments = 0, run_last_q_odds = 0;  // hit lists: segments of the run
+    uint32_t packed_end = 0;         // packed kernel primes [sieve_split, packed_end)
+
+    void size_bucket_ring_and_hitlists();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -902,15 +920,10 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
     std::memcpy(b.want_p, gstats->want_p().data(), gstats->want_p().size() * 4);
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    // (ctx, mod and the first four kernels: DenseRun's member initializers)
-    configure_checkers();
-    configure_ridges_and_stats();
-    set_group_sizes();
-
-    size_buffers();
-    allocate_slot_buffers();
+/// Phase 6: which large primes leave the packed kernel (bucket ring or hit
+/// lists), the ring size and bucket capacity, the hit-list batch / regions,
+/// and the run's segment count for the harvest.
+void DenseRun::size_bucket_ring_and_hitlists() {
     // ---- Bucket sieve geometry (kernels/goldbach.cl, "Bucket sieve") ------
     init_mark("buffers");
     // Primes p > q_odds_full hit a segment at most once; they leave the
@@ -919,22 +932,22 @@ RunStats DenseRun::run() {
     // Requires the uniform dense geometry: every segment's q_first is
     // seg_start - MAX_GB_PRIME and consecutive q ranges advance by exactly
     // delta = segment_even / 2 bits. GB_BUCKET=0 disables (A/B).
-    const uint64_t delta = segment_even / 2;
-    const uint64_t q_odds_full = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
+    delta = segment_even / 2;
+    q_odds_full = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
     const SegmentGeometry g_first = segment_geometry(start_even, limit, segment_even, 0);
-    const uint64_t q_first0 = g_first.q_first;
+    q_first0 = g_first.q_first;
     const bool bucket_env_off = !env::onoff("GB_BUCKET", true);
-    uint32_t bucket_begin = sieve_count;   // B: first bucketed prime index
+    bucket_begin = sieve_count;   // B: first bucketed prime index
     // Multiplier wheel of the bucket kernel (WHEEL_W = 30030, the only wheel
     // the kernel module has): max step (in p) and kept fraction of odd
     // multipliers.
     static_assert(WHEEL_W == 30030, "kernels/goldbach.cl only has the 30030 wheel tables");
     constexpr uint64_t wheel_max_step = 11;
     constexpr double wheel_keep = 5760.0 / 15015;
-    uint32_t bucket_R = 0;
-    uint32_t bucket_cap = 0;
+    bucket_R = 0;
+    bucket_cap = 0;
     double bucket_lam = 0.0;   // expected bucketed hits per segment
-    bool bucket_on = !bucket_env_off && large_count > 0 &&
+    bucket_on = !bucket_env_off && large_count > 0 &&
                      start_even >= MAX_GB_PRIME + 2 &&
                      g_first.seg_end != limit &&                  // >= 2 segments
                      g_first.q_odds == q_odds_full &&
@@ -990,17 +1003,14 @@ RunStats DenseRun::run() {
     // hits as a bucket. The harvest walks in
     // (segment, offset) form: needs delta + p_max < 2^32 (the bucket's own
     // pmax + q_odds_full < 2^32 guard) and q_odds_full < 2 delta.
-    constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
-    static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
     // GB_HITLIST=0 restores the bucket ring (A/B); GB_HITLIST_K sets the batch.
-    const bool hitlist = bucket_on && env::onoff("GB_HITLIST", true);
-    uint32_t hl_K = env::u32("GB_HITLIST_K", 128, 1u, HL_MAX_K_HOST);
+    hitlist = bucket_on && env::onoff("GB_HITLIST", true);
+    hl_K = env::u32("GB_HITLIST_K", 128, 1u, HL_MAX_K_HOST);
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
     // mean m = lam / hl_G hits per region). Capacity m * 1.10 + 10 sqrt(m) +
     // 64 (a region's count is a sum of independent hit indicators, variance
     // <= mean), rounded to a power of two; overflow fails the run closed.
-    uint32_t hl_G = 1, hl_capg = 64;
     {
         const auto need = [](double m) { return m * 1.10 + 10.0 * std::sqrt(m) + 64.0; };
         const auto mmax = [&](double cg) {   // largest mean whose capacity fits cg
@@ -1018,7 +1028,6 @@ RunStats DenseRun::run() {
     while (hl_K > 1 && uint64_t(hl_K) * hl_G * hl_capg * 4 >= (uint64_t(1) << 32)) --hl_K;
     // Segments of the run (the loop below: seg_start += segment_even until
     // seg_end == limit) and the last one's q_odds (the only short one).
-    uint64_t run_segments = 0, run_last_q_odds = 0;
     // hl_harvest's 32-bit walk: off + p (off < delta), off + delta and the
     // segment index all stay below 2^32. 2 delta < 2^32 already follows from
     // bucket_on (a bucketed p > q_odds_full > delta with pmax + q_odds_full
@@ -1035,8 +1044,20 @@ RunStats DenseRun::run() {
                 throw std::runtime_error("hit lists: non-uniform segment geometry");
         }
     }
-    const uint32_t packed_end = bucket_on ? bucket_begin : sieve_count;
+    packed_end = bucket_on ? bucket_begin : sieve_count;
     init_mark("bucket-geom+lambda");
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
+    configure_ridges_and_stats();
+    set_group_sizes();
+
+    size_buffers();
+    allocate_slot_buffers();
+    size_bucket_ring_and_hitlists();
     const uint32_t packed_count = packed_end - sieve_split;
     // hl_apply fused into the packed kernel (sieve_large_packed_hl): the two
     // mark sets commute, and alone hl_apply was latency-bound. hl_apply runs
