@@ -303,8 +303,50 @@ struct RunSetup {
 
 class DenseRun : RunSetup {
 public:
-    using RunSetup::RunSetup;
+    DenseRun(uint64_t limit_, uint64_t segment_even_, const std::string& spv_path_,
+             bool verbose_, uint64_t start_even_, uint32_t sieve_split_arg_,
+             const char* prime_cache_path_, bool collect_segments_)
+        : RunSetup(limit_, segment_even_, spv_path_, verbose_, start_even_, sieve_split_arg_,
+                   prime_cache_path_, collect_segments_),
+          ctx(true),   // unordered list, barrier per launch (§9.2v)
+          mod(ctx, spv_path),
+          k_sieve(mod, "make_prime_map"),
+          k_large(mod, "sieve_large_packed"),
+          k_check(mod, "check_phase_a"),
+          k_check_b(mod, "check_phase_b") {}
+
     RunStats run();
+
+private:
+    // Level Zero objects, created in this order by the constructor (and
+    // destroyed in reverse order after every member declared below).
+    Context ctx;
+    Module  mod;
+    Kernel  k_sieve;
+    Kernel  k_large;
+    // Two-phase checker (twin form, the fallback of the class-split and
+    // mod-30 checkers): check_phase_a (32-bit register-window word checker
+    // over twin pairs) + check_phase_b (per-even sparse continuation).
+    Kernel  k_check;
+    Kernel  k_check_b;
+
+    // ---- configure_checkers ---------------------------------------------------
+    uint32_t a_w64 = 0;              // phase-A item width (CHECK_PHASE_A_W64)
+    uint32_t twin_cap = 0;           // GB_TWIN_CAP
+    std::vector<uint16_t> rest_primes;  // twin phase B: candidates not covered
+    bool split_on = false;           // GB_SPLIT: class-split checker
+    SplitPlan split_plan;
+    uint32_t split_write_checked = 0;
+    std::unique_ptr<Kernel> k_split, k_sa, k_sb, k_merge;
+    bool class_mode = false;         // GB_CLASSMAP != 0: class map
+    bool c30 = false;                // mod-30 class map
+    uint32_t ncls_map = 0;           // class arrays of the map (8 / 2)
+    bool c30chk = false;             // GB_C30: mod-30 checker
+    Plan30 plan30;
+    std::unique_ptr<Kernel> k_ca, k_cb;
+    uint32_t cm_u32 = 0;             // kernel class-mode argument (0 / 1 / 2)
+
+    void configure_checkers();
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -421,30 +463,21 @@ void RunSetup::init_mark(const char* what) {
     t_mark = clock_::now();
 }
 
-RunStats DenseRun::run() {
-    // ------------------------------------------------ Level Zero setup ----
-    Context ctx(true);   // unordered list, barrier per launch (§9.2v)
-    Module  mod(ctx, spv_path);
-    Kernel  k_sieve(mod, "make_prime_map");
-    Kernel  k_large(mod, "sieve_large_packed");
-    // Two-phase checker (twin form, the fallback of the class-split and
-    // mod-30 checkers): check_phase_a (32-bit register-window word checker
-    // over twin pairs) + check_phase_b (per-even sparse continuation).
-    Kernel  k_check(mod, "check_phase_a");
-    Kernel  k_check_b(mod, "check_phase_b");
+/// Phase 3a: the checker family (twin / class-split / mod-30) and the map
+/// layout (dense, mod-6 or mod-30 class map) from GB_*; creates their kernels.
+void DenseRun::configure_checkers() {
     // Phase A item width (64-bit words): the kernel's compiled-in A_W64
     // (tests/check_constants.py). Deliberately not overridable at run time:
     // a host-only change sizes the phase-A launch for a different width and
     // leaves evens unchecked.
-    const uint32_t a_w64 = CHECK_PHASE_A_W64;
+    a_w64 = CHECK_PHASE_A_W64;
     // Twin checker (v1.10.0): phase A reads the map as a twin map with the lower
     // members of twin pairs (two candidates per funnel); phase B then probes
     // ALL candidates of the pending evens. GB_TWIN_CAP caps the twin funnels.
-    const uint32_t twin_cap = env::u32("GB_TWIN_CAP", CHECK_TWIN_CANDS);
+    twin_cap = env::u32("GB_TWIN_CAP", CHECK_TWIN_CANDS);
     // Phase B of the twin checker probes only the candidates the first
     // twin_cap twin pairs did not cover (ascending): every pending even has
     // already failed all of those.
-    std::vector<uint16_t> rest_primes;
     {
         std::vector<bool> covered(MAX_GB_PRIME + 3, false);
         for (uint32_t i = 0; i < std::min<size_t>(twin_cap, twin_primes.size()); ++i) {
@@ -460,12 +493,10 @@ RunStats DenseRun::run() {
     // twin checker; GB_SPLIT_CAP = funnels per class list, GB_SPLIT_STAGES =
     // stage masks ("7/3": p, p+6, p+12 then p, p+6). Used per segment only
     // where the geometry allows it (split_segment().ok), else twin.
-    const bool split_on = env::onoff("GB_SPLIT", true);
-    SplitPlan split_plan;
+    split_on = env::onoff("GB_SPLIT", true);
     // checked[] is validation output only (tools/debug_check_hi runs the
     // kernels itself): the production checkers do not write it.
-    const uint32_t split_write_checked = 0u;
-    std::unique_ptr<Kernel> k_split, k_sa, k_sb, k_merge;
+    split_write_checked = 0u;
     if (split_on) {
         const uint32_t cap = env::u32("GB_SPLIT_CAP", CHECK_SPLIT_CANDS);
         const char* st = env::raw("GB_SPLIT_STAGES");   // parse_split_stages validates it
@@ -479,25 +510,29 @@ RunStats DenseRun::run() {
     // arrays the split checker reads (kernels/goldbach.cl map_clear): 2/3 of
     // the tiles, no split_map pass. GB_CLASSMAP=0: dense map + split_map.
     const std::string classmap_env = env::choice("GB_CLASSMAP", "30", {"30", "6", "0"}, true);
-    const bool class_mode = split_on && classmap_env != "0";
+    class_mode = split_on && classmap_env != "0";
     // Class map mod 30 (v1.12.0 default): 8 class arrays for the residues
     // coprime to 30; merge30 rebuilds the checker's S1 / S5. GB_CLASSMAP=6:
     // the v1.11.0 mod-6 class map (the checker reads it directly).
-    const bool c30 = class_mode && classmap_env != "6";
-    const uint32_t ncls_map = c30 ? 8u : 2u;
+    c30 = class_mode && classmap_env != "6";
+    ncls_map = c30 ? 8u : 2u;
     // Mod-30 checker (v1.13.0, include/check30.hpp): evens grouped by n mod
     // 30 read the class arrays directly (no merge30). GB_C30=0: the v1.12.0
     // merge30 + class-split checker; GB_C30_PLAN overrides the plan.
-    const bool c30chk = c30 && env::onoff("GB_C30", true);
-    Plan30 plan30;
-    std::unique_ptr<Kernel> k_ca, k_cb;
+    c30chk = c30 && env::onoff("GB_C30", true);
     if (c30chk) {
         const char* pe = env::raw("GB_C30_PLAN");   // make_plan30 validates it
         plan30 = make_plan30(gb_all, pe ? pe : CHECK30_PLAN);
         k_ca = std::make_unique<Kernel>(mod, "check30_a");
         k_cb = std::make_unique<Kernel>(mod, "check30_b");
     }
-    const uint32_t cm_u32 = class_mode ? (c30 ? 2u : 1u) : 0u;
+    cm_u32 = class_mode ? (c30 ? 2u : 1u) : 0u;
+}
+
+RunStats DenseRun::run() {
+    // ------------------------------------------------ Level Zero setup ----
+    // (ctx, mod and the first four kernels: DenseRun's member initializers)
+    configure_checkers();
     // ---- Goldbach ridge tracking (include/ridge.hpp) -----------------------
     // The phase-B checkers record the smallest witness of every pending even
     // they resolve (their rest lists are ascending, so the first hit is the
