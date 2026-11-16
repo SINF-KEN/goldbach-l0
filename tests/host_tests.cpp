@@ -145,7 +145,7 @@ void test_prime_cache()
         }
         bool tmp_left = false;
         for (const auto& de : fs::directory_iterator(dir))
-            if (de.path().filename().string().find(".tmp.") != std::string::npos) tmp_left = true;
+            if (de.path().filename().string().contains(".tmp.")) tmp_left = true;
         check(!tmp_left, "cache writes leave no temp files behind");
     }
     std::error_code ec;
@@ -847,7 +847,7 @@ void test_stats_state()
         g.commit("test", 7);                      // 7 sampled evens claimed, 0 recorded
     } catch (const std::exception&) { threw = true; }
     check(threw && slurp(st) == full, "sampled-evens mismatch throws, state unchanged");
-    for (size_t cut : {size_t(0), full.size() / 2, full.size() - 1}) {
+    for (size_t cut : {0uz, full.size() / 2, full.size() - 1}) {
         { std::FILE* f = std::fopen(st.c_str(), "wb"); std::fwrite(full.data(), 1, cut, f); std::fclose(f); }
         threw = false;
         try { GoldbachStats g(cands, plan, CHECK30_TAIL); } catch (const std::exception&) { threw = true; }

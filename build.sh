@@ -2,7 +2,7 @@
 # Build goldbach-l0 (Intel Arc B580, Level Zero): configure + build with CMake.
 #
 # Dependencies (Ubuntu 24.04 names): level-zero-dev, intel-level-zero-gpu,
-# cmake >= 3.24, a C++20 compiler; intel-ocloc optional. With ocloc on PATH
+# cmake >= 3.24, a C++23 compiler; intel-ocloc optional. With ocloc on PATH
 # CMake recompiles kernels/*_bmg.spv whenever a kernel source changes;
 # without it the shipped modules are used.
 set -euo pipefail

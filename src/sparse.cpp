@@ -691,12 +691,8 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
     r.N = g.N; r.dl = g.dl; r.T = g.T;
     double t[4] = {};
     for (int i = 0; i < 4; ++i) {
-        ze_kernel_timestamp_result_t ts{};
         if ((i == 1 && I.large_count == 0) || (i < 2 && g.check_only)) continue;
-        if (zeEventQueryKernelTimestamp(I.ev.ev[slot][i], &ts) == ZE_RESULT_SUCCESS && I.timer_hz > 0) {
-            const int64_t d = int64_t(ts.context.kernelEnd) - int64_t(ts.context.kernelStart);
-            if (d > 0) t[i] = double(d) / I.timer_hz;
-        }
+        t[i] = kernel_seconds(I.ev.ev[slot][i], I.timer_hz).value_or(0.0);
     }
     r.tile_s = t[0]; r.large_s = t[1]; r.check_a_s = t[2]; r.check_b_s = t[3];
     r.pending = *I.h_pending_n[slot];

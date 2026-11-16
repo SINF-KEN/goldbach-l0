@@ -5,6 +5,7 @@
 // fail closed, never silently continue with half-created GPU state.
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <ze_api.h>
@@ -108,6 +109,20 @@ private:
 /// @throws std::runtime_error unless the variable is a whole number (decimal,
 ///         0x hex or 0 octal, as strtoul) in [1, 2^32 - 1].
 uint32_t env_grid(const char* name, uint32_t dflt);
+
+/// Start / end ticks (context clock) of the kernel that signaled the
+/// timestamp event @p ev. Timing output only, so a failed query is not an
+/// error: the result code carries nothing the callers use (an absent value).
+/// @return the ticks, or std::nullopt when zeEventQueryKernelTimestamp fails.
+std::optional<ze_kernel_timestamp_data_t> kernel_ticks(ze_event_handle_t ev);
+
+/// Run time of the kernel that signaled the timestamp event @p ev.
+/// @param timer_hz  device timer frequency (ze_device_properties_t 1.2
+///                  timerResolution).
+/// @return seconds (> 0), or std::nullopt when the event has no timestamp,
+///         @p timer_hz is not positive, or the device clock reports
+///         end <= start (an anomaly seen on some driver builds).
+std::optional<double> kernel_seconds(ze_event_handle_t ev, double timer_hz);
 
 /// The immediate list is not in-order (Context(true): the dense pipeline,
 /// unless GB_UNORDERED=0); Kernel::launch then appends a barrier first.

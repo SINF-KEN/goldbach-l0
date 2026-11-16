@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 namespace gb {
@@ -24,8 +25,23 @@ std::string ze_result_string(ze_result_t r) {
     case ZE_RESULT_ERROR_MODULE_BUILD_FAILURE: return "module build failure";
     case ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX: return "invalid kernel arg index";
     case ZE_RESULT_ERROR_INVALID_SIZE: return "invalid size";
-    default: return "error " + std::to_string(static_cast<int>(r));
+    default: return "error " + std::to_string(std::to_underlying(r));
     }
+}
+
+std::optional<ze_kernel_timestamp_data_t> kernel_ticks(ze_event_handle_t ev) {
+    ze_kernel_timestamp_result_t ts{};
+    if (zeEventQueryKernelTimestamp(ev, &ts) != ZE_RESULT_SUCCESS) return std::nullopt;
+    return ts.context;
+}
+
+std::optional<double> kernel_seconds(ze_event_handle_t ev, double timer_hz) {
+    if (!(timer_hz > 0)) return std::nullopt;
+    const auto t = kernel_ticks(ev);
+    if (!t) return std::nullopt;
+    const int64_t d = int64_t(t->kernelEnd) - int64_t(t->kernelStart);
+    if (d <= 0) return std::nullopt;
+    return double(d) / timer_hz;
 }
 
 uint32_t env_grid(const char* name, uint32_t dflt) {
@@ -144,7 +160,7 @@ void* Context::alloc_device(size_t bytes, size_t align) const {
     // 15-200% slower depending on where the map landed (TLB reach) — one
     // pipeline slot was consistently ~55% slower than the other. Rounded,
     // both slots run at the fast rate (large_s -30%). The tail is unused.
-    constexpr size_t kHuge = size_t(2) << 20;
+    constexpr size_t kHuge = 2uz << 20;
     if (bytes >= kHuge / 2) {
         bytes = (bytes + kHuge - 1) / kHuge * kHuge;
         align = std::max(align, kHuge);
