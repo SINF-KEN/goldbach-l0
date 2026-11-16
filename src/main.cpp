@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <print>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -128,8 +129,7 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
     std::println("  \"ridge_found\": {},", s.ridge_found);
     std::println("  \"ridge_dropped\": {},", s.ridge_dropped);
     std::print("  \"ridge_top\": [");
-    for (size_t i = 0; i < s.ridge_top.size(); ++i) {
-        const gb::RidgeEntry& e = s.ridge_top[i];
+    for (const auto& [i, e] : std::views::enumerate(s.ridge_top)) {
         std::print("{}\n    {{\"rank\": {}, \"ridge\": {}, \"even\": {}, "
                    "\"p\": {}, \"q\": {}, \"segment\": {}}}",
                    i ? "," : "", i + 1, e.p, e.n, e.p, e.q, e.seg);
@@ -141,8 +141,7 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
                    s.stats_tail, s.stats_sampled, s.stats_pmax, s.stats_primes, s.stats_twins);
     if (!s.per_segment.empty()) {
         std::println(",\n  \"per_segment\": [");
-        for (size_t i = 0; i < s.per_segment.size(); ++i) {
-            const gb::SegmentStats& g = s.per_segment[i];
+        for (const auto& [i, g] : std::views::enumerate(s.per_segment)) {
             std::println(
                 "    {{\"seg\": {}, \"start\": {}, \"end\": {}, "
                 "\"evens\": {}, \"tiles\": {}, \"large_items\": {}, "
@@ -153,7 +152,7 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
                 g.sieve_split, g.mask_count, g.leftovers,
                 g.sieve_seconds, g.large_seconds, g.check_seconds,
                 g.offset_seconds, g.wall_seconds,
-                i + 1 < s.per_segment.size() ? "," : "");
+                i + 1 < std::ssize(s.per_segment) ? "," : "");
         }
         std::print("  ]");
     }
@@ -191,8 +190,7 @@ void print_per_segment(const gb::RunStats& s) {
     std::println(
         "#seg  evens  [start, end]      tiles  large_items  split  "
         "sieve_s  large_s  check_s  offset_s  wall_s  left");
-    for (size_t i = 0; i < s.per_segment.size(); ++i) {
-        const gb::SegmentStats& g = s.per_segment[i];
+    for (const auto& [i, g] : std::views::enumerate(s.per_segment)) {
         std::println(
             "{:4}  {:9}  [{:13}, {:<13}] {:6} {:11}  {:6}  "
             "{:6.3f}  {:7.3f}  {:7.3f}  {:7.3f}  {:6.3f}  {:5}",
@@ -212,8 +210,7 @@ void print_ridges(const gb::RunStats& s) {
         std::println("  (none recorded at or above the floor {} yet)", s.ridge_min);
         return;
     }
-    for (size_t i = 0; i < s.ridge_top.size(); ++i) {
-        const gb::RidgeEntry& e = s.ridge_top[i];
+    for (const auto& [i, e] : std::views::enumerate(s.ridge_top)) {
         std::println("  {:2}. ridge {:<5}  {} = {} + {}", i + 1, e.p, e.n, e.q, e.p);
     }
 }
