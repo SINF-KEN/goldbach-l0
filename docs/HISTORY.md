@@ -1201,6 +1201,49 @@ Measured and dropped in the same round:
   and table loads (~18 ms); the packed kernel's setup floor (decode +
   modulo + hit lists: 125 ms of 429) with a modulo chained across the 16
   primes of a work-item.
+### 9.2x Mid-prime SLM windows (GB_MIDWIN, 2026-11-17)
+The packed kernel paid ~30 ps per mark for the primes just above the split
+(L2 atomics on the L3-resident map: 430k..4M cost 94.5 ms per 1e11 in the
+2026-10-18 ablations), the tile kernel's medium stage ~11 ps per mark with
+its visits, but its 16 KB tiles limited it to p < 430k (one visit per prime
+per tile). `mid_setup` / `mid_window` add a second pass over the class map
+in 128 KB SLM windows (a work-group of 1024 per window, 15 windows per class
+array, 120 per segment):
+- `mid_setup` (per segment, launched beside the tile kernel): for every mid
+  prime the dense bit b0 of its first odd multiple (`mod_ff`, as the packed
+  kernel), then per class c its first class bit
+  `i0 = (b0 + k p - phi_c) / 15` with `k = (phi_c - b0) p^-1 mod 15`.
+- `mid_window` (after a barrier behind the tile kernel, before the packed
+  kernel's barrier): loads its window, clears every class-map multiple of
+  every mid prime with SLM `atomic_and` (first bit from i0 by an exact float
+  remainder: class bits < 2^24), stores the window back. It marks all
+  multiples with multiplier coprime to 30, a superset of the packed
+  kernel's wheel-30030 marks; the extra ones are composites already clear.
+- The packed list starts at the window bound; the device prime list now
+  uploads [0, bound) (it skipped [split, bucket_begin) unless
+  GB_BUCKET_VERIFY: the first build read p = 0 there and hung).
+Per 1e11 at 4e18, single runs, gpu ms (base 724.5): 64 KB windows of 512
+lose (bound 4M: 743) because the visits dominate; 128 KB of 1024: bound
+2M / 3M / 4M / 6M 693.9 / 693.2 / 694.0 / 701.9. Lowering the split moves
+the medium stage over too (bound 3M): split 36000 / 24000 / 12250 / 9000 /
+6000 / 3500 693.2 / 682.7 / 677.0 / 674.1 / 671.8 / 670.8; split 800..3500
+x bound 2..4M all 670..676. WG 512 at 128 KB: 733. SIMD16 (MIDW_SG) -3%
+window time vs the compiler's SIMD32; MIDW_BATCH 4 > 8 > 16. Overlapping
+the pass with the previous segment's checker (event waits on the tile
+kernel and mid_setup instead of the barrier): null (669.8 vs 670.6), the
+checker already fills the machine.
+Result (bench.py, 5 paired rounds, 1e11, measured on the active bb3a96f
+tree): long +8.44% (95% CI +-0.25%), long-end +8.52% (+-0.15%). Window
+pass ~81 ms, tile kernel ~114 ms (was 168), packed + hit lists 353 ms (was
+435). With split 1500 the host's per-segment first bits and tile tables
+cover 1500 primes instead of 36000. Exact: GB_BUCKET_VERIFY=1 PASS on 1e11
+at 4e18 (every segment's map equal to tile + packed over all large primes),
+stats state, ridges, primes and twins identical at 4e18 and 5e18.
+Also measured: hit-list K 192 / 256 null (+0.01 / -0.07%, HL_MAX_K raised
+to try them); count30 in the 256-register mode (`-ze-opt-large-grf-kernel
+count30` as a module build option) removes its 1.7 KB spill but loses 3.5%
+(half the threads per EU); the whole module at 256 registers makes
+check30_a spill.
 --------------------------------------------------------------------------
 ## 13. Performance
 

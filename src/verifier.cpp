@@ -122,7 +122,7 @@ void* stage_upload(Context& ctx, const void* data, size_t bytes, void* dst) {
 // Per-slot kernel-timestamp events: sieve/large/check for each of the two
 // pipeline slots. One pool per event so each can be reset independently.
 struct SlotEvents {
-    ze_event_pool_handle_t pool[20] = {};
+    ze_event_pool_handle_t pool[22] = {};
     ze_event_handle_t sieve[2] = {};
     ze_event_handle_t large[2] = {};
     ze_event_handle_t check[2] = {};   // last checker kernel (host waits on it)
@@ -131,11 +131,12 @@ struct SlotEvents {
     ze_event_handle_t splitk[2] = {};  // split_map (timing only; counted in check_s)
     ze_event_handle_t xv[3][2] = {};   // check30_xs8 / 6 / 4 (timing only; counted in check_s)
     ze_event_handle_t hl[2] = {};      // hl_harvest (timing only; counted in large_s)
+    ze_event_handle_t mw[2] = {};      // mid_window (timing only; counted in sieve_s)
 
-    /// Creates the twenty pools and events.
+    /// Creates the twenty-two pools and events.
     /// @throws std::runtime_error on failure; destroy() is safe afterwards.
     void create(ze_context_handle_t ctx) {
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < 22; ++i) {
             ze_event_pool_desc_t pd{};
             pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
             pd.count = 1;
@@ -153,7 +154,8 @@ struct SlotEvents {
                                  : (i < 10) ? &bucket[i - 8]
                                  : (i < 12) ? &splitk[i - 10]
                                  : (i < 18) ? &xv[(i - 12) / 2][(i - 12) % 2]
-                                            : &hl[i - 18];
+                                 : (i < 20) ? &hl[i - 18]
+                                            : &mw[i - 20];
             ZE_CHECK(zeEventCreate(pool[i], &ed, e));
         }
     }
@@ -168,8 +170,9 @@ struct SlotEvents {
             if (splitk[i]) zeEventDestroy(splitk[i]);
             for (int v = 0; v < 3; ++v) if (xv[v][i]) zeEventDestroy(xv[v][i]);
             if (hl[i]) zeEventDestroy(hl[i]);
+            if (mw[i]) zeEventDestroy(mw[i]);
         }
-        for (int i = 0; i < 20; ++i)
+        for (int i = 0; i < 22; ++i)
             if (pool[i]) zeEventPoolDestroy(pool[i]);
     }
 };
@@ -326,6 +329,8 @@ struct RunSetup {
     uint32_t mask_count = 0;         // primes < 64: the small-prime mask path
     uint32_t sieve_count = 0;        // base primes
     uint32_t sieve_split = 0;        // [0, split): tile walk; [split, count): large kernels
+    uint64_t midwin_p2 = 0;          // GB_MIDWIN: mid-window bound (0 = off)
+    bool midwin_pre = false;         // its preconditions hold (sets the auto split)
     uint32_t large_count = 0;
     bool init_trace = false;         // GB_INIT_TRACE
     clock_::time_point t_mark;       // init_mark's previous mark
@@ -377,6 +382,7 @@ private:
     void prepare_segment_tables(Segment& sg);
     void enqueue_sieve(Segment& sg);
     void enqueue_large_primes(Segment& sg);
+    void enqueue_midwin(const Segment& sg);
     void enqueue_hitlists(const Segment& sg, uint32_t& hl_jb);
     void enqueue_buckets(const Segment& sg);
     void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
@@ -490,6 +496,12 @@ private:
 
     // ---- allocate_large_prime_buffers ---------------------------------------------
     uint32_t packed_count = 0;       // primes of the packed large kernel
+    uint32_t mid_end = 0;            // mid windows: primes [sieve_split, mid_end)
+    uint32_t mid_n = 0;
+    uint32_t midw_bits = 0, midw_wg = 0;  // window bits, work-group size
+    std::unique_ptr<Kernel> k_mids, k_midw;
+    uint32_t* d_mid_i0[2] = {};      // per slot: first class bit per class and mid prime
+    double midw_seconds = 0.0;       // window pass (counted in sieve_s)
     bool hl_fuse = false;            // hl_apply fused into sieve_large_packed_hl
     PackedLarge packed;
     uint32_t* d_large_bases = nullptr;
@@ -641,8 +653,26 @@ void RunSetup::load_base_primes() {
     // 34K 940.6, 36K 942.4, 40K 945.7 ms kernel time -> 32K.
     // v1.13.0 (mod-30 checker, 425M spans), gpu per 1e11 vs 32K: 28K +2.6%,
     // 34K -0.11%, 36K -0.11% (long-end -0.06%), 38K 0.0%, 42K +0.27% -> 36K.
+    // v2.6 mid-prime SLM windows (HISTORY.md §9.2x): primes [split, GB_MIDWIN)
+    // go to mid_window, and the auto split drops to MIDWIN_SPLIT (2026-11-17
+    // grid: split 800..3500 x bound 2..4M within 0.3%). They need the mod-30
+    // class map (the twin and split checkers on, GB_CLASSMAP default),
+    // q >= 2^60 (mod_ff) and class arrays < 2^24 bits (exact float
+    // remainders); otherwise the old split. GB_MIDWIN=0 disables.
+    midwin_p2 = env::u64("GB_MIDWIN", MIDWIN_P2_DEFAULT, 0, UINT32_MAX);
+    {
+        const auto is = [](const char* k, const char* v) {
+            const char* e = env::raw(k);
+            return e && std::string(e) == v;
+        };
+        const uint64_t qof_est = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
+        midwin_pre = midwin_p2 > 0 && !is("GB_TWIN", "0") && !is("GB_SPLIT", "0") &&
+                     !is("GB_CLASSMAP", "0") && !is("GB_CLASSMAP", "6") &&
+                     start_even >= (uint64_t(1) << 60) + MAX_GB_PRIME + 2 &&
+                     (qof_est + 14) / 15 < (uint64_t(1) << 24);
+    }
     if (sieve_split == 0 || sieve_split > sieve_count)
-        sieve_split = std::min<uint32_t>(sieve_count, 36000);
+        sieve_split = std::min<uint32_t>(sieve_count, midwin_pre ? MIDWIN_SPLIT : 36000);
     sieve_split = std::max(sieve_split, mask_count);
     large_count = sieve_count - sieve_split;
 
@@ -1180,7 +1210,33 @@ void DenseRun::size_bucket_ring_and_hitlists() {
 /// the bucket ring or hit-list buffers and their kernels, and the
 /// GB_BUCKET_VERIFY reference path (full packed list, scratch map, kernels).
 void DenseRun::allocate_large_prime_buffers() {
-    packed_count = packed_end - sieve_split;
+    // Mid-prime SLM windows (§9.2x): [sieve_split, mid_end) leave the packed
+    // kernel; the packed list starts at mid_end.
+    mid_end = sieve_split;
+    midw_bits = env::u32("GB_MIDWIN_KB", MIDWIN_KB, 1, 128) * 8192u;
+    midw_wg = env::wg32("GB_MIDWIN_WG", MIDWIN_WG);
+    if (midwin_pre) {
+        if (c30 && q_first0 >= (uint64_t(1) << 60) && (q_odds_full + 14) / 15 < (uint64_t(1) << 24))
+            mid_end = uint32_t(std::lower_bound(sieve_primes + sieve_split, sieve_primes + packed_end,
+                                                uint32_t(midwin_p2)) - sieve_primes);
+        else
+            std::fprintf(stderr, "note: mid-window pass off (needs the mod-30 class map, "
+                                 "q >= 2^60 and class arrays < 2^24 bits)\n");
+    }
+    mid_n = mid_end - sieve_split;
+    if (mid_n > 0) {
+        k_mids = std::make_unique<Kernel>(mod, "mid_setup");
+        k_midw = std::make_unique<Kernel>(mod, "mid_window");
+        k_mids->set_group_size(WG_SIZE);
+        k_midw->set_group_size(midw_wg);
+        for (int s = 0; s < 2; ++s)
+            d_mid_i0[s] = static_cast<uint32_t*>(ctx.alloc_device(size_t(mid_n) * 8 * 4));
+        if (verbose)
+            std::fprintf(stderr, "mid windows: primes [%u, %u], %u primes, %u-bit windows, wg %u\n",
+                         sieve_primes[sieve_split], sieve_primes[mid_end - 1], mid_n,
+                         midw_bits, midw_wg);
+    }
+    packed_count = packed_end - mid_end;
     // hl_apply fused into the packed kernel (sieve_large_packed_hl): the two
     // mark sets commute, and alone hl_apply was latency-bound. hl_apply runs
     // as its own launch only when no prime is packed.
@@ -1188,7 +1244,7 @@ void DenseRun::allocate_large_prime_buffers() {
     d_large_bases = nullptr;
     d_large_gaps = nullptr;
     if (packed_count > 0) {
-        packed = pack_large_primes(sieve_primes, sieve_split, packed_end);
+        packed = pack_large_primes(sieve_primes, mid_end, packed_end);
         init_mark("  pack (host)");
         d_large_bases = static_cast<uint32_t*>(ctx.alloc_device(packed.bases.size() * 4));
         d_large_gaps  = static_cast<uint32_t*>(ctx.alloc_device(packed.gaps.size()));
@@ -1335,7 +1391,7 @@ void DenseRun::upload_tables() {
             stage_x[1] = stage_upload(ctx, splan.xtab.data(), splan.xtab.size() * 4, b.x_tab);
         }
         // The base-prime list on the device is read only by the tile kernel
-        // ([0, split)), bucket_activate ([bucket_begin, count)) and the
+        // ([0, split)), the mid windows ([split, mid_end)), bucket_activate ([bucket_begin, count)) and the
         // verify kernels (everything). Copy only the ranges that are read —
         // at 4e18 that is ~192 MB instead of 437 MB — and DMA them straight
         // from the mmap'd cache (host pages stay valid until the sync below),
@@ -1349,7 +1405,7 @@ void DenseRun::upload_tables() {
         if (bucket_verify) {
             copy_primes(0, sieve_count);
         } else {
-            copy_primes(0, sieve_split);
+            copy_primes(0, mid_end);   // mid_end >= sieve_split
             if (bucket_on) copy_primes(bucket_begin, sieve_count);
         }
         void* stage6 = d_large_bases ? stage_upload(ctx, packed.bases.data(),
@@ -1510,6 +1566,12 @@ bool DenseRun::query_slot(uint32_t slot, double& ds, double& dl, double& dv) {
     if (const auto t = kernel_seconds(ev.sieve[slot], timer_hz)) { ds = *t; any = true; }
     if (const auto t = kernel_seconds(ev.large[slot], timer_hz)) { dl = *t; any = true; }
     if (const auto t = kernel_seconds(ev.check[slot], timer_hz)) { dv = *t; any = true; }
+    if (mid_n > 0)       // sieve_s also counts the mid-window pass
+        if (const auto t = kernel_seconds(ev.mw[slot], timer_hz)) {
+            ds += *t;
+            midw_seconds += *t;
+            if (phase_trace) std::fprintf(stderr, "    mid_window %.3f ms\n", *t * 1e3);
+        }
     if (hl_used[slot])   // large_s also counts the hit-list harvest
         if (const auto t = kernel_seconds(ev.hl[slot], timer_hz)) {
             dl += *t;
@@ -1768,6 +1830,7 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     ZE_CHECK(zeEventHostReset(ev.checka[sg.slot]));
     ZE_CHECK(zeEventHostReset(ev.bucket[sg.slot]));
     ZE_CHECK(zeEventHostReset(ev.hl[sg.slot]));
+    ZE_CHECK(zeEventHostReset(ev.mw[sg.slot]));
     ZE_CHECK(zeEventHostReset(ev.splitk[sg.slot]));
     for (int v = 0; v < 3; ++v) ZE_CHECK(zeEventHostReset(ev.xv[v][sg.slot]));
     sg.args_s = seconds_since(t_args0);
@@ -1776,6 +1839,17 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     // launch_overlap: may overlap segment k-1's checker (this slot's map,
     // tables and counters were last used by segment k-2, host-synchronized)
     k_sieve.launch_overlap(ctx.list(), uint32_t(sg.tiles_launch), ev.sieve[sg.slot]); // all tiles, one launch
+    if (mid_n > 0) {
+        // mid_setup reads only the primes and q_first; its table slot was
+        // last read by segment k-2's mid_window (host-synchronized)
+        k_mids->set_arg(0, sizeof(b.sieve_primes), &b.sieve_primes);
+        k_mids->set_arg(1, 4, &sieve_split);
+        k_mids->set_arg(2, 4, &mid_n);
+        k_mids->set_arg(3, 8, &sg.q_first);
+        k_mids->set_arg(4, 4, &sg.phis);
+        k_mids->set_arg(5, sizeof(d_mid_i0[sg.slot]), &d_mid_i0[sg.slot]);
+        k_mids->launch_overlap(ctx.list(), (mid_n + WG_SIZE - 1) / WG_SIZE);
+    }
     sg.l1_s = seconds_since(sg.t_launch0);
 }
 
@@ -1803,6 +1877,9 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
     } else if (bucket_on) {
         enqueue_buckets(sg);
     }
+    if (mid_n > 0) {
+        enqueue_midwin(sg);
+    }
     if (large_count > 0) {
         enqueue_packed_large(sg, hl_jb);
     }
@@ -1810,6 +1887,30 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
         enqueue_bucket_verify(sg);
     }
     sg.l2_s = seconds_since(sg.t_launch0);
+}
+
+/// Step 4b' (mid windows, §9.2x): after a barrier (the tile kernel's stores
+/// and mid_setup complete), mid_window rebuilds each 128 KB window of the
+/// class map with the mid primes' marks and stores it back with plain
+/// stores; the packed kernel's barrier then orders its atomics after them.
+void DenseRun::enqueue_midwin(const Segment& sg) {
+    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const uint32_t c5w32 = sg.c5w * 2u;
+    const uint64_t ncmax = (sg.q_odds + 14) / 15;
+    const uint32_t wpc = uint32_t((ncmax + midw_bits - 1) / midw_bits);
+    k_midw->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_midw->set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
+    k_midw->set_arg(2, 4, &sieve_split);
+    k_midw->set_arg(3, 4, &mid_n);
+    k_midw->set_arg(4, sizeof(d_mid_i0[sg.slot]), &d_mid_i0[sg.slot]);
+    k_midw->set_arg(5, 8, &sg.q_odds);
+    k_midw->set_arg(6, 4, &sg.phis);
+    k_midw->set_arg(7, 4, &c5w32);
+    k_midw->set_arg(8, 4, &wpc);
+    k_midw->set_arg(9, 4, &midw_bits);
+    k_midw->set_local_arg(10, size_t(midw_bits) / 8);
+    k_midw->set_arg(11, 8, &sg.q_first);
+    k_midw->launch_overlap(ctx.list(), uint32_t(ncls_map) * wpc, ev.mw[sg.slot]);
 }
 
 /// Step 4a: hit lists for primes [bucket_begin, sieve_count): the batch
@@ -2648,6 +2749,7 @@ void DenseRun::release_device_objects() {
         Context::free_mem(ctx.context(), b.leftovers[s]);
         Context::free_mem(ctx.context(), b.leftover_n[s]);
         Context::free_mem(ctx.context(), b.tile_first[s]);
+        if (d_mid_i0[s]) Context::free_mem(ctx.context(), d_mid_i0[s]);
         if (b.pending[s]) Context::free_mem(ctx.context(), b.pending[s]);
         if (b.pending_n[s]) Context::free_mem(ctx.context(), b.pending_n[s]);
         if (b.ridge[s]) Context::free_mem(ctx.context(), b.ridge[s]);

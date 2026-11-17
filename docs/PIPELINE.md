@@ -28,7 +28,7 @@ flowchart TD
     subgraph CPU_INIT["goldbach_l0: main.cpp → run_gpu() init (CPU)"]
         M1["main: parse_count args<br/>→ run_gpu(limit, segment, spv, ...)"]
         I1["PrimeCacheView::load<br/>mmap base_primes.cache: all primes ≤ √limit"]
-        I2["Pick split points:<br/>mask primes < 64, tile primes < 36000th prime,<br/>packed-large primes, hit-list primes above that"]
+        I2["Pick split points:<br/>mask primes < 64, tile primes < 1500th prime,<br/>mid-window primes < 2.5M,<br/>packed-large primes, hit-list primes above that"]
         I3["odd_primes_up_to 9781 → Goldbach candidates p<br/>make_plan30 / make_stats_plan: mod-30 checker plans"]
         I4["Level Zero: Context + immediate list<br/>Module(goldbach_bmg.spv), create kernels"]
         I5["Allocate 2 pipeline slots of buffers:<br/>prime_map, leftovers, pending, ridge, histograms"]
