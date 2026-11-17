@@ -1244,6 +1244,18 @@ to try them); count30 in the 256-register mode (`-ze-opt-large-grf-kernel
 count30` as a module build option) removes its 1.7 KB spill but loses 3.5%
 (half the threads per EU); the whole module at 256 registers makes
 check30_a spill.
+Tried on top of it and lost (bench.py, 5 paired rounds, both windows, vs
+the window pass at +8.45% / +8.31%): skipping the window marks on q = 0
+mod 7 / 7, 11 / 7, 11, 13 (already cleared by the masks; MIDW_SKIP 1-3,
+a residue counter per mark) +5.9 / +4.1 / +2.1%: the per-mark ALU costs
+more than the 14..28% of SLM atomics it saves (window pass +16 / +28 / +41
+ms), as the mod-7 skip did in the tile kernel. Interleaving the packed
+kernel's work-groups from both ends of the prime list (small-p atomic-heavy
+groups beside one-hit groups) +7.8%, a 1:2 interleave +7.1% (packed +3 /
++8 ms). Segment 485M / 500M (the class-bit float bound allows up to ~503M)
++7.2% / +7.5% (sieve +7 ms). A fused kernel that builds each 128 KB
+window from the group masks and replaces the tile kernel is not finished
+(its map differs; parked).
 --------------------------------------------------------------------------
 ## 13. Performance
 
