@@ -18,8 +18,7 @@ namespace gb {
 // ScmEngine fail-closed paths); dense and --sparse kernels byte-identical.
 // v2.1.0: cleanup release — concluded experiment kernels/tools and their
 // A/B-only env knobs removed; production paths unchanged (spv byte-identical).
-// The selectors of earlier production paths (GB_SPLIT, GB_CLASSMAP, GB_TWIN,
-// GB_C30, ...) were kept; PROJECT-REFERENCE.md §7 lists every GB_* variable.
+// PROJECT-REFERENCE.md §7 lists every GB_* variable.
 // v2.2.0: exact Goldbach statistics on the dense path (include/gstats.hpp,
 // HISTORY.md §9.2l) and a tail-bounded mod-30 checker plan
 // (every phase-A member < 3000: complete ridges and p(n) >= 3000 tail).
@@ -45,7 +44,13 @@ namespace gb {
 // v2.5.1: the packed kernel's gap-stream loads bypass L3 (LSC L1S_L3UC): the
 // ~33 MB per segment stream no longer evicts the class map under the
 // atomics (+0.4%). Results unchanged.
-inline constexpr const char* VERSION = "2.5.1";
+// v2.6.0 (audit 2026-11-17, CORRECTNESS.md §6): positive coverage accounting
+// (every even of a segment counted as resolved or left for the CPU; a checker
+// that did not run fails the run, dense and --sparse); the prime cache carries
+// a payload hash ("GBP2"); the twin / class-split checkers, the dense / mod-6
+// maps and the bucket ring are removed (only A/B knobs reached them; those
+// knobs are refused). Results unchanged.
+inline constexpr const char* VERSION = "2.6.0";
 
 // ---- make_prime_map geometry --------------------------------------------
 // One work-group = one tile. SLM holds 64-bit words; one bit represents one

@@ -248,7 +248,7 @@ struct ScmEngine::Impl {
     uint32_t* h_fbt[2] = {};               // shared
     uint32_t* h_gy[2] = {};                // shared
     uint32_t* h_ivalid[2] = {};            // shared
-    uint32_t* h_acct[2] = {};              // shared coverage counters: [0] A resolved, [1] B resolved, [2] A pending evens
+    uint64_t* h_acct[2] = {};              // shared coverage counters (64-bit: ~1.2e11 evens per segment): [0] A resolved, [1] B resolved, [2] A pending evens
     uint64_t* d_pending[2] = {};
     uint32_t* h_pending_n[2] = {};         // shared
     uint64_t* d_left[2] = {};
@@ -488,7 +488,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
         I.h_fbt[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(size_t(G.K) * std::max(I.split, 1u) * 4));
         I.h_gy[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(G.K * SCM_MAX_GROUPS * 4));
         I.h_ivalid[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(2 * G.CR() * 4));
-        I.h_acct[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(4 * 4));
+        I.h_acct[s] = static_cast<uint64_t*>(I.ctx.alloc_shared(4 * 8));
         I.d_pending[s] = static_cast<uint64_t*>(I.ctx.alloc_device(size_t(I.pending_cap) * 8));
         I.h_pending_n[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(64));
         I.d_left[s] = static_cast<uint64_t*>(I.ctx.alloc_device(size_t(I.leftover_cap) * 8));
@@ -586,7 +586,7 @@ void ScmEngine::enqueue(uint64_t s)
     }
     *I.h_pending_n[slot] = 0;
     *I.h_left_n[slot] = 0;
-    std::memset(I.h_acct[slot], 0, 4 * 4);
+    std::memset(I.h_acct[slot], 0, 4 * 8);
     // advance the first-hit state to segment s + 1 (class index shift by dlt;
     // K x split ~ 150K updates: cheaper inline than spawning threads)
     for (uint32_t k = 0; k < I.geo.K; ++k) {
@@ -710,10 +710,10 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
     const uint32_t nl = *I.h_left_n[slot];
     if (nl > I.leftover_cap) throw std::runtime_error("sparse: leftover overflow");
     r.leftovers = nl;
-    // Positive coverage: every even of the segment inside [start, limit] is
-    // resolved by phase A, resolved by phase B or a leftover. The segment's
-    // evens are the contiguous [N, N + M dl - 2]; the per-class valid ranges
-    // the kernels used must count them exactly too.
+    // Positive coverage: phase A's launched items cover exactly the segment's
+    // evens inside [start, limit] (the contiguous [N, N + M dl - 2], clipped),
+    // as do the per-class valid ranges; phase B processed every pending word
+    // phase A wrote, and every even it examined is resolved or a leftover.
     {
         const uint64_t lo = std::max<uint64_t>(g.N, I.start);
         const uint64_t hi = std::min<uint64_t>(g.N + uint64_t(I.geo.M) * g.dl - 2, I.limit);
@@ -721,16 +721,19 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
         uint64_t valid = 0;
         for (uint32_t cr = 0; cr < I.geo.CR(); ++cr)
             valid += I.h_ivalid[slot][2 * cr + 1] - I.h_ivalid[slot][2 * cr];
-        const uint64_t ra = I.h_acct[slot][0], rb = I.h_acct[slot][1], pe = I.h_acct[slot][2];
+        const uint64_t va = I.h_acct[slot][0], rb = I.h_acct[slot][1], ex = I.h_acct[slot][2],
+                       wb = I.h_acct[slot][3];
         const std::string seg = " (sparse segment at " + std::to_string(g.N) + ", " + std::to_string(want) + " evens)";
         if (valid != want)
             throw std::runtime_error("coverage: class ranges hold " + std::to_string(valid) + " evens" + seg);
-        if (ra + pe != want)
-            throw std::runtime_error("coverage: phase A resolved " + std::to_string(ra) + " + pending " +
-                                     std::to_string(pe) + " != segment evens" + seg);
-        if (rb + nl != pe)
+        if (va != want)
+            throw std::runtime_error("coverage: phase A covered " + std::to_string(va) + " evens" + seg);
+        if (wb != r.pending)
+            throw std::runtime_error("coverage: phase B processed " + std::to_string(wb) + " of " +
+                                     std::to_string(r.pending) + " pending words" + seg);
+        if (rb + nl != ex)
             throw std::runtime_error("coverage: phase B resolved " + std::to_string(rb) + " + leftovers " +
-                                     std::to_string(nl) + " != pending " + std::to_string(pe) + seg);
+                                     std::to_string(nl) + " != examined " + std::to_string(ex) + seg);
     }
     if (nl) {
         r.left.resize(nl);

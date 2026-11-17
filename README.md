@@ -22,9 +22,12 @@ compiled to SPIR-V and a C++23 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts, prime gaps).
 
-**v2.5.1: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
+**v2.6.0: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
 top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
-on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580.
+on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580. (Measured
+on v2.5.1; v2.6.0, which adds positive coverage accounting and removes the
+unused pipelines, matched it bit for bit within +0.03% / +0.12% on 10¹²
+windows, 6 paired rounds.)
 
 | Document | Contents |
 |---|---|
@@ -67,8 +70,10 @@ next:
 
 Evens the GPU cannot resolve are settled on the CPU by deterministic
 Miller–Rabin. The verifier **fails closed**: any GPU error, buffer
-overflow or counterexample exits non-zero; `result=PASS` means every even in
-range was verified. Why that holds, and how each step is checked:
+overflow or counterexample exits non-zero, and every segment's evens must
+be positively accounted for (resolved by phase A, by phase B, or left for
+the CPU: the counts must add up, so a checker that did not run fails the
+run); `result=PASS` means every even in range was verified. Why that holds, and how each step is checked:
 [docs/CORRECTNESS.md](docs/CORRECTNESS.md).
 
 ## Quick start
@@ -121,7 +126,11 @@ odd `q`: the sparse class map keeps 12 residue classes mod 30030 (0.04% of
 the integers) chosen so that every even class reaches one of them, with
 candidates up to 4×10⁷. It verifies ~1.04×10¹² evens/s at 4×10¹⁸ (~15× the
 dense path) but cannot produce the exact statistics (its map holds 12 of
-5760 classes), so the campaign runs the dense path. Design and validation:
+5760 classes), so the campaign runs the dense path. Because it shares no
+map or checker kernel with the dense path, it is the campaign's independent
+second verification: `ci/sparse_crosscheck.sh run` re-verifies the range in
+~5.7 days while production is stopped (`status` reports what both cover).
+Design and validation:
 [HISTORY.md §9.2k](docs/HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp).
 
 ## Goldbach ridge tracking (`My Top 30 Largest Goldbach Ridges`)

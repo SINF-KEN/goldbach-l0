@@ -67,6 +67,7 @@ flowchart TD
         C2["query_slot: kernel timestamps<br/>→ sieve_s, large_s, check_s"]
         C3{"bkt_err, verify_diff,<br/>pending or leftover overflow?"}
         C4["ridges.merge + collect_stats<br/>p(n) histograms, prime/twin counts"]
+        C4b{"coverage: A resolved + pending = evens,<br/>B resolved + leftovers = pending?"}
         C5["resolve_leftovers<br/>Miller-Rabin: n-p prime for p ≤ 9781,<br/>then any odd p ≤ n/2"]
         C6{"witness found?"}
         C7["ridges.save goldbach_ridges.csv"]
@@ -90,7 +91,9 @@ flowchart TD
     G10 --> C1
     C1 --> C2 --> C3
     C3 -- yes --> X1
-    C3 -- no --> C4 --> C5 --> C6
+    C3 -- no --> C4 --> C4b
+    C4b -- yes --> C5 --> C6
+    C4b -- no --> X1
     C6 -- no --> X1
     C6 -- yes --> C7
     C7 -- "next segment" --> P1

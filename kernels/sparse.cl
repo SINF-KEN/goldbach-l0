@@ -12,6 +12,8 @@
 // ============================================================================
 
 typedef ulong u64;
+// 64-bit coverage counters: a segment holds ~1.2e11 evens (M = 30030)
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
 typedef uint  u32;
 typedef ushort u16;
 
@@ -419,7 +421,7 @@ __kernel void scm_check_a(
         __global const u32* restrict ivalid,
         const u32 write_checked,
         const u32 pshift,                        // pending entry: cr << pshift | word << 32 | miss mask
-        __global u32* restrict acct)             // [0] += evens resolved, [2] += evens left pending
+        __global u64* restrict acct)             // [0] += valid evens of the launched items
 {
     const u32 gid = get_global_id(0);
     const u32 cr = gid / items_pad;                    // uniform per work-group
@@ -860,28 +862,20 @@ __kernel void scm_check_a(
 
     // Pending: one entry per word with unresolved evens (cr << pshift | word <<
     // 32 | miss mask), a predicated store per word; phase B expands the bits.
-    // Coverage (host: collect): resolved = valid bits set, pending = bits
-    // clear (invalid bits were preset to 1, so every clear bit is a valid even).
-    u32 cnt = 0, res = 0, pev = 0;
+    // Coverage (host: collect): the valid evens of every launched item, once
+    // per item (a per-word count cost +4..15% check_s); phase B accounts for
+    // the pending words.
+    u32 cnt = 0;
     #pragma unroll
     for (u32 i = 0; i < A3_WPL; ++i) {
         const u32 kb = k0 + 32u * i;
         if (write_checked && live && kb < ihi)
             ((__global u32*)(checked + (u64)cr * chk_stride))[kb >> 5] = acc[i];
         cnt += (acc[i] != ~0u) ? 1u : 0u;
-        const u32 lo = (ilo > kb) ? min(32u, ilo - kb) : 0u;
-        const u32 hi = (ihi > kb) ? min(32u, ihi - kb) : 0u;
-        const u32 lom = (lo >= 32u) ? ~0u : ((1u << lo) - 1u);
-        const u32 him = (hi >= 32u) ? ~0u : ((1u << hi) - 1u);
-        const u32 vm = (live && hi > lo) ? (him & ~lom) : 0u;
-        res += (u32)popcount(acc[i] & vm);
-        pev += (u32)popcount(~acc[i]);
     }
-    const u32 rtot = sub_group_reduce_add(res), ptot = sub_group_reduce_add(pev);
-    if (get_sub_group_local_id() == 0) {
-        if (rtot) atomic_add(acct, rtot);
-        if (ptot) atomic_add(acct + 2, ptot);
-    }
+    const u32 nv = live ? min(ihi, k0 + A3_WPL * 32u) - max(ilo, k0) : 0u;
+    const u32 vtot = sub_group_reduce_add(nv);
+    if (get_sub_group_local_id() == 0 && vtot) atom_add((volatile __global long*)acct, (long)vtot);
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
     u32 base = 0;
@@ -930,14 +924,16 @@ __kernel void scm_check_b(
         const u32 leftover_cap,
         const u32 write_checked,
         const u32 pshift,
-        __global u32* restrict acct)             // [1] += pending evens resolved
+        __global u64* restrict acct)             // [1] += evens resolved, [2] += evens examined, [3] += words
 {
     const u32 n = min(*pending_count, pending_cap);
-    u32 nres = 0u;
+    u32 nres = 0u, nex = 0u, nw = 0u;
     for (u32 x = get_global_id(0); x < n; x += get_global_size(0)) {
         const u64 e = pending[x];
         const u32 cr = (u32)(e >> pshift), w = (u32)(e >> 32) & ((1u << (pshift - 32u)) - 1u);
         u32 miss = (u32)e;
+        ++nw;
+        nex += (u32)popcount(miss);
         const u32 ro = rtab[cr], rc = rtab[SCM_CR + cr];
         while (miss) {
             const u32 i = 32u * w + (u32)ctz(miss);
@@ -966,8 +962,12 @@ __kernel void scm_check_b(
             }
         }
     }
-    const u32 rs = sub_group_reduce_add(nres);         // every lane has left the loop
-    if (get_sub_group_local_id() == 0 && rs) atomic_add(acct + 1, rs);
+    const u32 rs = sub_group_reduce_add(nres), xs = sub_group_reduce_add(nex), ws = sub_group_reduce_add(nw);
+    if (get_sub_group_local_id() == 0) {                // every lane has left the loop
+        if (rs) atom_add((volatile __global long*)(acct + 1), (long)rs);
+        if (xs) atom_add((volatile __global long*)(acct + 2), (long)xs);
+        if (ws) atom_add((volatile __global long*)(acct + 3), (long)ws);
+    }
 }
 
 /// Geometry handshake: the host checks the module's compiled modulus, class
