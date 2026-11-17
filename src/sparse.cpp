@@ -248,6 +248,7 @@ struct ScmEngine::Impl {
     uint32_t* h_fbt[2] = {};               // shared
     uint32_t* h_gy[2] = {};                // shared
     uint32_t* h_ivalid[2] = {};            // shared
+    uint32_t* h_acct[2] = {};              // shared coverage counters: [0] A resolved, [1] B resolved, [2] A pending evens
     uint64_t* d_pending[2] = {};
     uint32_t* h_pending_n[2] = {};         // shared
     uint64_t* d_left[2] = {};
@@ -264,7 +265,7 @@ struct ScmEngine::Impl {
         for (void* p : bufs) Context::free_mem(ctx.context(), p);
         for (int s = 0; s < 2; ++s) {
             void* sb[] = {d_map[s], h_fbt[s], h_gy[s], h_ivalid[s], d_pending[s], h_pending_n[s],
-                          d_left[s], h_left_n[s], d_checked[s]};
+                          d_left[s], h_left_n[s], d_checked[s], h_acct[s]};
             for (void* p : sb) Context::free_mem(ctx.context(), p);
         }
     }
@@ -324,8 +325,9 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
                                  "and sqrt(limit) (use the dense path for small ranges)");
 
     // a missing module fails before the base primes (~2.6 s, ~400 MB of cache)
-    (void)locate_module(env::present("GB_SCM_SPV") ? std::string(env::raw("GB_SCM_SPV"))
-                        : !o.spv.empty() ? o.spv : std::string(G.spv));
+    if (env::present("GB_SCM_SPV")) (void)locate_module(env::raw("GB_SCM_SPV"));
+    else if (!o.spv.empty()) (void)locate_module(o.spv);
+    else (void)locate_module(G.spv, true);
     // ---- base primes ----
     I.pv = PrimeCacheView::load(std::max<uint64_t>(sqrt_limit, 64),
                                 o.prime_cache ? o.prime_cache : "base_primes.cache");
@@ -411,7 +413,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
 
     // ---- L0 ----
     I.mod.reset(new Module(I.ctx, env::present("GB_SCM_SPV") ? std::string(env::raw("GB_SCM_SPV"))
-                                  : !o.spv.empty() ? o.spv : std::string(G.spv)));
+                                  : !o.spv.empty() ? o.spv : locate_module(G.spv, true)));
     {   // geometry handshake (fail closed on a module built for another M / K / residues)
         Kernel kg(*I.mod, "scm_geometry");
         kg.set_group_size(1);
@@ -486,6 +488,7 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
         I.h_fbt[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(size_t(G.K) * std::max(I.split, 1u) * 4));
         I.h_gy[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(G.K * SCM_MAX_GROUPS * 4));
         I.h_ivalid[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(2 * G.CR() * 4));
+        I.h_acct[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(4 * 4));
         I.d_pending[s] = static_cast<uint64_t*>(I.ctx.alloc_device(size_t(I.pending_cap) * 8));
         I.h_pending_n[s] = static_cast<uint32_t*>(I.ctx.alloc_shared(64));
         I.d_left[s] = static_cast<uint64_t*>(I.ctx.alloc_device(size_t(I.leftover_cap) * 8));
@@ -583,6 +586,7 @@ void ScmEngine::enqueue(uint64_t s)
     }
     *I.h_pending_n[slot] = 0;
     *I.h_left_n[slot] = 0;
+    std::memset(I.h_acct[slot], 0, 4 * 4);
     // advance the first-hit state to segment s + 1 (class index shift by dlt;
     // K x split ~ 150K updates: cheaper inline than spawning threads)
     for (uint32_t k = 0; k < I.geo.K; ++k) {
@@ -662,6 +666,7 @@ void ScmEngine::enqueue(uint64_t s)
     ka.set_arg(10, sizeof(I.h_ivalid[slot]), &I.h_ivalid[slot]);
     ka.set_arg(11, 4, &wc);
     ka.set_arg(12, 4, &I.pshift);
+    ka.set_arg(13, sizeof(I.h_acct[slot]), &I.h_acct[slot]);
     ka.launch(I.ctx.list(), uint32_t(uint64_t(I.geo.CR()) * items_pad / 256), I.ev.ev[slot][2]);
     ZE_CHECK(zeCommandListAppendBarrier(I.ctx.list(), nullptr, 0, nullptr));
     Kernel& kb = *I.k_cb;
@@ -679,6 +684,7 @@ void ScmEngine::enqueue(uint64_t s)
     kb.set_arg(11, 4, &I.leftover_cap);
     kb.set_arg(12, 4, &wc);
     kb.set_arg(13, 4, &I.pshift);
+    kb.set_arg(14, sizeof(I.h_acct[slot]), &I.h_acct[slot]);
     kb.launch(I.ctx.list(), I.cb_groups, I.ev.ev[slot][3]);
 }
 
@@ -704,6 +710,28 @@ ScmSegResult ScmEngine::collect(uint32_t slot)
     const uint32_t nl = *I.h_left_n[slot];
     if (nl > I.leftover_cap) throw std::runtime_error("sparse: leftover overflow");
     r.leftovers = nl;
+    // Positive coverage: every even of the segment inside [start, limit] is
+    // resolved by phase A, resolved by phase B or a leftover. The segment's
+    // evens are the contiguous [N, N + M dl - 2]; the per-class valid ranges
+    // the kernels used must count them exactly too.
+    {
+        const uint64_t lo = std::max<uint64_t>(g.N, I.start);
+        const uint64_t hi = std::min<uint64_t>(g.N + uint64_t(I.geo.M) * g.dl - 2, I.limit);
+        const uint64_t want = hi >= lo ? (hi - lo) / 2 + 1 : 0;
+        uint64_t valid = 0;
+        for (uint32_t cr = 0; cr < I.geo.CR(); ++cr)
+            valid += I.h_ivalid[slot][2 * cr + 1] - I.h_ivalid[slot][2 * cr];
+        const uint64_t ra = I.h_acct[slot][0], rb = I.h_acct[slot][1], pe = I.h_acct[slot][2];
+        const std::string seg = " (sparse segment at " + std::to_string(g.N) + ", " + std::to_string(want) + " evens)";
+        if (valid != want)
+            throw std::runtime_error("coverage: class ranges hold " + std::to_string(valid) + " evens" + seg);
+        if (ra + pe != want)
+            throw std::runtime_error("coverage: phase A resolved " + std::to_string(ra) + " + pending " +
+                                     std::to_string(pe) + " != segment evens" + seg);
+        if (rb + nl != pe)
+            throw std::runtime_error("coverage: phase B resolved " + std::to_string(rb) + " + leftovers " +
+                                     std::to_string(nl) + " != pending " + std::to_string(pe) + seg);
+    }
     if (nl) {
         r.left.resize(nl);
         ZE_CHECK(zeCommandListAppendMemoryCopy(I.ctx.list(), r.left.data(), I.d_left[slot],

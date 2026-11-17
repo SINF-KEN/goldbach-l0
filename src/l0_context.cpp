@@ -190,21 +190,21 @@ void Context::host_sync() const {
 
 // ----------------------------------------------------------------- Module --
 
-std::string locate_module(const std::string& path) {
+std::string locate_module(const std::string& path, bool exe_first) {
     namespace fs = std::filesystem;
     const auto readable = [](const fs::path& p) { return std::ifstream(p, std::ios::binary).good(); };
     if (path.empty()) throw std::runtime_error("no SPIR-V module path");
-    if (readable(path)) return path;
-    std::string tried = path;
+    std::vector<fs::path> cand;
     if (fs::path(path).is_relative()) {
         std::error_code ec;
         const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec)
-            for (const fs::path& dir : {exe.parent_path(), exe.parent_path().parent_path()}) {
-                const fs::path cand = dir / path;
-                if (readable(cand)) return cand.string();
-                tried += ", " + cand.string();
-            }
+        if (!ec) cand = {exe.parent_path() / path, exe.parent_path().parent_path() / path};
+    }
+    cand.insert(exe_first ? cand.end() : cand.begin(), fs::path(path));
+    std::string tried;
+    for (const fs::path& c : cand) {
+        if (readable(c)) return c.string();
+        tried += (tried.empty() ? "" : ", ") + c.string();
     }
     throw std::runtime_error("cannot open SPIR-V file: " + path + " (tried " + tried + ")");
 }

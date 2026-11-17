@@ -82,13 +82,15 @@ private:
 
 /// SPIR-V module loaded from a file (produced from kernels/*.cl by ocloc) and
 /// JIT-compiled for the context's device. Non-copyable.
-/// Resolves a kernel module path: as given when it is absolute or readable
-/// from the working directory, else relative to the executable's directory
-/// and its parent (a release dir holds kernels/ next to goldbach_l0, a build
-/// dir sits one level below the source tree's kernels/), so the default
-/// "kernels/goldbach_bmg.spv" works from any working directory.
+/// Resolves a kernel module path. A relative path is looked up from the
+/// working directory and relative to the executable's directory and its
+/// parent (a release dir holds kernels/ next to goldbach_l0; a build dir sits
+/// one level below the source tree's kernels/).
+/// @param exe_first  try the executable's directories before the working
+///        directory: for the built-in default paths, so a release binary run
+///        from the production tree loads its OWN kernels, not the tree's.
 /// @throws std::runtime_error naming every place tried when none is readable.
-std::string locate_module(const std::string& path);
+std::string locate_module(const std::string& path, bool exe_first = false);
 
 class Module {
 public:

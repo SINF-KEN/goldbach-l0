@@ -418,7 +418,8 @@ __kernel void scm_check_a(
         const u32 items_pad,
         __global const u32* restrict ivalid,
         const u32 write_checked,
-        const u32 pshift)                        // pending entry: cr << pshift | word << 32 | miss mask
+        const u32 pshift,                        // pending entry: cr << pshift | word << 32 | miss mask
+        __global u32* restrict acct)             // [0] += evens resolved, [2] += evens left pending
 {
     const u32 gid = get_global_id(0);
     const u32 cr = gid / items_pad;                    // uniform per work-group
@@ -859,13 +860,27 @@ __kernel void scm_check_a(
 
     // Pending: one entry per word with unresolved evens (cr << pshift | word <<
     // 32 | miss mask), a predicated store per word; phase B expands the bits.
-    u32 cnt = 0;
+    // Coverage (host: collect): resolved = valid bits set, pending = bits
+    // clear (invalid bits were preset to 1, so every clear bit is a valid even).
+    u32 cnt = 0, res = 0, pev = 0;
     #pragma unroll
     for (u32 i = 0; i < A3_WPL; ++i) {
         const u32 kb = k0 + 32u * i;
         if (write_checked && live && kb < ihi)
             ((__global u32*)(checked + (u64)cr * chk_stride))[kb >> 5] = acc[i];
         cnt += (acc[i] != ~0u) ? 1u : 0u;
+        const u32 lo = (ilo > kb) ? min(32u, ilo - kb) : 0u;
+        const u32 hi = (ihi > kb) ? min(32u, ihi - kb) : 0u;
+        const u32 lom = (lo >= 32u) ? ~0u : ((1u << lo) - 1u);
+        const u32 him = (hi >= 32u) ? ~0u : ((1u << hi) - 1u);
+        const u32 vm = (live && hi > lo) ? (him & ~lom) : 0u;
+        res += (u32)popcount(acc[i] & vm);
+        pev += (u32)popcount(~acc[i]);
+    }
+    const u32 rtot = sub_group_reduce_add(res), ptot = sub_group_reduce_add(pev);
+    if (get_sub_group_local_id() == 0) {
+        if (rtot) atomic_add(acct, rtot);
+        if (ptot) atomic_add(acct + 2, ptot);
     }
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
@@ -897,8 +912,9 @@ __kernel void scm_check_a(
 ///                    cr << 32 | i (host: CPU Miller-Rabin fallback).
 /// @pre   runs after scm_check_a of the same segment; pshift - 32 in [1, 31].
 /// @post  every pending even is either resolved by a genuine witness
-///        (checked bit set iff write_checked) or appended to leftovers;
-///        *leftover_count may exceed leftover_cap (host fails closed).
+///        (checked bit set iff write_checked; acct[1] counts it) or appended
+///        to leftovers; *leftover_count may exceed leftover_cap (host fails
+///        closed).
 __kernel void scm_check_b(
         __global const u32* restrict cmap32,
         const u32 stride32,
@@ -913,9 +929,11 @@ __kernel void scm_check_b(
         __global u32* restrict leftover_count,
         const u32 leftover_cap,
         const u32 write_checked,
-        const u32 pshift)
+        const u32 pshift,
+        __global u32* restrict acct)             // [1] += pending evens resolved
 {
     const u32 n = min(*pending_count, pending_cap);
+    u32 nres = 0u;
     for (u32 x = get_global_id(0); x < n; x += get_global_size(0)) {
         const u64 e = pending[x];
         const u32 cr = (u32)(e >> pshift), w = (u32)(e >> 32) & ((1u << (pshift - 32u)) - 1u);
@@ -938,6 +956,7 @@ __kernel void scm_check_b(
                 ok = hit != 0u;
             }
             if (ok) {
+                ++nres;
                 if (write_checked)
                     atomic_or((volatile __global u32*)(checked + (u64)cr * chk_stride) + (i >> 5),
                               1u << (i & 31u));
@@ -947,6 +966,8 @@ __kernel void scm_check_b(
             }
         }
     }
+    const u32 rs = sub_group_reduce_add(nres);         // every lane has left the loop
+    if (get_sub_group_local_id() == 0 && rs) atomic_add(acct + 1, rs);
 }
 
 /// Geometry handshake: the host checks the module's compiled modulus, class
