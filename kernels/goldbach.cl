@@ -136,7 +136,12 @@ inline u32 float_int_low32_big(const float v)
 // < 2 p < 2^31 above). Hence r is exact in int, the selects fix the usual
 // +-1 error and the guarded loops the rest. (Measured by CPU emulation over
 // 1.4e7 (x, p) pairs: max |r| = 5.4e8.)
-/// @pre    x from ff_split of a value < 2^63; 1 <= p < 2^30;
+// NOT for small p: a GPU self-test against the exact remainder (2026-11-17,
+// HISTORY.md 9.2z) found wrong results for every prime 67..251 at x ~ 4e18
+// and for primes up to 491 at x up to 9.2e18 (the correction term no longer
+// fits), and none for 512..2^31 (1.2e9 (x, p) pairs). Callers keep p >=
+// MOD_FF_MIN_P = 4096 (host: the split prime; mid_setup uses the exact %).
+/// @pre    x from ff_split of a value < 2^63; 4096 <= p < 2^30;
 ///         x / p >= 2^23 (callers: x >= 2^60), so qh >= 2^23.
 /// @return x mod p, exact.
 inline u32 mod_ff(const ff_x x, const u32 p)
@@ -3700,7 +3705,7 @@ __kernel void sieve_large_packed_hl(
 #define MIDW_SG 16               // SIMD16: window pass -3% vs the compiler's SIMD32
 #endif
 __constant uchar INV15[15] = {0, 1, 8, 0, 4, 0, 0, 13, 2, 0, 0, 11, 0, 7, 14};
-/// @pre    q_first >= 2^60, odd; primes[a .. a + n) in (30, 2^30) coprime to 30;
+/// @pre    q_first odd; primes[a .. a + n) in (30, 2^32) coprime to 30;
 ///         phis = 8 dense phases (nibbles) of the class arrays.
 /// @post   i0tab[c * n + j] = smallest class-c bit i whose q = q_first +
 ///         2 (15 i + phi_c) is a multiple of primes[a + j].
@@ -3710,7 +3715,9 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
     const u32 j = get_global_id(0);
     if (j >= n) return;
     const u32 p = primes[a + j];
-    const u32 r = mod_ff(ff_split(q_first), p);
+    // exact 64-bit remainder: once per prime per segment, free beside the
+    // window pass (bench null), and valid for every p (mod_ff needs p >= 4096)
+    const u32 r = (u32)(q_first % (u64)p);
     u32 t = r ? p - r : 0u;
     t += (t & 1u) ? p : 0u;                 // q_first odd: first odd multiple at q_first + t
     const u32 b0 = t >> 1;                  // its dense bit, < p

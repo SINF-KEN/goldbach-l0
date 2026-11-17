@@ -1254,8 +1254,7 @@ kernel's work-groups from both ends of the prime list (small-p atomic-heavy
 groups beside one-hit groups) +7.8%, a 1:2 interleave +7.1% (packed +3 /
 +8 ms). Segment 485M / 500M (the class-bit float bound allows up to ~503M)
 +7.2% / +7.5% (sieve +7 ms). A fused kernel that builds each 128 KB
-window from the group masks and replaces the tile kernel is not finished
-(its map differs; parked).
+window from the group masks and replaces the tile kernel: -7% (§9.2z).
 ### 9.2y Hit-list threshold 3 -> 2 x q_odds with the mid windows (2026-11-17)
 The mid windows (§9.2x) took the many-mark primes below 2.5M out of the
 packed kernel, so its remaining cost is mostly per-prime setup and the
@@ -1269,6 +1268,27 @@ rounds: long +1.29% (CI +-0.11%), long-end +1.26% (+-0.07%). Exact: stats
 state, ridges, primes, twins identical at 4e18 and 5e18; GB_BUCKET_VERIFY=1
 PASS at 4e18. Also re-checked with the windows (3 rounds, within noise):
 GB_MED_P 384 / 768 / 1024, GB_LARGE_WG 64 / 256.
+
+### 9.2z mod_ff is wrong for small primes; the fused window sieve (2026-11-17)
+A fused kernel that builds each 128 KB window from the group masks and
+sieves every prime from 67 up in it (replacing the tile kernel) gave a
+wrong map, and bisecting by the first window prime led to p = 109: the
+packed kernel's float-float remainder `mod_ff` is not exact for small p.
+A GPU self-test of mod_ff against the exact remainder (divisibility by the
+64-bit inverse) over 1024 odd q per prime: every prime 67..251 fails at
+q ~ 4e18, primes up to 271 near 5e18, up to 491 at q up to 9.2e18; none of
+512..2.5M (1024 q in 4e18..9.2e18) or 2.5M..2^31 (16 q in 4e18..4.004e18)
+fails. The correction term rint(ql) grows like x / p and stops fitting the
+int conversion. Production never reached it (packed primes >= 430k, now
+>= 2.5M; mid_setup primes >= 12577), but `--split` below ~95 sent primes
+< 512 to the packed kernel, and GB_BUCKET_VERIFY's reference uses the same
+kernel, so it agreed with the wrong map (a split-17 run "passed" verify
+while its prime count was off). Now: the split prime is clamped to >= 4096
+(MOD_FF_MIN_P), and mid_setup takes the exact 64-bit remainder (bench.py
+vs mod_ff: +0.03% / +0.05%, null). With that the fused window kernel is
+exact, but 7.1% / 7.0% slower than tile kernel + window pass (sieve 196 ->
+242 ms: its owned walk in 1024-thread windows with a float setup per
+thread and prime costs more than the tile kernel's table path); dropped.
 
 --------------------------------------------------------------------------
 ## 13. Performance
