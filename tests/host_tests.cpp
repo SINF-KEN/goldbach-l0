@@ -116,12 +116,16 @@ void test_prime_cache()
         // truncation could expose exactly such a zero hole before v2.3.0.)
         const uint64_t n = 50000;
         const auto good = odd_primes_up_to(n);
+        // a well-formed GBP2 file whose hash matches its (damaged) payload:
+        // only the content check can refuse it
         const auto write = [&](const std::string& f, const std::vector<uint32_t>& pl) {
             std::FILE* o = std::fopen(f.c_str(), "wb");
             const uint64_t cnt = pl.size();
-            std::fwrite("GBPR", 1, 4, o);
+            const uint64_t h = prime_payload_hash(pl.data(), pl.size());
+            std::fwrite("GBP2", 1, 4, o);
             std::fwrite(&n, 8, 1, o);
             std::fwrite(&cnt, 8, 1, o);
+            std::fwrite(&h, 8, 1, o);
             std::fwrite(pl.data(), 4, pl.size(), o);
             std::fclose(o);
         };
@@ -142,6 +146,45 @@ void test_prime_cache()
             write(fp, pl);                                                // fread path
             check(segmented_odd_primes_up_to_cached(n, fp.c_str()) == good,
                   std::string("cached loader refuses a cache with a ") + why);
+        }
+        {   // storage damage the content check cannot see: one prime replaced
+            // in place by an odd composite between its neighbours (1009 ->
+            // 1011 = 3 * 337 left thousands of false primes in a GPU map);
+            // the header hash refuses it
+            const std::string kb = (dir / "cv_repl").string(), f = kb + "." + std::to_string(n);
+            const auto v0 = PrimeCacheView::load(n, kb.c_str());     // writes a good cache
+            check(v0.size() == good.size(), "replaced-prime case: good cache written");
+            std::FILE* o = std::fopen(f.c_str(), "r+b");
+            const size_t i = size_t(std::find(good.begin(), good.end(), 1009u) - good.begin());
+            const uint32_t composite = 1011;
+            std::fseek(o, long(28 + 4 * i), SEEK_SET);
+            std::fwrite(&composite, 4, 1, o);
+            std::fclose(o);
+            auto repl = good; repl[i] = composite;
+            check(std::is_sorted(repl.begin(), repl.end()), "replaced-prime case: still ascending and odd");
+            const auto view = PrimeCacheView::load(n, kb.c_str());
+            check(view.size() == good.size() && std::equal(good.begin(), good.end(), view.data()),
+                  "PrimeCacheView refuses a cache with a replaced prime (payload hash)");
+            check(segmented_odd_primes_up_to_cached(n, f.c_str()) == good,
+                  "cached loader refuses a cache with a replaced prime (payload hash)");
+        }
+        {   // a pre-hash "GBPR" cache (header and payload intact) is not trusted
+            const std::string kb = (dir / "cv_old").string(), f = kb + "." + std::to_string(n);
+            std::FILE* o = std::fopen(f.c_str(), "wb");
+            const uint64_t cnt = good.size();
+            std::fwrite("GBPR", 1, 4, o);
+            std::fwrite(&n, 8, 1, o);
+            std::fwrite(&cnt, 8, 1, o);
+            std::fwrite(good.data(), 4, good.size(), o);
+            std::fclose(o);
+            const auto view = PrimeCacheView::load(n, kb.c_str());
+            check(view.size() == good.size() && std::equal(good.begin(), good.end(), view.data()),
+                  "an old-format cache is regenerated");
+            char m[4] = {};
+            o = std::fopen(f.c_str(), "rb");
+            check(o && std::fread(m, 1, 4, o) == 4 && std::memcmp(m, "GBP2", 4) == 0,
+                  "the regenerated cache has the hashed format");
+            if (o) std::fclose(o);
         }
         bool tmp_left = false;
         for (const auto& de : fs::directory_iterator(dir))
