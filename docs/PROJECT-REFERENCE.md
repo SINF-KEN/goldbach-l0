@@ -195,7 +195,7 @@ usage: goldbach_l0 [--limit N] [--start N] [--segment N] [--split N]
 | `--limit N` | 100000000 | verify evens in [start, N]. N accepts full decimal or e-notation (`4e18` = `4000000000000000000`); junk, hex/octal and u64 overflow exit 2 with an error |
 | `--start N` | 4 | first even: rounded up to even, at least 4. Everything below `start` is ASSUMED verified (campaign slices). No even n >= 4 in [start, limit] (e.g. start > limit) is a usage error (exit 2) |
 | `--segment N` | 467500000 | integer span per segment; forced >= 2, even; shrunk to total range (min 2 segments kept for pipeline overlap); a span whose odd count exceeds 32 bits fails closed (exit 1) |
-| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 1500) while the mid-window pass runs ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)), else min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count; > 2^32 - 1 is a usage error |
+| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 1500) while the mid-window pass runs ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)), else min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count and to a split prime >= 4096 (`MOD_FF_MIN_P`, [§9.2z](HISTORY.md#92z-mod_ff-is-wrong-for-small-primes-the-fused-window-sieve-2026-11-17)); > 2^32 - 1 is a usage error |
 | `--spv FILE` | kernels/goldbach_bmg.spv | SPIR-V module path |
 | `--prime-cache FILE` | base_primes.cache | keyed by limit: `<file>.<limit>` is tried first, then the legacy shared file; miss regenerates + writes |
 | `--cpu-check N` | off | independent trial-division Goldbach check of [4, N], then exit (exit 0 = PASS) |

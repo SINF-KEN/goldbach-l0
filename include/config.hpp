@@ -167,6 +167,10 @@ inline constexpr uint32_t MED_MIN_P_CLASS = 512;
 // (MUST fit the device's per-work-group SLM) and its work-group size
 // (GB_MIDWIN_KB / GB_MIDWIN_WG override).
 inline constexpr uint64_t MIDWIN_P2_DEFAULT = 2500000;
+// Smallest prime the packed kernel's float-float remainder (mod_ff) may get:
+// it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split prime
+// is clamped to at least this (the tile kernel handles everything below).
+inline constexpr uint32_t MOD_FF_MIN_P = 4096;
 inline constexpr uint32_t MIDWIN_SPLIT = 1500;
 inline constexpr uint32_t MIDWIN_KB = 128;
 inline constexpr uint32_t MIDWIN_WG = 1024;

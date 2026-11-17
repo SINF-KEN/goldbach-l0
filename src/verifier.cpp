@@ -675,6 +675,11 @@ void RunSetup::load_base_primes() {
     if (sieve_split == 0 || sieve_split > sieve_count)
         sieve_split = std::min<uint32_t>(sieve_count, midwin_pre ? MIDWIN_SPLIT : 36000);
     sieve_split = std::max(sieve_split, mask_count);
+    // The packed kernel (and the GB_BUCKET_VERIFY reference) take the first
+    // odd multiple with mod_ff above q = 2^60, which is wrong for p < 512
+    // (HISTORY.md §9.2z): keep every prime below MOD_FF_MIN_P in the tile walk.
+    sieve_split = std::max(sieve_split, std::min(sieve_count, uint32_t(
+        std::lower_bound(sieve_primes, sieve_primes + sieve_count, MOD_FF_MIN_P) - sieve_primes)));
     large_count = sieve_count - sieve_split;
 
     // Goldbach candidate primes: p <= 9781 (see config.hpp).
