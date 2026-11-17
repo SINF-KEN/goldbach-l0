@@ -34,7 +34,6 @@
 #include "primes.hpp"
 #include "ridge.hpp"
 #include "sparse.hpp"
-#include "split_check.hpp"
 
 using namespace gb;
 
@@ -261,6 +260,44 @@ bool ref_strong(uint64_t n, uint64_t a)
 // GB_PSP_FILE=<Feitsma's list of base-2 pseudoprimes below 2^64, one per
 // line, first field> additionally streams the whole list (~1.2e8 numbers;
 // not in CI).
+// The CPU fallback (resolve_leftovers): first the candidate list, then every
+// odd p beyond its bound. With a short list (bound 50) most evens need the
+// beyond-the-list scan, the path production only takes for a new p(n) record.
+void test_cpu_fallback()
+{
+    std::puts("CPU fallback witness search");
+    const auto small = odd_primes_up_to(50);
+    const std::vector<uint16_t> c50(small.begin(), small.end());
+    const auto brute = [](uint64_t n) -> uint64_t {
+        for (uint64_t p = 3; p <= n / 2; p += 2)
+            if (is_prime_trial(p) && is_prime_trial(n - p)) return p;
+        return n == 4 ? 2 : 0;
+    };
+    bool ok = true;
+    uint64_t beyond = 0;
+    for (uint64_t n = 4; n <= 30000; n += 2) {
+        const uint64_t want = brute(n), got = cpu_min_goldbach_prime(n, c50.data(), c50.size(), 50);
+        ok &= got == want;
+        beyond += want > 50;
+    }
+    check(ok && beyond > 100, "cpu_min_goldbach_prime == brute force for n <= 30000 (list <= 50; " +
+                                  std::to_string(beyond) + " evens need the scan beyond the list)");
+    check(cpu_min_goldbach_prime(4, c50.data(), c50.size(), 50) == 2 &&
+          cpu_min_goldbach_prime(7, c50.data(), c50.size(), 50) == 0 &&
+          cpu_min_goldbach_prime(2, c50.data(), c50.size(), 50) == 0, "n = 4 -> 2; odd n and n < 4 -> 0");
+    // production list at 4e18: equals a plain ascending scan
+    const auto all = odd_primes_up_to(MAX_GB_PRIME);
+    const std::vector<uint16_t> cands(all.begin(), all.end());
+    ok = true;
+    for (uint64_t n = 4000000000000000000ull; n < 4000000000000000000ull + 400; n += 2) {
+        uint64_t want = 0;
+        for (uint64_t p = 3; !want; p += 2)
+            if (is_prime_u64(p) && is_prime_u64(n - p)) want = p;
+        ok &= cpu_min_goldbach_prime(n, cands.data(), cands.size(), MAX_GB_PRIME) == want;
+    }
+    check(ok, "cpu_min_goldbach_prime with the production list at 4e18 == ascending scan");
+}
+
 void test_pseudoprimes()
 {
     std::puts("pseudoprimes");
@@ -479,33 +516,12 @@ void test_sparse_helpers()
 // Phase A (funnel members) + phase B must test every candidate of a class.
 void test_dense_plans()
 {
-    std::puts("checker plans (split, mod-30)");
+    std::puts("checker plan (mod-30)");
     const auto cands = odd_primes_up_to(MAX_GB_PRIME);
     const auto isp = sieve_upto(MAX_GB_PRIME);
-    // class-split plan
-    const SplitPlan sp = make_split_plan(cands, CHECK_SPLIT_CANDS, parse_split_stages(CHECK_SPLIT_STAGES));
-    bool ok = true;
-    for (uint32_t c = 0; c < 3; ++c) {
-        std::vector<char> tested(MAX_GB_PRIME + 1, 0);
-        const uint32_t mo = (c == 1) ? 16 : 0;
-        const uint32_t res = (c == 1) ? 5 : 1;
-        for (uint32_t st = 0; st < sp.meta[mo]; ++st) {
-            const uint32_t b = sp.meta[mo + 1 + 3 * st], e = sp.meta[mo + 2 + 3 * st], mask = sp.meta[mo + 3 + 3 * st];
-            for (uint32_t j = b; j < e; ++j)
-                for (uint32_t d = 0; d <= SPLIT_MAXD; ++d)
-                    if ((mask >> d) & 1) {
-                        const uint32_t x = sp.cands[j] + 6 * d;
-                        ok &= x <= MAX_GB_PRIME && isp[x] && x % 6 == res;
-                        tested[std::min<uint32_t>(x, MAX_GB_PRIME)] = 1;
-                    }
-        }
-        for (uint32_t k = 0; k < sp.rcnt[c]; ++k) tested[sp.rest[sp.roff[c] + k]] = 1;
-        for (uint32_t p : cands) ok &= tested[p] != 0;
-    }
-    check(ok, "split plan: funnels hold only primes of the list residue; A + B cover every candidate");
     // mod-30 plan
     const Plan30 p30 = make_plan30(cands, CHECK30_PLAN);
-    ok = true;
+    bool ok = true;
     for (uint32_t cr = 0; cr < 15; ++cr) {
         std::vector<char> tested(MAX_GB_PRIME + 1, 0);
         for (uint32_t sg = 0; sg < p30.meta[cr * 32]; ++sg) {
@@ -1835,6 +1851,7 @@ int main()
     test_prime_cache();
     test_primality();
     test_pseudoprimes();
+    test_cpu_fallback();
     test_limit_bounds();
     test_small_prime_masks();
     test_sparse_helpers();

@@ -323,6 +323,9 @@ ScmEngine::ScmEngine(uint64_t start_even, uint64_t limit, const ScmOptions& o)
         throw std::runtime_error("sparse map needs start well above the candidate range "
                                  "and sqrt(limit) (use the dense path for small ranges)");
 
+    // a missing module fails before the base primes (~2.6 s, ~400 MB of cache)
+    (void)locate_module(env::present("GB_SCM_SPV") ? std::string(env::raw("GB_SCM_SPV"))
+                        : !o.spv.empty() ? o.spv : std::string(G.spv));
     // ---- base primes ----
     I.pv = PrimeCacheView::load(std::max<uint64_t>(sqrt_limit, 64),
                                 o.prime_cache ? o.prime_cache : "base_primes.cache");

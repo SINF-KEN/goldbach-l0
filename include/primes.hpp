@@ -215,4 +215,13 @@ bool is_prime_u64(uint64_t n);
 /// @return true iff @p n is prime.
 bool is_prime_trial(uint64_t n);
 
+/// The CPU fallback's witness search (the verifier's leftovers): the smallest
+/// odd prime p with n - p prime, testing first @p cands (ascending odd primes:
+/// all of them up to @p cand_bound) and then every odd p in (cand_bound, n / 2]
+/// by deterministic Miller-Rabin, so an even needing p > cand_bound (a new
+/// p(n) record above 4e18) is found, not failed.
+/// @return p(n); 2 for n = 4 (4 = 2 + 2); 0 when no partition exists (a
+///         Goldbach counterexample, or n odd / n < 4).
+uint64_t cpu_min_goldbach_prime(uint64_t n, const uint16_t* cands, size_t ncand, uint64_t cand_bound);
+
 } // namespace gb

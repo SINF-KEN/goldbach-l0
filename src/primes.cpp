@@ -421,6 +421,19 @@ bool is_prime_u64(uint64_t n) {
     return true;
 }
 
+uint64_t cpu_min_goldbach_prime(uint64_t n, const uint16_t* cands, size_t ncand, uint64_t cand_bound) {
+    if (n < 4 || (n & 1)) return 0;
+    if (n == 4) return 2;
+    for (size_t i = 0; i < ncand; ++i) {
+        const uint64_t p = cands[i];
+        if (p > n - p) return 0;                 // every candidate up to n / 2 failed
+        if (is_prime_u64(n - p)) return p;
+    }
+    for (uint64_t p = (cand_bound + 1) | 1; p <= n / 2; p += 2)
+        if (is_prime_u64(p) && is_prime_u64(n - p)) return p;
+    return 0;
+}
+
 bool is_prime_trial(uint64_t n) {
     if (n < 2) return false;
     if (n < 4) return true;
