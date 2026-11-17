@@ -496,6 +496,7 @@ private:
 
     // ---- allocate_large_prime_buffers ---------------------------------------------
     uint32_t packed_count = 0;       // primes of the packed large kernel
+    bool midwin_on = false;          // the mid-window pass runs (size_bucket_ring_and_hitlists)
     uint32_t mid_end = 0;            // mid windows: primes [sieve_split, mid_end)
     uint32_t mid_n = 0;
     uint32_t midw_bits = 0, midw_wg = 0;  // window bits, work-group size
@@ -1110,11 +1111,16 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                      g_first.seg_end != limit &&                  // >= 2 segments
                      g_first.q_odds == q_odds_full &&
                      q_first0 == start_even - MAX_GB_PRIME;
+    // the mid-window pass runs (allocate_large_prime_buffers): its
+    // preconditions on the run's geometry
+    midwin_on = midwin_pre && c30 && q_first0 >= (uint64_t(1) << 60) &&
+                (q_odds_full + 14) / 15 < (uint64_t(1) << 24);
     if (bucket_on) {
         // Bucket only primes above max(q_odds_full, GB_BUCKET_MINP): below
         // ~9 x q_odds_full a prime's per-segment packed setup (~22 ps) is
         // cheaper than filing its ~q_odds/p entries (~200 ps each).
-        uint64_t minp = env::u64("GB_BUCKET_MINP", BUCKET_MIN_P_FACTOR * q_odds_full);
+        const uint64_t factor = midwin_on ? BUCKET_MIN_P_FACTOR_MIDWIN : BUCKET_MIN_P_FACTOR;
+        uint64_t minp = env::u64("GB_BUCKET_MINP", factor * q_odds_full);
         minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
                                                  sieve_primes + sieve_count,
@@ -1216,7 +1222,7 @@ void DenseRun::allocate_large_prime_buffers() {
     midw_bits = env::u32("GB_MIDWIN_KB", MIDWIN_KB, 1, 128) * 8192u;
     midw_wg = env::wg32("GB_MIDWIN_WG", MIDWIN_WG);
     if (midwin_pre) {
-        if (c30 && q_first0 >= (uint64_t(1) << 60) && (q_odds_full + 14) / 15 < (uint64_t(1) << 24))
+        if (midwin_on)
             mid_end = uint32_t(std::lower_bound(sieve_primes + sieve_split, sieve_primes + packed_end,
                                                 uint32_t(midwin_p2)) - sieve_primes);
         else
