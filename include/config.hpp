@@ -96,6 +96,11 @@ inline constexpr uint32_t BUCKET_GROUPS = 1024;
 // 3 x +1.6/+1.6/+1.4/+1.2%, 2.5 x +1.3/+1.4/+1.1/+1.1%. Cost: the ring is
 // R x cap entries, ~6.9 GiB of VRAM at 3 x with the 30030 wheel (R ~199).
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
+// With the mid-prime SLM windows (HISTORY.md §9.2x) the packed kernel lost
+// most of its atomics and the crossover moved down: 1e11 at 4e18 (3 paired
+// rounds, gpu ms) 3 x 667.1, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2,
+// 1.25 x 659.8, 1 x 662.2 -> 2 x (+1.3%; §9.2y).
+inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN = 2;
 // Phase-A item width in 64-bit words (768 evens per item) of every word
 // checker. MUST match A_W64 in kernels/goldbach.cl. v1.13.0: 16 -> 14 (the
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after

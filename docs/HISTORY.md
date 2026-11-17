@@ -1256,6 +1256,20 @@ groups beside one-hit groups) +7.8%, a 1:2 interleave +7.1% (packed +3 /
 +7.2% / +7.5% (sieve +7 ms). A fused kernel that builds each 128 KB
 window from the group masks and replaces the tile kernel is not finished
 (its map differs; parked).
+### 9.2y Hit-list threshold 3 -> 2 x q_odds with the mid windows (2026-11-17)
+The mid windows (§9.2x) took the many-mark primes below 2.5M out of the
+packed kernel, so its remaining cost is mostly per-prime setup and the
+crossover between a packed prime (setup every segment) and a hit-listed one
+(one harvested u32 per hit) moved down. GB_BUCKET_MINP sweep, 1e11 at
+4e18, 3 paired rounds, gpu ms: 4 x 687.7, 3.5 x 677.8, 3 x 667.1,
+2.5 x 660.0, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2, 1.25 x 659.8,
+1 x 662.2 (the correctness floor). BUCKET_MIN_P_FACTOR_MIDWIN = 2 whenever
+the window pass runs (3 otherwise). bench.py vs main ef82633, 5-6 paired
+rounds: long +1.29% (CI +-0.11%), long-end +1.26% (+-0.07%). Exact: stats
+state, ridges, primes, twins identical at 4e18 and 5e18; GB_BUCKET_VERIFY=1
+PASS at 4e18. Also re-checked with the windows (3 rounds, within noise):
+GB_MED_P 384 / 768 / 1024, GB_LARGE_WG 64 / 256.
+
 --------------------------------------------------------------------------
 ## 13. Performance
 
