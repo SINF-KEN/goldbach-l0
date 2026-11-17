@@ -142,8 +142,9 @@ def main():
         backup = f"{a.state}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
         shutil.copy2(a.state, backup)
         rewrite_state(a.state, dp, dt)
+        reason = "".join(c if c.isalnum() or c in "-_.+" else "_" for c in a.reason)   # one key=value token
         with open(a.log, "a") as f:
-            f.write(f"GBFIX v1 start={new['start']} limit={new['limit']} reason={a.reason} "
+            f.write(f"GBFIX v1 start={new['start']} limit={new['limit']} reason={reason} "
                     f"original_version={old['version']} rerun_version={new['version']} "
                     f"primes={old['primes']}->{new['primes']} twins={old['twins']}->{new['twins']} "
                     f"dprimes30={','.join(map(str, dp))} dtwins30={','.join(map(str, dt))} "
