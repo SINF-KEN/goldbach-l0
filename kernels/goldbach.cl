@@ -2697,7 +2697,9 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 ///         a witness pair) — its checked[] bit is set when write_checked —
 ///         and otherwise e is appended to pending (atomic counter; entries
 ///         beyond pending_cap are counted but not stored: the host fails
-///         closed). The map is unchanged.
+///         closed). acct[0] += the evens it resolved (positive coverage: the
+///         host requires acct[0] + pending_count == seg_evens). The map is
+///         unchanged.
 __kernel void check30_a(
         __global const u32* restrict cmap32,     // 8 class arrays of cw32 u32 words
         const u32 cw32,
@@ -2713,7 +2715,8 @@ __kernel void check30_a(
         const u32 sm30,                          // seg_start mod 30
         const int tb,                            // seg_start - q_first
         const u32 phik,                          // dense phase of class k, nibble k
-        const u32 write_checked)
+        const u32 write_checked,
+        __global u32* restrict acct)             // [0] += evens resolved here
 {
     const u32 gid = get_global_id(0);
     const u32 cr = gid / items_pad;                    // uniform per work-group
@@ -2789,7 +2792,7 @@ __kernel void check30_a(
         }
     }
 
-    u32 cnt = 0;
+    u32 cnt = 0, res = 0;                              // misses / resolved (valid bits only)
     #pragma unroll
     for (u32 i = 0; i < A_W64; ++i) {
         const u32 kb = k0 + 64u * i;
@@ -2799,9 +2802,12 @@ __kernel void check30_a(
         const u64 valid = (n >= 64u) ? ~0UL : ((1UL << n) - 1UL);
         if (write_checked) checked[(u64)cr * chk_stride + (kb >> 6)] = a & valid;
         cnt += (u32)popcount(~a & valid);
+        res += (u32)popcount(a & valid);
     }
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
+    const u32 rtot = sub_group_reduce_add(res);
+    if (get_sub_group_local_id() == 0 && rtot) atomic_add(acct, rtot);
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
@@ -2837,7 +2843,9 @@ __kernel void check30_a(
 ///         thresholds a ridge append / hist_p / first_p entry with the first
 ///         (smallest) such p. Otherwise e is appended to leftovers (counted
 ///         past MAX_LEFTOVERS: the host fails closed) for the exact CPU
-///         fallback. The map and pending are unchanged.
+///         fallback. acct[1] += the pending evens it resolved (the host
+///         requires acct[1] + leftover_count == pending_count). The map and
+///         pending are unchanged.
 __kernel void check30_b(
         __global const u64* restrict prime_map,
         __global u64* restrict checked,
@@ -2859,13 +2867,15 @@ __kernel void check30_b(
         __global u32* restrict hist_p,                // tail p(n) counts by p >> 1
         __global u32* restrict first_p,               // tail first even index by p >> 1
         __global const u32* restrict want_p,          // first_p bins still wanted
-        const u32 tail_t)                             // record p(n) >= this; ~0u = off
+        const u32 tail_t,                             // record p(n) >= this; ~0u = off
+        __global u32* restrict acct)                  // [1] += pending evens resolved here
 {
     const __global u32* map32 = (const __global u32*)prime_map;
     const cmap g = {2u, phi1, phi5, off5};
     const u32 n = min(*pending_count, pending_cap);
     const long Tbase = (long)seg_start - (long)q_first;
     const u32 sm30 = (u32)(seg_start % 30UL);
+    u32 nres = 0u;                                     // evens this lane resolved
     for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
         const u32 e = pending[i];                      // segment-local even index
         const u32 cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
@@ -2894,6 +2904,7 @@ __kernel void check30_b(
             if (ok) rp = (u32)rest[ro + j + (u32)ctz(hit)];
         }
         if (ok) {
+            ++nres;
             if (rp >= ridge_thresh) {                // useful residues first, so
                 const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
                 if (slot < RIDGE_CAP) {              // exact for n > MAX_GB_PRIME + 5
@@ -2915,6 +2926,8 @@ __kernel void check30_b(
             if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
         }
     }
+    const u32 rs = sub_group_reduce_add(nres);         // every lane has left the loop
+    if (get_sub_group_local_id() == 0 && rs) atomic_add(acct + 1, rs);
 }
 
 // ----------------------------------------------------------------------------

@@ -64,6 +64,12 @@ struct GpuBuffers {
     uint32_t* group_y[2] = {};     // class modes: per class x group canonical-table word offsets
     uint32_t* pending[2]    = {};  // two-phase checker: evens left by phase A
     uint32_t* pending_n[2]  = {};  // their count (shared: host-checked for overflow)
+    // Positive coverage (check30_a / check30_b): [0] evens phase A resolved,
+    // [1] pending evens phase B resolved (shared). The host requires
+    // [0] + pending == segment evens and [1] + leftovers == pending, so a
+    // checker launch that did not run, or covered too few evens, fails the
+    // run instead of passing it.
+    uint32_t* acct[2]       = {};
     uint64_t* ridge[2]      = {};  // Goldbach ridge appends (shared; count + (n, p) pairs)
     // Exact statistics (gstats.hpp): per-slot p(n) histogram / first-even
     // index per candidate-list entry, count30 limits + output (all shared).
@@ -390,6 +396,8 @@ private:
     void collect_previous_segment(Segment& sg);
     void end_iteration(const Segment& sg);
     void drain_final_segment();
+    void collect_slot(uint32_t sl, SegmentStats& rec);
+    void check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left);
 
     // Helpers (former lambdas of run_gpu)
     void reset_gaps(int s);
@@ -549,6 +557,8 @@ private:
     double sum_args = 0.0, sum_launch = 0.0;
     bool split_used[2] = {false, false};   // slot's segment ran the split checker
     bool xs_used[2] = {false, false};      // slot's segment ran check30_xs8..3 (4 launches)
+    bool acct_slot[2] = {false, false};    // slot's segment ran check30_a / _b (b.acct counts)
+    uint64_t slot_hist_n[2] = {0, 0};      // sampled slot: evens its exact histogram counted
 };
 
 /// Phase 1: validates and clamps the range and segment span (run_gpu's
@@ -958,6 +968,8 @@ void DenseRun::allocate_slot_buffers() {
         b.leftover_n[s] = static_cast<uint32_t*>(ctx.alloc_shared(4));
         b.pending[s]   = static_cast<uint32_t*>(ctx.alloc_device(size_t(pending_cap) * 4));
         b.pending_n[s] = static_cast<uint32_t*>(ctx.alloc_shared(4));
+        b.acct[s]      = static_cast<uint32_t*>(ctx.alloc_shared(8));
+        std::memset(b.acct[s], 0, 8);
         // Ridge append buffer: u32 count in word 0 (low half) + RIDGE_CAP
         // (n, p) pairs; shared so the host merges it without a D2H copy.
         b.ridge[s]     = static_cast<uint64_t*>(ctx.alloc_shared((1 + 2 * size_t(RIDGE_CAP)) * 8));
@@ -1024,7 +1036,7 @@ void DenseRun::reset_gaps(int s) {
 
 /// Merges a completed slot's statistics buffers (after its check event).
 void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
-    if (sampled_slot[sl]) gstats->add_full(b.x_hist[sl]);
+    if (sampled_slot[sl]) slot_hist_n[sl] = gstats->add_full(b.x_hist[sl]);
     else gstats->add_tail(b.p_hist[sl]);
     gstats->add_first(seg_start_sl, b.p_first[sl]);
     if (gaps_on) {
@@ -1755,6 +1767,8 @@ void DenseRun::enqueue_sieve(Segment& sg) {
                                            nullptr, 0, nullptr));
     ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
                                            nullptr, 0, nullptr));
+    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.acct[sg.slot], &zero, 4, 8,
+                                           nullptr, 0, nullptr));
     ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
                                            nullptr, 0, nullptr));
     // statistics: p_hist / p_first / x_cnt are reset by the host after
@@ -2093,6 +2107,7 @@ void DenseRun::enqueue_check(Segment& sg) {
     slot_evens[sg.slot] = sg.seg_evens;
     if (sampled) sampled_evens += sg.seg_evens;
     xs_used[sg.slot] = sampled;
+    acct_slot[sg.slot] = !sampled && s30.ok;
     if (stats_on) {
         enqueue_count30(sg, sampled);
     }
@@ -2241,6 +2256,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_ca->set_arg(12, 4, &s30.tb);
     k_ca->set_arg(13, 4, &s30.phik);
     k_ca->set_arg(14, 4, &split_write_checked);
+    k_ca->set_arg(15, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
     // launch_overlap: phase A may run alongside count30 (both only
     // read the finished map; the barrier above follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
@@ -2268,6 +2284,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
     k_cb->set_arg(22, 4, &tail_t);
+    k_cb->set_arg(23, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
     k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
@@ -2414,47 +2431,7 @@ void DenseRun::collect_previous_segment(Segment& sg) {
     sg.wait_s = seconds_since(t_wait);
     const auto t_coll = clock_::now();
 
-    // Per-kernel GPU times from event timestamps.
-    double ds = 0.0, dl = 0.0, dv = 0.0;
-    query_slot(prev, ds, dl, dv);
-    sieve_seconds  += ds;
-    large_seconds  += dl;
-    verify_seconds += dv;
-
-    if (bkt_err && *bkt_err)
-        throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
-    if (verify_diff && *verify_diff)
-        throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
-                                 std::to_string(*verify_diff) + " words");
-    // Two-phase checker: fail closed if phase A's pending list
-    // overflowed (evens beyond the cap were never checked).
-    if (*b.pending_n[prev] > pending_cap)
-        throw std::runtime_error("two-phase checker: pending list overflow");
-    if (phase_trace)
-        std::fprintf(stderr, "    pending %u\n", *b.pending_n[prev]);
-    // Read the 4-byte counter directly from shared memory (no D2H copy).
-    const uint32_t n_left = *b.leftover_n[prev];
-    total_leftovers += n_left;
-    ridges->merge(b.ridge[prev], prev_seg_start);
-    if (stats_on) collect_stats(prev, prev_seg_start);
-
-    if (collect_segments) {
-        // prev_stat is the record of the segment enqueued one
-        // iteration ago (seg_stat already holds the newer one).
-        prev_stat.sieve_seconds  = ds;
-        prev_stat.large_seconds  = dl;
-        prev_stat.check_seconds  = dv;
-        prev_stat.leftovers      = n_left;
-        prev_stat.offset_seconds = prev_seg_offsets;
-        prev_stat.wall_seconds   = prev_seg_wall;
-        stats.per_segment.push_back(prev_stat);
-    }
-
-    if (n_left > 0)
-        resolve_leftovers(ctx, b.leftovers[prev], n_left, prev_seg_start,
-                          prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
-                          gstats.get(), sampled_slot[prev]);
-    ridges->save(ridge_file);
+    collect_slot(prev, prev_stat);
     sg.coll_s = seconds_since(t_coll);
 }
 
@@ -2500,14 +2477,24 @@ void DenseRun::end_iteration(const Segment& sg) {
     }
 }
 
-/// After the loop: collects the final segment (as collect_previous_segment,
-/// without the wait timing and pending trace; its record is seg_stat).
+/// After the loop: collects the final segment (its record is seg_stat: it was
+/// never overwritten after its enqueue).
 void DenseRun::drain_final_segment() {
     const uint32_t last = uint32_t((stats.segments - 1) & 1);
     ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
+    collect_slot(last, seg_stat);
+}
 
+/// Collects a completed slot (its check event has fired; prev_seg_start /
+/// prev_seg_evens describe its segment): kernel times, device error flags,
+/// the pending overflow, ridges and statistics, the coverage accounting,
+/// the telemetry record @p rec, the CPU fallback for its leftovers and the
+/// ridge store.
+/// @throws std::runtime_error on any device error flag, a pending overflow,
+///         a coverage mismatch or a genuine counterexample (fail closed).
+void DenseRun::collect_slot(uint32_t sl, SegmentStats& rec) {
     double ds = 0.0, dl = 0.0, dv = 0.0;
-    query_slot(last, ds, dl, dv);
+    query_slot(sl, ds, dl, dv);
     sieve_seconds  += ds;
     large_seconds  += dl;
     verify_seconds += dv;
@@ -2516,32 +2503,63 @@ void DenseRun::drain_final_segment() {
         throw std::runtime_error("bucket sieve: device error flags " + std::to_string(*bkt_err));
     if (verify_diff && *verify_diff)
         throw std::runtime_error("GB_BUCKET_VERIFY: bucket map differs from the reference map in " +
-                         std::to_string(*verify_diff) + " words");
-    if (*b.pending_n[last] > pending_cap)
+                                 std::to_string(*verify_diff) + " words");
+    // Two-phase checker: fail closed if phase A's pending list
+    // overflowed (evens beyond the cap were never checked).
+    const uint32_t pend = *b.pending_n[sl];
+    if (pend > pending_cap)
         throw std::runtime_error("two-phase checker: pending list overflow");
-    const uint32_t n_left = *b.leftover_n[last];
+    if (phase_trace)
+        std::fprintf(stderr, "    pending %u\n", pend);
+    // Read the 4-byte counter directly from shared memory (no D2H copy).
+    const uint32_t n_left = *b.leftover_n[sl];
     total_leftovers += n_left;
-    ridges->merge(b.ridge[last], prev_seg_start);
-    if (stats_on) collect_stats(last, prev_seg_start);
+    ridges->merge(b.ridge[sl], prev_seg_start);
+    if (stats_on) collect_stats(sl, prev_seg_start);
+    check_coverage(sl, pend, n_left);
 
     if (collect_segments) {
-        // seg_stat still holds the FINAL segment here: it was never
-        // overwritten after its enqueue, and its timestamps are now
-        // readable — this is the one segment collected without delay.
-        seg_stat.sieve_seconds  = ds;
-        seg_stat.large_seconds  = dl;
-        seg_stat.check_seconds  = dv;
-        seg_stat.leftovers      = n_left;
-        seg_stat.offset_seconds = prev_seg_offsets;
-        seg_stat.wall_seconds   = prev_seg_wall;
-        stats.per_segment.push_back(seg_stat);
+        rec.sieve_seconds  = ds;
+        rec.large_seconds  = dl;
+        rec.check_seconds  = dv;
+        rec.leftovers      = n_left;
+        rec.offset_seconds = prev_seg_offsets;
+        rec.wall_seconds   = prev_seg_wall;
+        stats.per_segment.push_back(rec);
     }
 
     if (n_left > 0)
-        resolve_leftovers(ctx, b.leftovers[last], n_left, prev_seg_start,
+        resolve_leftovers(ctx, b.leftovers[sl], n_left, prev_seg_start,
                           prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
-                          gstats.get(), sampled_slot[last]);
+                          gstats.get(), sampled_slot[sl]);
     ridges->save(ridge_file);
+}
+
+/// Positive coverage of a collected slot: every even of its segment must be
+/// accounted for as resolved on the GPU or listed for the CPU fallback. A
+/// PASS used to mean only "no failure was reported": a checker launch that
+/// did not run (or covered too few evens) left nothing pending and passed.
+/// mod-30 segments: check30_a's resolved count + pending == segment evens and
+/// check30_b's resolved count + leftovers == pending. Sampled segments: the
+/// exact histogram's count of the segment + leftovers == segment evens.
+/// @throws std::runtime_error on a mismatch (the run fails, nothing is merged).
+void DenseRun::check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left) {
+    const std::string seg = " (segment starting " + std::to_string(prev_seg_start) + ", " +
+                            std::to_string(prev_seg_evens) + " evens)";
+    if (sampled_slot[sl]) {
+        if (slot_hist_n[sl] + n_left != prev_seg_evens)
+            throw std::runtime_error("coverage: exact histogram " + std::to_string(slot_hist_n[sl]) +
+                                     " + leftovers " + std::to_string(n_left) + " != segment evens" + seg);
+        return;
+    }
+    if (!acct_slot[sl]) return;          // a fallback checker without accounting
+    const uint64_t res_a = b.acct[sl][0], res_b = b.acct[sl][1];
+    if (res_a + pend != prev_seg_evens)
+        throw std::runtime_error("coverage: phase A resolved " + std::to_string(res_a) + " + pending " +
+                                 std::to_string(pend) + " != segment evens" + seg);
+    if (res_b + n_left != pend)
+        throw std::runtime_error("coverage: phase B resolved " + std::to_string(res_b) + " + leftovers " +
+                                 std::to_string(n_left) + " != pending " + std::to_string(pend) + seg);
 }
 
 /// Phase 12: the segment loop. Each iteration enqueues segment k on its slot,
@@ -2650,6 +2668,7 @@ void DenseRun::release_device_objects() {
         Context::free_mem(ctx.context(), b.tile_first[s]);
         if (b.pending[s]) Context::free_mem(ctx.context(), b.pending[s]);
         if (b.pending_n[s]) Context::free_mem(ctx.context(), b.pending_n[s]);
+        if (b.acct[s]) Context::free_mem(ctx.context(), b.acct[s]);
         if (b.ridge[s]) Context::free_mem(ctx.context(), b.ridge[s]);
         if (b.split_s1[s]) Context::free_mem(ctx.context(), b.split_s1[s]);
         if (b.split_s5[s]) Context::free_mem(ctx.context(), b.split_s5[s]);
