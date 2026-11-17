@@ -195,7 +195,7 @@ usage: goldbach_l0 [--limit N] [--start N] [--segment N] [--split N]
 | `--limit N` | 100000000 | verify evens in [start, N]. N accepts full decimal or e-notation (`4e18` = `4000000000000000000`); junk, hex/octal and u64 overflow exit 2 with an error |
 | `--start N` | 4 | first even: rounded up to even, at least 4. Everything below `start` is ASSUMED verified (campaign slices). No even n >= 4 in [start, limit] (e.g. start > limit) is a usage error (exit 2) |
 | `--segment N` | 467500000 | integer span per segment; forced >= 2, even; shrunk to total range (min 2 segments kept for pipeline overlap); a span whose odd count exceeds 32 bits fails closed (exit 1) |
-| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count; > 2^32 - 1 is a usage error |
+| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 1500) while the mid-window pass runs ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)), else min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count; > 2^32 - 1 is a usage error |
 | `--spv FILE` | kernels/goldbach_bmg.spv | SPIR-V module path |
 | `--prime-cache FILE` | base_primes.cache | keyed by limit: `<file>.<limit>` is tried first, then the legacy shared file; miss regenerates + writes |
 | `--cpu-check N` | off | independent trial-division Goldbach check of [4, N], then exit (exit 0 = PASS) |
@@ -291,6 +291,7 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default (`exact`, also `1`): every segment; any other value is an error |
 | `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
+| `GB_MIDWIN=N` / `GB_MIDWIN_KB` / `GB_MIDWIN_WG` | mid-prime SLM window pass: primes [split, N) in windows of KB of SLM with work-groups of WG (defaults 2500000 / 128 / 1024; `GB_MIDWIN=0` off and the auto split back to 36000) ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
 | `GB_TWIN=0` / `GB_TWIN_CAP=K` | v1.10.0 A/B: the plain two-phase checker (implies `GB_SPLIT=0`) / twin funnels of the twin checker (default `CHECK_TWIN_CANDS` = 100) |
@@ -350,7 +351,8 @@ Map must be sized in WHOLE tiles — the tile kernel writes whole tiles, a
 partial last tile would write past the buffer (device-lost comment,
 verifier.cpp).
 
-Auto split: `min(sieve_count, 36000)` (rationale and measurements in the
+Auto split: `min(sieve_count, 1500)` while the mid-window pass runs (HISTORY.md
+§9.2x), else `min(sieve_count, 36000)` (rationale and measurements in the
 comment at the split selection in verifier.cpp). The split is what makes 4e18 feasible:
 walking all ~98M base primes per tile blew the driver watchdog (engine
 reset).
