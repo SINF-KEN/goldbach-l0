@@ -3,13 +3,13 @@ previous links, promotion and pruning."""
 import contextlib
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-from .core import STATE, cfg, load_json, log
-from .journal import read_journal
+from .core import ROOT, STATE, cfg, git, load_json, log
 from .prodstate import find_run_range, prod_conf, prod_paths
 
 
@@ -67,14 +67,62 @@ def promote(rel):
     prune_releases()
 
 
-def prune_releases():
-    """Keep active, previous, every release named in the journal, the newest
-    keep_releases others and the binary production runs right now."""
-    keep = {p for p in (active_release(), link_target("previous")) if p}
+RELEASE_RE = re.compile(r"\brelease=([0-9a-f]{12})\b")
+
+
+def named_releases():
+    """Release ids named by ANY journal or recheck file in production's
+    directory (every row kind: PASS, RETRY, RECHECK), or None when one of
+    them -- or the journal production.json names -- cannot be read.
+
+    Protecting only the journal production.json names at the moment lost the
+    binaries of 23 of the 25 releases behind the campaign's PASS rows: on
+    2026-10-19 production switched to the gap-backfill journal and the next
+    prune removed every release named only in the main journal (and the
+    switch back did the same to the backfill's)."""
     pc = prod_conf()
-    if pc:
-        keep |= {release_dir(r["kv"]["release"]).resolve() for r in read_journal(prod_paths(pc)[0])
-                 if "release" in r["kv"]}
+    jdir = ROOT
+    if pc.get("journal"):
+        j = prod_paths(pc)[0]
+        if not j.is_file():
+            return None
+        jdir = j.parent
+    names = set()
+    for f in sorted(jdir.glob("*.journal")) + sorted(jdir.glob("*.recheck")):
+        try:
+            names |= set(RELEASE_RE.findall(f.read_text(errors="replace")))
+        except OSError:
+            return None
+    return names
+
+
+def tag_releases(ids):
+    """Pins each release commit with a local tag release/<id>, so the source
+    of every binary the journal names stays reachable after its branch is
+    deleted (git gc would drop it). Ids without a local commit are skipped."""
+    have = set(git("tag", "--list", "release/*", check=False).split())
+    made = []
+    for rid in sorted(ids):
+        if f"release/{rid}" in have or not git("rev-parse", "-q", "--verify", f"{rid}^{{commit}}", check=False):
+            continue
+        git("tag", f"release/{rid}", rid, check=False)
+        made.append(rid)
+    if made:
+        log(f"tagged releases: {', '.join(made)}")
+
+
+def prune_releases():
+    """Keep active, previous, every release named in any production journal
+    (named_releases), the newest keep_releases others and the binary
+    production runs right now. Fails closed: when a journal cannot be read
+    nothing is pruned."""
+    named = named_releases()
+    if named is None:
+        log("prune skipped: a production journal cannot be read (its releases must be kept)")
+        return
+    tag_releases(named)
+    keep = {p for p in (active_release(), link_target("previous")) if p}
+    keep |= {release_dir(r).resolve() for r in named}
     for p in find_run_range():
         env = Path(f"/proc/{p['pid']}/environ")
         with contextlib.suppress(OSError):
