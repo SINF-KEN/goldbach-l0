@@ -1261,7 +1261,7 @@ The mid windows (§9.2x) took the many-mark primes below 2.5M out of the
 packed kernel, so its remaining cost is mostly per-prime setup and the
 crossover between a packed prime (setup every segment) and a hit-listed one
 (one harvested u32 per hit) moved down. GB_BUCKET_MINP sweep, 1e11 at
-4e18, 3 paired rounds, gpu ms: 4 x 704.1 (est.), 3.5 x 677.8, 3 x 667.1,
+4e18, 3 paired rounds, gpu ms: 4 x 687.7, 3.5 x 677.8, 3 x 667.1,
 2.5 x 660.0, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2, 1.25 x 659.8,
 1 x 662.2 (the correctness floor). BUCKET_MIN_P_FACTOR_MIDWIN = 2 whenever
 the window pass runs (3 otherwise). bench.py vs main ef82633, 5-6 paired
