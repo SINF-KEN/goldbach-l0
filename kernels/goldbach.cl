@@ -571,6 +571,9 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+#ifndef MED_W7_MAXP
+#define MED_W7_MAXP 8192u
+#endif
 __constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
 inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
                           const u32 tile_bit0, const u32 qc7, const u32 s7)
@@ -596,7 +599,10 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
     // and exactly the k = k7 (mod 7) are skipped: blocks of 7 p take six
     // marks at fixed offsets (no per-mark ALU), the tail tests each of at
     // most 7 candidates. qc7 = qc mod 7, s7 = s mod 7.
-    if (p == 7u) {
+    // Only primes with a few full 7p blocks per tile: above, the wheel's
+    // setup and the 7-candidate tail cost more than the marks they skip
+    // (low heights, split 36000: sieve +55 ms per 1e11 at 1e14).
+    if (p == 7u || p > (u32)MED_W7_MAXP) {
         for (; bit < (u32)TILE_BITS; bit += p)
             atomic_and(&t32[bit >> 5], CLR_MASK(bit));
         return;
