@@ -571,8 +571,9 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+__constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
 inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0)
+                          const u32 tile_bit0, const u32 qc7, const u32 s7)
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
@@ -588,8 +589,38 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
         const u32 rmu = (u32)rf;
         bit = rmu ? p - rmu : 0u;
     }
-    for (; bit < (u32)TILE_BITS; bit += p)
-        atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+    // Wheel 7, unrolled (2026-11-18, sieve -4.4 ms per 1e11): the marks of
+    // q = 0 (mod 7) are already cleared by the tile kernel's own sieving of
+    // 7 (mask or walk; q = p m >= 7 p, never 7 itself). Along a class array
+    // q(i) = qc + s i (s = 2 cmod = 30 or 6), so q_k = q_0 + s p k (mod 7)
+    // and exactly the k = k7 (mod 7) are skipped: blocks of 7 p take six
+    // marks at fixed offsets (no per-mark ALU), the tail tests each of at
+    // most 7 candidates. qc7 = qc mod 7, s7 = s mod 7.
+    if (p == 7u) {
+        for (; bit < (u32)TILE_BITS; bit += p)
+            atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+        return;
+    }
+    if (bit < (u32)TILE_BITS) {
+        const u32 q0 = (qc7 + s7 * (tile_bit0 + bit)) % 7u;      // class bits < 2^24
+        const u32 k7 = ((7u - q0) * INV7[(s7 * p) % 7u]) % 7u;
+        const u32 p6 = 6u * p, p7 = 7u * p;
+        u32 o[6];
+        #pragma unroll
+        for (u32 t = 0; t < 6u; ++t) o[t] = (t + (t >= k7 ? 1u : 0u)) * p;
+        for (; bit + p6 < (u32)TILE_BITS; bit += p7) {
+            #pragma unroll
+            for (u32 t = 0; t < 6u; ++t) {
+                const u32 b = bit + o[t];
+                atomic_and(&t32[b >> 5], CLR_MASK(b));
+            }
+        }
+        for (u32 d = 0; d < 7u; ++d) {
+            const u32 b = bit + d * p;
+            if (b >= (u32)TILE_BITS) break;
+            if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK(b));
+        }
+    }
 }
 
 // One prime of the thread-owned walk (table path) in 32-bit / float
@@ -722,6 +753,8 @@ __kernel void make_prime_map(
     const u32 phic = (cm == 2u) ? ((phis >> (4u * cls)) & 15u)
                                 : (cls ? (phis >> 8) : (phis & 0xFFu));
     const u32 cmod = (cm == 2u) ? 15u : 3u;            // dense bits per class bit
+    const u32 qc7v = (u32)((q_first + 2UL * phic) % 7UL);   // q of class bit 0, mod 7
+    const u32 s7v = (2u * cmod) % 7u;                       // q step per class bit, mod 7
     const u32 qf30 = (u32)(q_first % 30UL);            // wheel-30 phase (dense map)
     const u64 n_valid = (cm == 2u) ? ((q_odds > phic) ? (q_odds - phic + 14UL) / 15UL : 0UL)
                       : cm ? (cls ? n5 : n1) : q_odds;
@@ -1054,10 +1087,10 @@ __kernel void make_prime_map(
                 }
                 #pragma unroll
                 for (u32 u = 0; u < MED_BATCH; ++u)
-                    med_prime_f32(t32, fbv[u], pv[u], tb);
+                    med_prime_f32(t32, fbv[u], pv[u], tb, qc7v, s7v);
             }
             for (; j < sieve_split; j += WG_SIZE)
-                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb);
+                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb, qc7v, s7v);
         }
         if (cm) {                                       // class map: no wheel (uniform)
             for (; j + (MED_BATCH - 1) * WG_SIZE < sieve_split; j += MED_BATCH * WG_SIZE) {
