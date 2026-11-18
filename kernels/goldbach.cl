@@ -6789,6 +6789,26 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 #define MIDW_SKIP_STEP MIDW_SK1_STEP MIDW_SK2_STEP MIDW_SK3_STEP
 #define MIDW_SKIP_TEST (MIDW_SK1_TEST MIDW_SK2_TEST MIDW_SK3_TEST)
 
+// First mark of a mid prime in the window at class bit ws: (i0 - ws) mod p,
+// branch-free (2026-11-18, window pass -9 us per segment, was an if on
+// i0 >= ws around the remainder): d = ws - i0 lies in (-p, 2^24) (i0 < p),
+// exact as a float; trunc(d / p) is within one of the true quotient, so
+// fma(-q, p, d) is the exact remainder in (-p, 2p) and two selects bring it
+// into [0, p). d < 0 (window 0, i0 > ws) gives rm = d + p, i.e. i0 - ws.
+/// @pre    i0 < p < 2^23 (mid_setup), ws < 2^24.
+/// @return the window-relative bit of p's first mark at or after ws.
+inline u32 midw_first(const u32 i0, const u32 p, const u32 ws)
+{
+    const float pf = (float)p;
+    const float df = (float)(int)(ws - i0);
+    const float qf = trunc(df * (1.0f / pf));
+    float rf = fma(-qf, pf, df);
+    rf += (rf < 0.0f) ? pf : 0.0f;
+    rf -= (rf >= pf) ? pf : 0.0f;
+    const u32 rmu = (u32)rf;
+    return rmu ? p - rmu : 0u;
+}
+
 #if MIDW_SG
 __attribute__((intel_reqd_sub_group_size(MIDW_SG)))
 #endif
@@ -6852,35 +6872,13 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         #pragma unroll
         for (u32 u = 0; u < MIDW_BATCH; ++u) {
             const u32 p = pv[u];
-            u32 bit;
-            if (iv[u] >= ws) bit = iv[u] - ws;
-            else {                          // d < 2^24: exact float remainder (med_prime_f32)
-                const float df = (float)(ws - iv[u]);
-                const float pf = (float)p;
-                const float qf = trunc(df * (1.0f / pf));
-                float rf = fma(-qf, pf, df);
-                rf += (rf < 0.0f) ? pf : 0.0f;
-                rf -= (rf >= pf) ? pf : 0.0f;
-                const u32 rmu = (u32)rf;
-                bit = rmu ? p - rmu : 0u;
-            }
+            const u32 bit = midw_first(iv[u], p, ws);
             MIDW_MARK_LOOP(bit, p, wb, v, ws)
         }
     }
     for (; j < n; j += wg) {
         const u32 i0 = it[j], p = pr[j];
-        u32 bit;
-        if (i0 >= ws) bit = i0 - ws;
-        else {
-            const float df = (float)(ws - i0);
-            const float pf = (float)p;
-            const float qf = trunc(df * (1.0f / pf));
-            float rf = fma(-qf, pf, df);
-            rf += (rf < 0.0f) ? pf : 0.0f;
-            rf -= (rf >= pf) ? pf : 0.0f;
-            const u32 rmu = (u32)rf;
-            bit = rmu ? p - rmu : 0u;
-        }
+        const u32 bit = midw_first(i0, p, ws);
         MIDW_MARK_LOOP(bit, p, wb, v, ws)
     }
     barrier(CLK_LOCAL_MEM_FENCE);
