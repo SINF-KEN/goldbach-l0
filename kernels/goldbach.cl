@@ -2298,6 +2298,9 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+#ifndef MED_BF
+#define MED_BF 1
+#endif
 #ifndef MED_W7_MAXP
 #define MED_W7_MAXP 8192u
 #endif
@@ -2308,6 +2311,19 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
+#if MED_BF
+    {   // both arms, one select (no divergent branch; the float arm's value
+        // is discarded when fb >= tile_bit0)
+        // (fb - tile_bit0) mod p by a floor quotient (as midw_first)
+        const float df = (float)(int)(fb - tile_bit0);
+        const float pf = (float)p;
+        const float qf = floor(df * (1.0f / pf));
+        float rf = fma(-qf, pf, df);
+        rf += (rf < 0.0f) ? pf : 0.0f;
+        rf -= (rf >= pf) ? pf : 0.0f;
+        bit = (fb >= tile_bit0) ? fb - tile_bit0 : (u32)rf;
+    }
+#else
     if (fb >= tile_bit0) {
         bit = fb - tile_bit0;
     } else {
@@ -2320,6 +2336,7 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
         const u32 rmu = (u32)rf;
         bit = rmu ? p - rmu : 0u;
     }
+#endif
     // Wheel 7, unrolled (2026-11-18, sieve -4.4 ms per 1e11): the marks of
     // q = 0 (mod 7) are already cleared by the tile kernel's own sieving of
     // 7 (mask or walk; q = p m >= 7 p, never 7 itself). Along a class array
@@ -6704,6 +6721,9 @@ __kernel void sieve_large_packed_hl(
 #ifndef MIDW_BATCH
 #define MIDW_BATCH 4             // 2026-11-17: 4 > 8 = 16 (window pass -1%)
 #endif
+#ifndef MIDW_FLOOR
+#define MIDW_FLOOR 1
+#endif
 #ifndef MIDW_SG
 #define MIDW_SG 16               // SIMD16: window pass -3% vs the compiler's SIMD32
 #endif
@@ -6740,7 +6760,7 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 ///         MIDW_ANDST 0 / 1: no concurrent writer. Class bits < 2^24.
 /// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
 #ifndef MIDW_ANDST
-#define MIDW_ANDST 2             // 2: atomic AND store (the packed kernel may overlap)
+#define MIDW_ANDST 3             // 2: atomic AND store (the packed kernel may overlap); 3: 64-bit atomics
 #endif
 #ifndef MIDW_SKIP
 #define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
@@ -6799,6 +6819,17 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 /// @return the window-relative bit of p's first mark at or after ws.
 inline u32 midw_first(const u32 i0, const u32 p, const u32 ws)
 {
+#if MIDW_FLOOR
+    // r = (i0 - ws) mod p directly: floor quotient of d = i0 - ws in
+    // (-2^24, p), r = d - q p in (-p, 2p) (q within one), two fix-ups
+    const float pf = (float)p;
+    const float df = (float)(int)(i0 - ws);
+    const float qf = floor(df * (1.0f / pf));
+    float rf = fma(-qf, pf, df);
+    rf += (rf < 0.0f) ? pf : 0.0f;
+    rf -= (rf >= pf) ? pf : 0.0f;
+    return (u32)rf;
+#else
     const float pf = (float)p;
     const float df = (float)(int)(ws - i0);
     const float qf = trunc(df * (1.0f / pf));
@@ -6807,6 +6838,7 @@ inline u32 midw_first(const u32 i0, const u32 p, const u32 ws)
     rf -= (rf >= pf) ? pf : 0.0f;
     const u32 rmu = (u32)rf;
     return rmu ? p - rmu : 0u;
+#endif
 }
 
 #if MIDW_SG
@@ -6885,7 +6917,19 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     {
         __global uint4* g4 = (__global uint4*)gm;
         __local const uint4* w4 = (__local const uint4*)win;
-#if MIDW_ANDST == 2
+#if MIDW_ANDST == 3
+        // 64-bit atomic ANDs: half the atomic lanes (gm is 16 KB aligned)
+        __global u64* gm64 = (__global u64*)gm;
+        __local const u64* w64 = (__local const u64*)win;
+        for (u32 i = lid; i < (nw >> 1); i += wg) {
+            const u64 x = w64[i];
+            if (x != ~0UL) atom_and((volatile __global u64*)gm64 + i, x);
+        }
+        if ((nw & 1u) && lid == 0) {
+            const u32 x = win[nw - 1u];
+            if (x != ~0u) atomic_and((volatile __global u32*)gm + nw - 1u, x);
+        }
+#elif MIDW_ANDST == 2
         // atomic AND: the packed large kernel may already be marking
         for (u32 i = lid; i < nw; i += wg) {
             const u32 x = win[i];
