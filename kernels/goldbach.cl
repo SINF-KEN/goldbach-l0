@@ -3820,6 +3820,9 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 ///         visible (barrier before); no concurrent writer of the map (the
 ///         window is written back with plain stores). Class bits < 2^24.
 /// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
+#ifndef MIDW_ANDST
+#define MIDW_ANDST 1
+#endif
 #ifndef MIDW_SKIP
 #define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
 #endif
@@ -3900,6 +3903,15 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     // core, so the window load / store latency is exposed; uint4 issues 4x
     // fewer messages (2026-11-18: window pass -5.5 ms per 1e11, +0.8%)
     const u32 nw4 = nw >> 2;
+#if MIDW_ANDST
+    // the window starts as ones and is ANDed into the map at the store: no
+    // exposed load phase before the marks (one work-group per Xe core)
+    {
+        __local uint4* w4 = (__local uint4*)win;
+        for (u32 i = lid; i < nw4; i += wg) w4[i] = (uint4)(~0u);
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = ~0u;
+    }
+#else
     {
         __global const uint4* g4 = (__global const uint4*)gm;
         __local uint4* w4 = (__local uint4*)win;
@@ -3907,6 +3919,7 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         for (u32 i = lid; i < nw4; i += wg) w4[i] = g4[i];
         for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = gm[i];
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     volatile __local u32* v = (volatile __local u32*)win;
     __global const u32* it = i0tab + (size_t)cls * n;
@@ -3954,8 +3967,14 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     {
         __global uint4* g4 = (__global uint4*)gm;
         __local const uint4* w4 = (__local const uint4*)win;
+#if MIDW_ANDST
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) g4[i] &= w4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] &= win[i];
+#else
         #pragma unroll 8
         for (u32 i = lid; i < nw4; i += wg) g4[i] = w4[i];
         for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] = win[i];
+#endif
     }
 }
