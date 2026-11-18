@@ -574,6 +574,9 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef HL_END
 #define HL_END 1
 #endif
+#ifndef HL_APPLY_LAST
+#define HL_APPLY_LAST 1          // fused apply after the packed primes
+#endif
 #ifndef HL_QS
 #define HL_QS 1                  // harvest setup from one float-float quotient
 #endif
@@ -6725,8 +6728,8 @@ __kernel void hl_apply(
 // sieve_large_packed with hl_apply fused in (HL_FUSE on the host): the list
 // marks and the packed marks are atomic ANDs on the same map, so they
 // commute; as a separate launch hl_apply ran alone, latency-bound (~4.8M
-// marks in 0.17 ms per 425M segment). Here every packed work-item first
-// takes list pairs (grid-stride, coalesced u64 loads), then its primes.
+// marks in 0.17 ms per 425M segment). Here every packed work-item takes its
+// primes, then list pairs (grid-stride, coalesced u64 loads; HL_APPLY_LAST).
 /// @pre    as sieve_large_packed and hl_apply (same segment, same map).
 /// @post   as sieve_large_packed followed by hl_apply.
 __attribute__((intel_reqd_sub_group_size(LARGE_PACK_SG)))
@@ -6744,9 +6747,18 @@ __kernel void sieve_large_packed_hl(
         volatile __global u32* restrict err)
 {
     const cmap g = {cm, phi1, phi5, off5};
+#if HL_APPLY_LAST
+    // primes first, list pairs after (2026-11-18 r7: large med 0.440 -> 0.419
+    // ms per segment; list pairs first, only in the upper half / quarter of
+    // the grid, or taken from a work counter after the primes were all slower)
+    large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+    hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
+                  get_global_id(0), get_global_size(0));
+#else
     hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
                   get_global_id(0), get_global_size(0));
     large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+#endif
 }
 
 // ----------------------------------------------------------------------------
