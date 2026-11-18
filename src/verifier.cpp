@@ -98,6 +98,10 @@ struct GpuBuffers {
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
 inline constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
+inline constexpr uint32_t HL_HARVEST_WG = 1024; // hl_harvest work-group size (GB_HLH_WG)
+// Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
+// harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
+inline constexpr uint32_t HL_K_DEFAULT = 64;
 static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
 /// Copies host data to a device buffer through a shared staging allocation.
@@ -1174,7 +1178,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // pmax + q_odds_full < 2^32 guard) and q_odds_full < 2 delta.
     // GB_HITLIST=0 restores the bucket ring (A/B); GB_HITLIST_K sets the batch.
     hitlist = bucket_on && env::onoff("GB_HITLIST", true);
-    hl_K = env::u32("GB_HITLIST_K", 128, 1u, HL_MAX_K_HOST);
+    hl_K = env::u32("GB_HITLIST_K", HL_K_DEFAULT, 1u, HL_MAX_K_HOST);
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
     // mean m = lam / hl_G hits per region). Capacity m * 1.10 + 10 sqrt(m) +
@@ -1304,7 +1308,10 @@ void DenseRun::allocate_large_prime_buffers() {
     if (hitlist) {
         k_hlh = std::make_unique<Kernel>(mod, "hl_harvest");
         k_hla = std::make_unique<Kernel>(mod, hl_fuse ? "sieve_large_packed_hl" : "hl_apply");
-        k_hlh->set_group_size(WG_SIZE);
+        // 1024 (2026-11-18): the scattered list stores are L2 write-combined;
+        // a larger group fills its regions' lines faster (harvest -6 ms per
+        // 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST work-items.
+        k_hlh->set_group_size(env::u32("GB_HLH_WG", HL_HARVEST_WG, HL_MAX_K_HOST, 1024u));
         k_hla->set_group_size(hl_fuse ? large_wg : WG_SIZE);
     } else if (bucket_on) {
         k_bproc = std::make_unique<Kernel>(mod, "bucket_process");
