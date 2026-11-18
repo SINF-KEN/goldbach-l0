@@ -72,6 +72,55 @@ inline constexpr uint32_t COUNT30_CW = 4;          // MUST match C30_CW in goldb
 // prime gaps (count30's tail and walk, the live paper's section 2.2)
 inline constexpr uint32_t GAPS30_TAIL = 700;       // MUST match G30T_TAIL in goldbach.cl
 inline constexpr uint32_t GAPS30_HBINS = 1024;     // MUST match G30_HBINS in goldbach.cl
+inline constexpr uint32_t GAPS30_PBINS = 256;      // count30 block-walk pattern bins (G30_PBINS), after the histogram
+
+/// Adds the internal gaps of count30's block-walk patterns to a gap
+/// histogram (bins g / 2): pattern x (bits s0 s4 s1 s5 s2 s6 s3 s7 = the
+/// slots of a block of 30 in phase order holding a prime) occurred pat[x]
+/// times; consecutive slots a < b contribute gap / 2 = phase_b - phase_a,
+/// phases = nibbles of phis (ascending).
+/// @return the largest internal gap / 2 that occurred (0: none).
+inline uint32_t add_pattern_gaps(uint32_t* hist, const uint32_t* pat, uint32_t phis)
+{
+    uint32_t dmax = 0;
+    for (uint32_t x = 0; x < GAPS30_PBINS; ++x) {
+        if (!pat[x]) continue;
+        int prev = -1;
+        for (uint32_t t = 0; t < 8; ++t) {
+            const uint32_t bit = t < 4 ? 2 * t : 2 * (t - 4) + 1;
+            if (!((x >> bit) & 1u)) continue;
+            const int ph = int((phis >> (4 * t)) & 15u);
+            if (prev >= 0) {
+                hist[ph - prev] += pat[x];
+                dmax = std::max<uint32_t>(dmax, uint32_t(ph - prev));
+            }
+            prev = ph;
+        }
+    }
+    return dmax;
+}
+
+/// The walk maximum of a segment from the primes themselves (Miller-Rabin
+/// on every odd q of its counted range [q_first + lo, q_first + hi]): the
+/// largest gap g between consecutive primes and the smallest position of
+/// its upper prime, as count30's g << 32 | ~position. For the block walk's
+/// segments whose largest gap into a block is not larger than an internal
+/// one (all gaps <= 28: tiny runs).
+/// @throws std::runtime_error if the range exceeds 10^7 (never seen: such a
+///         range holds gaps >= 30).
+inline uint64_t walk_max_exact(uint64_t q_first, uint32_t lo, uint32_t hi)
+{
+    if (hi < lo || hi - lo > 10000000u)
+        throw std::runtime_error("gaps: block-walk maximum needs a CPU walk over " + std::to_string(hi - lo));
+    uint64_t best = 0;
+    uint32_t prev = lo, up = 0;
+    for (uint32_t pos = lo + 2; pos <= hi; pos += 2)
+        if (is_prime_u64(q_first + pos)) {
+            if (pos - prev > best) { best = pos - prev; up = pos; }
+            prev = pos;
+        }
+    return best ? (best << 32) | uint64_t(~up) : 0;
+}
 inline constexpr uint32_t GAPS30_TCAP = 4096;      // tail entries per segment (~1 expected)
 inline constexpr uint32_t GAPS30_GROUPS = 48;      // default count30 grid on walked segments (work-groups, grid-stride)
                                                   // on a GAPS30_REF_EUS device; scaled by the device's EU count
