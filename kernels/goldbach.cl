@@ -2439,7 +2439,11 @@ __kernel void make_prime_map(
     // Primes [sieve_split, sieve_count) are handled by sieve_large_primes.
     // the fused groups may also clear the next xp primes (host GB_MASK_XP:
     // 67, 71, ...); the owned walk starts after them
-    const u32 xp = (n_groups > 0) ? n_groups_xp >> 8 : 0u;
+    const u32 xp = (n_groups > 0) ? (n_groups_xp >> 8) & 0xFFu : 0u;
+    // medium items (host plan, n_groups_xp >> 16 of them, after the group
+    // descriptors): prime index, tile words [lo, hi) as lo | hi << 16
+    const u32 med_nit = (n_groups > 0) ? n_groups_xp >> 16 : 0u;
+    __global const uint2* med_items = (__global const uint2*)(group_desc + 2u * MAX_MASK_GROUPS);
     const u32 j_begin = (mask_count > 0) ? mask_count + xp : 0;
 
     if (use_table) {
@@ -2644,6 +2648,41 @@ __kernel void make_prime_map(
             sieve_primes[sieve_split - 1u] < (1u << 23)) {   // uniform (med_prime_f32 PRE)
             __global const u32* fb32 = (__global const u32*)fb_global;   // low words
             const u32 tb = (u32)tile_bit0;
+            if (med_nit) {                             // uniform
+                // Host-planned items (prime, tile word range) of about equal
+                // mark counts, sorted by mark count: the lanes of a sub-group
+                // run equally long mark loops. Rows of WG_SIZE items snake.
+                const u32 nrow = (med_nit + WG_SIZE - 1u) / WG_SIZE;
+                const u32 meo = WG_SIZE - 1u - me;
+                u32 r = 0;
+                for (; r + MED_BATCH <= nrow; r += MED_BATCH) {
+                    u32 fbv[MED_BATCH], pv[MED_BATCH], wv[MED_BATCH];
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 it = (r + u) * WG_SIZE + (((r + u) & 1u) ? meo : me);
+                        const bool ok = it < med_nit;
+                        const uint2 d = med_items[ok ? it : 0u];
+                        wv[u] = ok ? d.y : 0u;
+                        fbv[u] = ok ? fb32[2u * d.x] : 0xFFFFFFFFu;
+                        pv[u] = ok ? sieve_primes[d.x] : 0u;
+                    }
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 w0 = wv[u] & 0xFFFFu, w1 = wv[u] >> 16;
+                        med_prime_f32n(t32 + w0, fbv[u], pv[u], tb + 32u * w0, qc7v, s7v,
+                                       32u * (w1 - w0), c1v);
+                    }
+                }
+                for (; r < nrow; ++r) {
+                    const u32 it = r * WG_SIZE + ((r & 1u) ? meo : me);
+                    if (it >= med_nit) continue;
+                    const uint2 d = med_items[it];
+                    const u32 w0 = d.y & 0xFFFFu, w1 = d.y >> 16;
+                    med_prime_f32n(t32 + w0, fb32[2u * d.x], sieve_primes[d.x], tb + 32u * w0, qc7v, s7v,
+                                   32u * (w1 - w0), c1v);
+                }
+                j = sieve_split;
+            } else
 #if MED_SPLITN
             // (only for short medium ranges, as the mid-window split's 1500:
             // with many rows the imbalance is small and the index ALU costs,

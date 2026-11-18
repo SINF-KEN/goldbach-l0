@@ -470,6 +470,8 @@ private:
 
     // ---- set_group_sizes ------------------------------------------------------
     uint32_t own_end = 0;            // primes [0, own_end): thread-owned tile walk
+    std::vector<uint32_t> med_items_host;   // medium items (prime, word range lo | hi << 16)
+    uint32_t med_nit = 0;            // items uploaded (0: none)
     double module_seconds = 0.0;
     uint32_t large_wg = 0;           // GB_LARGE_WG
 
@@ -892,13 +894,38 @@ void DenseRun::set_group_sizes() {
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    const uint32_t med_min_p = env::u32("GB_MED_P", !class_mode ? MED_MIN_P : midwin_pre ? MED_MIN_P_MIDWIN : MED_MIN_P_CLASS);
+    // GB_MED_ITEMS (2026-11-18): with the mid windows the medium stage takes
+    // every tile prime after the mask groups (the owned walk goes) as items of
+    // about T marks (+0.6%; T 90..110 flat, 80 / 130 worse)
+    const uint32_t med_items_t = env::u32("GB_MED_ITEMS", class_mode && midwin_pre ? MED_ITEMS_MIDWIN : 0u);
+    const uint32_t med_min_p = env::u32("GB_MED_P", !class_mode ? MED_MIN_P
+                                                    : midwin_pre ? (med_items_t ? MED_MIN_P_ITEMS : MED_MIN_P_MIDWIN)
+                                                                 : MED_MIN_P_CLASS);
     own_end = std::clamp<uint32_t>(uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_split, med_min_p) -
         sieve_primes), mask_count, sieve_split);
     module_seconds = seconds_since(t_module);
     init_mark("module");
-
+    // Medium items (GB_MED_ITEMS = marks per item, default MED_ITEMS_MIDWIN
+    // with the mid windows): every medium prime split into n = round(marks
+    // per tile / T) >= 1 equal tile word ranges, the items sorted by marks
+    // (the lanes of a sub-group run equally long loops). Uploaded behind the
+    // mask group descriptors (size_buffers).
+    med_items_host.clear();
+    if (const uint32_t T = med_items_t; T > 0 && class_mode && own_end < sieve_split) {
+        struct It { double m; uint32_t j, w; };
+        std::vector<It> v;
+        const uint32_t tw = uint32_t(BITS_PER_TILE / 32);
+        for (uint32_t j = own_end; j < sieve_split; ++j) {
+            const double m = double(BITS_PER_TILE) / sieve_primes[j];
+            const uint32_t n = std::clamp<uint32_t>(uint32_t(std::lround(m / T)), 1u, tw);
+            for (uint32_t i = 0; i < n; ++i)
+                v.push_back({m / n, j, (i * tw / n) | (((i + 1) * tw / n) << 16)});
+        }
+        std::stable_sort(v.begin(), v.end(), [](const It& x, const It& y) { return x.m > y.m; });
+        if (v.size() < 65536)
+            for (const It& t : v) { med_items_host.push_back(t.j); med_items_host.push_back(t.w); }
+    }
     k_sieve.set_group_size(WG_SIZE);
     // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
     // kernel indexes by global id). N must be a non-zero multiple of the
@@ -999,8 +1026,13 @@ void DenseRun::size_buffers() {
     d_group_desc = nullptr;
     if (mask_groups_n == 0) mask_xp = 0;   // per-prime mask path: the owned walk takes them
     if (mask_groups_n > 0) {
-        d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared(mask_groups0.desc.size() * 4));
+        // the medium items follow the descriptors at 2 * MAX_MASK_GROUPS words
+        const size_t dw = std::max<size_t>(mask_groups0.desc.size(), 2 * MAX_MASK_GROUPS_HOST);
+        d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared((dw + med_items_host.size()) * 4));
+        std::memset(d_group_desc, 0, dw * 4);
         std::memcpy(d_group_desc, mask_groups0.desc.data(), mask_groups0.desc.size() * 4);
+        std::memcpy(d_group_desc + 2 * MAX_MASK_GROUPS_HOST, med_items_host.data(), med_items_host.size() * 4);
+        med_nit = uint32_t(med_items_host.size() / 2);
     }
 }
 
@@ -1992,7 +2024,7 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     k_sieve.set_arg(15, sizeof(own_end),       &own_end);
     k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
     k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
-    const uint32_t groups_xp = mask_groups_n | mask_xp << 8;   // make_prime_map: n_groups_xp
+    const uint32_t groups_xp = mask_groups_n | mask_xp << 8 | med_nit << 16;   // make_prime_map: n_groups_xp
     k_sieve.set_arg(18, sizeof(groups_xp), &groups_xp);
     k_sieve.set_arg(19, 4, &cm_u32);
     k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
