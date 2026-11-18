@@ -3816,7 +3816,17 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     const u32 wb = min(win_bits, nc - ws);  // valid bits of this window
     const u32 nw = (wb + 31u) >> 5;
     __global u32* gm = map32 + (size_t)cls * c5w32 + (ws >> 5);
-    for (u32 i = lid; i < nw; i += wg) win[i] = gm[i];
+    // 16-byte loads and stores (gm is 16 KB aligned): one work-group per Xe
+    // core, so the window load / store latency is exposed; uint4 issues 4x
+    // fewer messages (2026-11-18: window pass -5.5 ms per 1e11, +0.8%)
+    const u32 nw4 = nw >> 2;
+    {
+        __global const uint4* g4 = (__global const uint4*)gm;
+        __local uint4* w4 = (__local uint4*)win;
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) w4[i] = g4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = gm[i];
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
     volatile __local u32* v = (volatile __local u32*)win;
     __global const u32* it = i0tab + (size_t)cls * n;
@@ -3861,5 +3871,11 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         MIDW_MARK_LOOP(bit, p, wb, v, ws)
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (u32 i = lid; i < nw; i += wg) gm[i] = win[i];
+    {
+        __global uint4* g4 = (__global uint4*)gm;
+        __local const uint4* w4 = (__local const uint4*)win;
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) g4[i] = w4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] = win[i];
+    }
 }
