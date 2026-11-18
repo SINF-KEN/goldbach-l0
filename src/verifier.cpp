@@ -1600,7 +1600,7 @@ void DenseRun::build_mtab() {
     ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
     kb.set_arg(7, sizeof(d_pat), &d_pat);
     const auto t0 = clock_::now();
-    kb.launch(ctx.list(), (mt_blocks + 63) / 64);   // MT_CB
+    kb.launch(ctx.list(), (mt_blocks + 127) / 128);   // MT_CB (kernels/goldbach.cl)
     ctx.host_sync();
     Context::free_mem(ctx.context(), d_pat);
     if (verbose)

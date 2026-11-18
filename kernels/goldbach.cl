@@ -5814,7 +5814,7 @@ inline u32 inv32(const u32 p)
 }
 
 #ifndef MT_CB
-#define MT_CB 64                 // table blocks (30030 numbers, 180 words) per mt_build group
+#define MT_CB 128                // table blocks (30030 numbers, 180 words) per mt_build group (host: MT_CB_HOST)
 #endif
 #define MT_SPLIT_P 1024u         // primes below: marks split over MT_R sub-ranges (load balance)
 #define MT_R 32u
@@ -5831,7 +5831,7 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
                        __global const u32* restrict pat)   // MT_PRE patterns (host: mt_patterns)
 {
     __local u32 win[MT_CB * 180];
-    __local ushort lidx[30030];
+    __local ushort lidx[15015];       // odd residues r: lidx[r >> 1] (every m here is odd)
     __local uchar lstep[WHL_N];
     const u32 lid = get_local_id(0), wg = get_local_size(0);
     const u32 kb0 = get_group_id(0) * MT_CB;
@@ -5849,7 +5849,7 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
 #undef MT_P
         win[i] = v;
     }
-    for (u32 i = lid; i < 30030u; i += wg) lidx[i] = WHL_IDX[i];
+    for (u32 i = lid; i < 15015u; i += wg) lidx[i] = WHL_IDX[2u * i + 1u];
     for (u32 i = lid; i < WHL_N; i += wg) lstep[i] = WHL_STEP[i];
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 m_a = (u64)(k_lo + kb0) * 30030UL;   // even
@@ -5871,12 +5871,12 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
         u32 rel = ra + (rm ? s - rm : 0u);
         if (!(rel & 1u)) rel += s;                    // m_a even: rel odd <-> m odd
         u32 rt = (u32)(((u64)(rel % 30030u) * WHL_INV[s % 30030u]) % 30030u);   // t mod 30030
-        while (lidx[rt] == WHL_MISS) { rel += 2u * s; rt += 2u; if (rt >= 30030u) rt -= 30030u; }
+        while (lidx[rt >> 1] == WHL_MISS) { rel += 2u * s; rt += 2u; if (rt >= 30030u) rt -= 30030u; }
         if (rel >= rb) continue;
-        u32 w = lidx[rt];
+        u32 w = lidx[rt >> 1];
         for (;;) {
             const u32 kk = rel / 30030u;
-            const u32 bit = kk * 5760u + lidx[rel - kk * 30030u];
+            const u32 bit = kk * 5760u + lidx[(rel - kk * 30030u) >> 1];
             atomic_and((volatile __local u32*)&win[bit >> 5], ~(1u << (bit & 31u)));
             const u32 st = 2u * s * lstep[w];
             if (rb - rel <= st) break;
