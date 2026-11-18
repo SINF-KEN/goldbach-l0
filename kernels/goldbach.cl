@@ -3783,7 +3783,10 @@ inline u64 tw64(const __global u64* map, const long w, const u64 map_words, cons
 // gb::CHECK_PHASE_A_W64). v1.13.0: 14 (896 evens per item): the mod-30
 // checker spilled ~26 registers at 16 (12: spill-free, -1.0% total; 14 spills
 // ~12 but -0.28% / -0.22% more on long / long-end; 8: +0.3%, 10: +0.04%).
-#define A_W64 12               // 14 -> 12 after C30_ROT (spill-free, +0.2%); 8/10/14/16 windows removed
+#ifndef A_W64
+#define A_W64 12
+#endif
+//                             14 -> 12 after C30_ROT (spill-free, +0.2%); 8/10/14/16 windows removed
 /// Phase A of the two-phase checker (first cand_cap candidates).
 /// @pre    as check_numbers; with twin = 1, gb_primes lists lower twin members.
 /// @post   checked[] holds the partial result; every unresolved valid even is
@@ -3935,6 +3938,9 @@ __kernel void check_phase_a(
 // CB_FLAT (2026-11-18, r6b): flattened check30_b probe loop (lanes refill
 // themselves per even) on a small grid (CHECK30_B_GROUPS = 40, beside the
 // next tile sieve): period 1.662 -> 1.634 ms per segment at 4e18
+#ifndef ABL_BSKIP
+#define ABL_BSKIP 0
+#endif
 #ifndef CB_FLAT
 #define CB_FLAT 1
 #endif
@@ -4397,6 +4403,22 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 // Vector loads (5 x vload8 from wb-4, one LSC message each) instead of 37
 // scalar loads: every lane reads its own lines, so each scalar SIMD load
 // touched 16 cache lines and window reloads were L1-throughput-bound.
+#if A_W64 != 12
+// generic width (experiments): 2 A_W64 + 5 words from wb - 4
+#define C30_WIN(S, wb, n) do { \
+    if ((wb) >= 4 && (wb) + 2 * A_W64 + 4 <= (int)(n)) { \
+        const __global u32* P_ = (S) + ((wb) - 4); \
+        u32 t_[((2 * A_W64 + 5) + 7) / 8 * 8]; \
+        _Pragma("unroll") for (u32 c_ = 0; c_ < (2 * A_W64 + 5) / 8; ++c_) vstore8(vload8(c_, P_), c_, t_); \
+        _Pragma("unroll") for (u32 c_ = (2 * A_W64 + 5) / 8 * 8; c_ < 2 * A_W64 + 5; ++c_) t_[c_] = P_[c_]; \
+        r4 = t_[0]; r3 = t_[1]; r2 = t_[2]; r1 = t_[3]; \
+        _Pragma("unroll") for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = t_[4 + i_]; \
+    } else { \
+        _Pragma("unroll") for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = split_ld((S), (wb) + i_, (n)); \
+        r1 = split_ld((S), (wb) - 1, (n)); r2 = split_ld((S), (wb) - 2, (n)); \
+        r3 = split_ld((S), (wb) - 3, (n)); r4 = split_ld((S), (wb) - 4, (n)); \
+    } } while (0)
+#else
 #define C30_WIN(S, wb, n) do { \
     if ((wb) >= 4 && (wb) + 28 <= (int)(n)) { \
         const __global u32* P_ = (S) + ((wb) - 4); \
@@ -4435,6 +4457,7 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
         r1 = split_ld((S), (wb) - 1, (n)); r2 = split_ld((S), (wb) - 2, (n)); \
         r3 = split_ld((S), (wb) - 3, (n)); r4 = split_ld((S), (wb) - 4, (n)); \
     } } while (0)
+#endif
 
 // Pattern OR of the whole window, in place top down; specialized for the
 // contiguous masks the plans use (a runtime-mask loop costs every shift).
@@ -4473,8 +4496,11 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 #ifndef CA_SG
 #define CA_SG 16
 #endif
+// CA_PAIR (2026-11-18 r6b): two candidates of the same window word per
+// iteration, merged by one 3-input OR (phase A 0.267 -> 0.263 ms per segment,
+// +0.28% both bench windows); 2 = also pair across a one-word step (slower)
 #ifndef CA_PAIR
-#define CA_PAIR 0
+#define CA_PAIR 1
 #endif
 #ifndef ABL_WIN
 #define ABL_WIN 0
@@ -4493,6 +4519,12 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 #endif
 #ifndef ABL_ONEF
 #define ABL_ONEF 0
+#endif
+#ifndef CA_SHF
+#define CA_SHF 0
+#endif
+#ifndef ABL_NOPEND
+#define ABL_NOPEND 0
 #endif
 #ifndef CA_PRO
 #define CA_PRO 0
@@ -4626,6 +4658,25 @@ __kernel void check30_a(
                         U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
                         continue;
                     }
+#if CA_PAIR >= 2
+                    if (tw2 == tw - 1) {                 // second one word lower: m[-1] = r1
+                        const u32 rr1 = (u32)U & 31u, rr2 = (u32)U2 & 31u;
+                        const u32 rl1 = 32u - rr1, rl2 = 32u - rr2;
+                        const u32 hm1 = 0xFFFFFFFFu >> rr1, hm2 = 0xFFFFFFFFu >> rr2;
+                        u32 rn1 = rotate(m[0], rl1), rn2 = rotate(c30_orp(r1, r2, mask), rl2);
+                        #pragma unroll
+                        for (u32 i = 0; i < 2 * A_W64; ++i) {
+                            const u32 rc1 = rn1, rc2 = rn2;
+                            rn1 = rotate(m[i + 1], rl1);
+                            rn2 = rotate(m[i], rl2);
+                            acc[i] |= bitselect(rn1, rc1, hm1) | bitselect(rn2, rc2, hm2);
+                        }
+                        j += 2u;
+                        if (j >= je) break;
+                        U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+                        continue;
+                    }
+#endif
                 }
 #endif
                 const u32 rr = (u32)U & 31u;
@@ -4650,6 +4701,16 @@ __kernel void check30_a(
                     rn2 = rotate(m[i + 1], rl ^ 1u);
                     acc[i] |= bitselect(rn, rc, hm);
                     acc[i] |= bitselect(rn2, rc2, hm ^ (hm >> 1));
+                }
+#elif CA_SHF
+                // shift funnel (CA_SHF): rotates issue at ~half the rate
+                // of shifts on Xe2; rr = 0 (no shift) as its own branch
+                if (CA_SHF == 1 && rr == 0u) {                        // xor form: no common OR to sink
+                    #pragma unroll
+                    for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] ^= m[i] & ~acc[i];
+                } else {
+                    #pragma unroll
+                    for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= (m[i] >> rr) | (m[i + 1] << rl);
                 }
 #else
                 u32 rn = rotate(m[0], rl);
@@ -4695,7 +4756,7 @@ __kernel void check30_a(
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
-    if (cnt) {
+    if (cnt && !ABL_NOPEND) {
         #pragma unroll
         for (u32 i = 0; i < 2 * A_W64; ++i) {
             u32 miss = ~acc[i];
@@ -4758,6 +4819,9 @@ __kernel void check30_b(
     // its current one is resolved or exhausted, so a subgroup no longer
     // waits for its slowest lane per even (the probes per even are
     // geometric: mean ~3 batches, max over a subgroup ~10).
+#if ABL_BSKIP
+    if (n > 0u) return;
+#endif
     u32 i = get_global_id(0);
     u32 e = 0u, cr = 0u, ro = 0u, rc = 0u, j = 0u;
     bool have = false;
