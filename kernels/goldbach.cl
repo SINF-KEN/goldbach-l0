@@ -1880,16 +1880,18 @@ __constant uchar SKR_MR2[5860] = {
     30, 8, 29, 7, 28, 6, 27, 5, 26, 4, 25, 3, 24, 2, 23, 1, 22, 0, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21,
     20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
 };
-inline u32 skr2_target(const u32 bit, const u32 p, const u32 w, const u32 qfr2)
+inline u32 skr2_target_q(const u32 q, const u32 p, const u32 mw)
 {
-    const u32 mw = WHL_SF2[w];
-    const u32 q = qfr2 + 2u * bit;
     u32 T = 0u;
 #define SKR_F(i, o, r) { const u32 mr = SKR_MR2[o + (p % r) * r + q % r]; const u32 x = (mw >> (7u * i)) & 127u; \
         T |= ((x >= mr) ? x - mr : x + r - mr) << (7u * i); }
     SKR_F(0u, 0u, 31u) SKR_F(1u, 961u, 37u) SKR_F(2u, 2330u, 41u) SKR_F(3u, 4011u, 43u)
 #undef SKR_F
     return T;
+}
+inline u32 skr2_target(const u32 bit, const u32 p, const u32 w, const u32 qfr2)
+{
+    return skr2_target_q(qfr2 + 2u * bit, p, WHL_SF2[w]);
 }
 inline u32 skr2_wrap(const u32 T)
 {
@@ -5158,6 +5160,9 @@ XS_KERNEL(check30_xs3, 3u, XS_W3)
 #ifndef HL_SKR
 #define HL_SKR 1                 // harvest skips hits p m, m divisible by 17..29 (LARGE_SKR)
 #endif
+#ifndef HL_SKR2
+#define HL_SKR2 1                // ... and by 31..43 (requires HL_SKR)
+#endif
 // q_odds of batch segment j (only the batch's last may be the run's short tail).
 #define HL_QO(j) (((j) == nseg - 1u) ? q_odds_tail : q_odds_full)
 /// Harvests the hits of primes [a, b) for segments [k0, k0 + nseg) of the batch.
@@ -5186,6 +5191,9 @@ __kernel void hl_harvest(
     __local u32 lpos[HL_MAX_K];
 #if HL_SKR
     __local u32 lstp[WHL_N];                 // WHL_SF: step + M[w] mod 17/19/23/29
+#if HL_SKR2
+    __local u32 lsf2[WHL_N];                 // WHL_SF2: M[w] mod 31/37/41/43
+#endif
 #else
     __local uchar lstp[WHL_N];
 #endif
@@ -5194,6 +5202,10 @@ __kernel void hl_harvest(
 #if HL_SKR
     for (u32 w = lid; w < WHL_N; w += wg) lstp[w] = WHL_SF[w];
     const u32 qfr = (u32)(q_first % (u64)SKR_R);
+#if HL_SKR2
+    for (u32 w = lid; w < WHL_N; w += wg) lsf2[w] = WHL_SF2[w];
+    const u32 qfr2 = (u32)(q_first % 2022161UL);
+#endif
 #else
     for (u32 w = lid; w < WHL_N; w += wg) lstp[w] = WHL_STEP[w];
 #endif
@@ -5219,6 +5231,10 @@ __kernel void hl_harvest(
             // x mod SKR_R from its u32 halves (x < 2^40: hi * (2^32 mod R) < 2^26)
             const u32 xr = ((u32)(x >> 32) * 150961u + (u32)x % SKR_R) % SKR_R;
             u32 T = skr_target_q((qfr + 2u * xr) % SKR_R, p, lstp[w] >> 4);
+#if HL_SKR2
+            const u32 xr2 = ((u32)(x >> 32) * 1919493u % 2022161u + (u32)x % 2022161u) % 2022161u;
+            u32 T2 = skr2_target_q((qfr2 + 2u * xr2) % 2022161u, p, lsf2[w]);
+#endif
 #endif
             // (j, off) of x by a float quotient, exact by the fix-up loops
             // (off in (-delta, 2 delta) fits an int: 2 delta < 2^31)
@@ -5231,7 +5247,11 @@ __kernel void hl_harvest(
                 const u32 off = (u32)o;
 #if HL_SKR
                 const u32 e = lstp[w];
-                if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H) {
+                if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H
+#if HL_SKR2
+                    && ((((lsf2[w] ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H
+#endif
+                    ) {
 #endif
                 if (j < nseg && off < HL_QO(j)) {
                     const u32 idx = atomic_inc(&lpos[j]);
@@ -5244,7 +5264,12 @@ __kernel void hl_harvest(
 #if HL_SKR
                 }
                 x += (u64)p * (e & 15u);
-                if (++w == WHL_N) { w = 0u; T = skr_wrap(T); }
+                if (++w == WHL_N) {
+                    w = 0u; T = skr_wrap(T);
+#if HL_SKR2
+                    T2 = skr2_wrap(T2);
+#endif
+                }
 #else
                 x += (u64)p * lstp[w];
                 if (++w == WHL_N) w = 0u;
