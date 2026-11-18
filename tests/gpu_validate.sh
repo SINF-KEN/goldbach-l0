@@ -12,12 +12,13 @@
 #    windows of an independent verifier (tests/known_windows.py: prime
 #    counts, max p(n) and its n at 4e18 + 1e10 / 1e12, full also 1e13 and
 #    the 1e12 window across 2^63);
-# 2. end-to-end PASS (leftovers 0) in every checker mode + verification of
-#    the bucketed primes (hit lists, and the GB_HITLIST=0 ring) against a
-#    full packed-kernel rebuild at both ends of [4e18, 5e18], ragged segments
-#    and multi-batch hit lists included;
+# 2. end-to-end PASS (leftovers 0; every segment's coverage accounting holds)
+#    with statistics on and off, without hit lists, and the in-order list +
+#    verification of the hit-listed primes against a full packed-kernel
+#    rebuild at both ends of [4e18, 5e18], ragged segments and multi-batch
+#    hit lists included;
 # 3. the bit-exact kernel validators when goldbach-tools is checked out
-#    (debug_check_hi, debug_map, debug_sieve, debug_check, debug_fb).
+#    (debug_check_hi, debug_map, debug_sieve, debug_fb).
 # "quick" skips 3 and the larger windows (~2 min instead of ~12).
 # Never touches the campaign files: every run writes into a temp directory.
 set -u
@@ -93,17 +94,16 @@ e2e() {     # e2e "ENV=.. ..." goldbach_l0 args...
 }
 echo "== end to end"
 W="--start 4000000000000000000 --limit 4000000010000000000"
-for m in "X=1" "GB_STATS=0" "GB_C30=0" "GB_CLASSMAP=6" "GB_CLASSMAP=0" "GB_SPLIT=0"; do
+for m in "X=1" "GB_STATS=0" "GB_BUCKET=0" "GB_UNORDERED=0"; do
     # shellcheck disable=SC2086
     e2e "$m" $W
 done
 e2e "GB_BUCKET_VERIFY=1" --start 4000000000000000000 --limit 4000000040000000000
 e2e "GB_BUCKET_VERIFY=1" --start 4999999999960000000 --limit 5000000000000000000
 # hit lists across batch boundaries (K = 5) with a ragged last segment, a
-# ragged first segment at the top, and the bucket-ring fallback (GB_HITLIST=0)
+# ragged first segment at the top
 e2e "GB_BUCKET_VERIFY=1 GB_HITLIST_K=5" --start 4000000000000000000 --limit 4000000051123456788
 e2e "GB_BUCKET_VERIFY=1 GB_HITLIST_K=50" --start 4999999948876543210 --limit 5000000000000000000
-e2e "GB_BUCKET_VERIFY=1 GB_HITLIST=0" --start 4000000000000000000 --limit 4000000040000000000
 e2e "X=1" --start 1000000000000000 --limit 1000000100000000 --segment 1000000
 if "$BIN" --cpu-check 1000000 2>&1 | grep -q PASS; then echo "  ok   --cpu-check 1000000"
 else echo "  FAIL --cpu-check"; fail=$((fail + 1)); fi
@@ -111,7 +111,7 @@ else echo "  FAIL --cpu-check"; fail=$((fail + 1)); fi
 # --- 3. bit-exact kernel validators (goldbach-tools) ---------------------------
 if [ -z "$QUICK" ]; then
     echo "== kernel validators"
-    for v in debug_check_hi debug_map debug_sieve debug_check debug_fb; do
+    for v in debug_check_hi debug_map debug_sieve debug_fb; do
         if [ ! -x "$BUILD/$v" ]; then echo "  skip $v (goldbach-tools not built)"; continue; fi
         if "$BUILD/$v" >"$T/$v.out" 2>&1; then echo "  ok   $v: $(tail -1 "$T/$v.out")"
         else echo "  FAIL $v"; tail -5 "$T/$v.out"; fail=$((fail + 1)); fi

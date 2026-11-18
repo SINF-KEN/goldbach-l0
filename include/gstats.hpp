@@ -465,7 +465,8 @@ public:
     size_t pbins() const { return primes_.back() / 2 + 1; }
 
     /// Sampled segment: check30_xs* + check30_xb counts per xall entry.
-    void add_full(const uint32_t* hist)
+    /// @return the evens of the segment the histogram counted (coverage).
+    uint64_t add_full(const uint32_t* hist)
     {
         uint64_t n = 0;
         for (uint32_t cr = 0; cr < 15; ++cr) {
@@ -480,6 +481,7 @@ public:
             }
         }
         evens_sampled_ += n;
+        return n;
     }
     /// Normal segment: check30_b tail counts by p >> 1 (class-aggregated:
     /// stored under class 15 -> folded into the per-class arrays as class 0
