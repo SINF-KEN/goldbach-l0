@@ -5779,13 +5779,14 @@ inline u32 inv32(const u32 p)
 /// Builds the multiplier table: bit kb 5760 + w (block kb of the table) set
 /// iff m = 30030 (k_lo + kb) + WHL_M[w] has no prime factor in
 /// primes[s_begin, s_end). Group = MT_CB blocks in SLM; the wheel tables in SLM.
-/// @pre    primes[s_begin, s_end) = every prime in [17, sqrt(m_max)] (3..13
-///         are the wheel), ascending; every table m exceeds primes[s_end - 1];
+/// @pre    primes[s_begin, s_end) = every prime in [67, sqrt(m_max)] (3..13
+///         are the wheel, 17..61 the patterns pat), ascending; every table m exceeds primes[s_end - 1];
 ///         local size 1024; tab holds nblocks * 180 words.
 /// @post   every table bit is 1 iff its m is prime.
 __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 k_lo,
                        __global const u32* restrict primes, const u32 s_begin, const u32 s_end,
-                       const u32 n_small)   // primes[s_begin, s_begin + n_small) are < MT_SPLIT_P
+                       const u32 n_small,   // primes[s_begin, s_begin + n_small) are < MT_SPLIT_P
+                       __global const u32* restrict pat)   // MT_PRE patterns (host: mt_patterns)
 {
     __local u32 win[MT_CB * 180];
     __local ushort lidx[30030];
@@ -5794,7 +5795,18 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
     const u32 kb0 = get_group_id(0) * MT_CB;
     if (kb0 >= nblocks) return;
     const u32 nb = min((u32)MT_CB, nblocks - kb0);
-    for (u32 i = lid; i < nb * 180u; i += wg) win[i] = 0xFFFFFFFFu;
+    // presieve: primes 17..61 by patterns, word wd of block k for prime s =
+    // pat[off_s + (k mod s) 180 + wd] (bit set iff s does not divide m)
+    for (u32 i = lid; i < nb * 180u; i += wg) {
+        const u32 kb = i / 180u, wd = i - kb * 180u;
+        const u32 k = k_lo + kb0 + kb;
+        u32 v = 0xFFFFFFFFu, off = 0u;
+#define MT_P(S) v &= pat[off + (k % S##u) * 180u + wd]; off += S##u * 180u;
+        MT_P(17) MT_P(19) MT_P(23) MT_P(29) MT_P(31) MT_P(37) MT_P(41) MT_P(43)
+        MT_P(47) MT_P(53) MT_P(59) MT_P(61)
+#undef MT_P
+        win[i] = v;
+    }
     for (u32 i = lid; i < 30030u; i += wg) lidx[i] = WHL_IDX[i];
     for (u32 i = lid; i < WHL_N; i += wg) lstep[i] = WHL_STEP[i];
     barrier(CLK_LOCAL_MEM_FENCE);

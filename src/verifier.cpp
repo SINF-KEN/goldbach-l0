@@ -1246,7 +1246,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         const uint64_t k_lo = m_lo / 30030 > 0 ? m_lo / 30030 - 1 : 0;
         const uint64_t k_hi = m_hi / 30030 + 2;
         const uint64_t s_max = uint64_t(std::sqrt(double(m_hi))) + 2;
-        const uint32_t sb = uint32_t(std::lower_bound(sieve_primes, sieve_primes + sieve_count, 17u) -
+        const uint32_t sb = uint32_t(std::lower_bound(sieve_primes, sieve_primes + sieve_count, 67u) -
                                      sieve_primes);
         const uint32_t se = uint32_t(std::upper_bound(sieve_primes, sieve_primes + sieve_count,
                                                       uint32_t(std::min<uint64_t>(s_max, UINT32_MAX))) -
@@ -1573,9 +1573,27 @@ void DenseRun::build_mtab() {
     const uint32_t n_small = uint32_t(std::lower_bound(sieve_primes + mt_s_begin, sieve_primes + mt_s_end,
                                                        1024u) - (sieve_primes + mt_s_begin));
     kb.set_arg(6, sizeof(n_small), &n_small);
+    // presieve patterns for 17..61 (kernels/goldbach.cl mt_build): prime s,
+    // row k mod s, 180 words: bit w set iff s does not divide 30030 k + M[w]
+    std::vector<uint32_t> M;
+    for (uint32_t m = 1; m < 30030; m += 2)
+        if (std::gcd(m, 30030u) == 1) M.push_back(m);
+    std::vector<uint32_t> pat;
+    for (const uint32_t s : {17u, 19u, 23u, 29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u, 61u})
+        for (uint32_t k = 0; k < s; ++k)
+            for (uint32_t wd = 0; wd < 180; ++wd) {
+                uint32_t x = 0;
+                for (uint32_t bt = 0; bt < 32; ++bt)
+                    if ((30030u * k + M[wd * 32 + bt]) % s != 0) x |= 1u << bt;
+                pat.push_back(x);
+            }
+    uint32_t* d_pat = static_cast<uint32_t*>(ctx.alloc_device(pat.size() * 4));
+    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
+    kb.set_arg(7, sizeof(d_pat), &d_pat);
     const auto t0 = clock_::now();
     kb.launch(ctx.list(), (mt_blocks + 63) / 64);   // MT_CB
     ctx.host_sync();
+    Context::free_mem(ctx.context(), d_pat);
     if (verbose)
         std::fprintf(stderr, "hl_mt: table %.1f MB built in %.1f ms\n", double(words) * 4 / 1e6,
                      std::chrono::duration<double, std::milli>(clock_::now() - t0).count());
@@ -1584,9 +1602,6 @@ void DenseRun::build_mtab() {
         uint32_t* h = static_cast<uint32_t*>(ctx.alloc_shared(words * 4));
         ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), h, d_mtab, words * 4, nullptr, 0, nullptr));
         ctx.host_sync();
-        std::vector<uint32_t> M;
-        for (uint32_t m = 1; m < 30030; m += 2)
-            if (std::gcd(m, 30030u) == 1) M.push_back(m);
         uint64_t x = 0x9E3779B97F4A7C15ull, bad = 0, ones = 0;
         for (uint32_t i = 0; i < nchk; ++i) {
             x ^= x << 13; x ^= x >> 7; x ^= x << 17;
