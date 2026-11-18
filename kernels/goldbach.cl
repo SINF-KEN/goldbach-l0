@@ -3272,23 +3272,52 @@ __kernel void count30(
                 if (!aprev && 30u * 32u * (w - 2u) >= pos_lo) err |= G30T_ERR_LOOK;
             }
             if (!aprev) hp = cf >> 1;
+            // Each word's 8 class words are nibble-transposed (an 8 x 8 matrix
+            // of 4-bit blocks, 3 swap stages): group k then holds blocks
+            // 4 k .. 4 k + 3 with slot s of block 4 k + j at bit 4 s + j, the
+            // slots rotated by ord & 15 so ascending slots are ascending
+            // phases (the classes in phase order are a rotation of 0..7, host-
+            // checked). A block refill is a 3-level select of its group, a
+            // shift and a mask (was 8 bit gathers), the phase a nibble of phis.
+            const u32 r0 = ord & 15u;
             #pragma unroll
             for (u32 i = 0; i < C30_CW; ++i) {
-                // one prime per iteration (lanes diverge least): a block's
-                // primes as a 15-bit mask of half offsets, refilled from the
-                // next non-empty block
+                u32 W[8];
+                #pragma unroll
+                for (u32 c = 0; c < 8; ++c) W[c] = v[c][i];
+                #pragma unroll
+                for (u32 c = 0; c < 4; ++c) {
+                    const u32 t = ((W[c] >> 16) ^ W[c + 4]) & 0x0000FFFFu;
+                    W[c + 4] ^= t; W[c] ^= t << 16;
+                }
+                #pragma unroll
+                for (u32 c = 0; c < 8; c += (c & 1u) ? 3u : 1u) {
+                    const u32 t = ((W[c] >> 8) ^ W[c + 2]) & 0x00FF00FFu;
+                    W[c + 2] ^= t; W[c] ^= t << 8;
+                }
+                #pragma unroll
+                for (u32 c = 0; c < 8; c += 2) {
+                    const u32 t = ((W[c] >> 4) ^ W[c + 1]) & 0x0F0F0F0Fu;
+                    W[c + 1] ^= t; W[c] ^= t << 4;
+                }
+                #pragma unroll
+                for (u32 k = 0; k < 8; ++k) W[k] = rotate(W[k], 32u - 4u * r0);
                 u32 nb = any[i], m = 0u, hb = 0u;
                 const u32 h0 = 15u * 32u * (w + i);
                 while (nb | m) {
                     if (!m) {
                         const u32 b = ctz(nb);
                         nb &= nb - 1u;
-                        #pragma unroll
-                        for (u32 c = 0; c < 8; ++c) m |= ((v[c][i] >> b) & 1u) << ph[c];
+                        const u32 k = b >> 2;
+                        const u32 x01 = (k & 1u) ? W[1] : W[0], x23 = (k & 1u) ? W[3] : W[2];
+                        const u32 x45 = (k & 1u) ? W[5] : W[4], x67 = (k & 1u) ? W[7] : W[6];
+                        const u32 x03 = (k & 2u) ? x23 : x01, x47 = (k & 2u) ? x67 : x45;
+                        m = (((k & 4u) ? x47 : x03) >> (b & 3u)) & 0x11111111u;
                         hb = h0 + 15u * b;
                     }
-                    const u32 h = hb + ctz(m);
+                    const u32 s4 = ctz(m);
                     m &= m - 1u;
+                    const u32 h = hb + ((phis >> s4) & 15u);
                     const u32 d = h - hp;
                     hp = h;
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
