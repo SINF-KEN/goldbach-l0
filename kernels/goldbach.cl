@@ -574,6 +574,9 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef HL_END
 #define HL_END 1
 #endif
+#ifndef HL_QS
+#define HL_QS 1                  // harvest setup from one float-float quotient
+#endif
 #ifndef HL_BAL
 #define HL_BAL 256               // primes per round-robin chunk (0: 1024-prime blocks)
 #endif
@@ -6447,6 +6450,9 @@ __kernel void hl_harvest_mt(
     if (lid < HL_MAX_K) lpos[lid] = 0u;
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 wend = (u64)(nseg - 1u) * delta + q_odds_tail;   // window [0, wend) in bits
+#if HL_QS
+    const ff_x qfs = ff_split(q_first);                         // uniform
+#endif
 #if HL_BAL
     // balanced regions: HL_BAL-prime chunks dealt round-robin to the groups
     // (chunk c to group c mod ngrp), so every region sees the same mix of
@@ -6462,6 +6468,44 @@ __kernel void hl_harvest_mt(
         if (i >= b) break;
 #endif
         const u32 p = primes[i];
+#if HL_QS
+        // m0 and the first offset from one float-float quotient Q ~ q_first / p
+        // (the uniform split qfs; error a few units, fixed exactly below by the
+        // 64-bit wrap-around remainder, |r| << 2^63): no 64-bit mod, no
+        // inverse. Lanes with p^2 >= q_first (p near sqrt(limit)) take the
+        // general path.
+        u64 xo;
+        u32 lo, hi;
+        if ((u64)p * p < q_first) {
+            const float pf = (float)p;
+            const int pr = (int)((long)p - (long)pf);        // |pr| <= 128
+            const float ih = 1.0f / pf;
+            const float e1 = fma(-pf, ih, 1.0f);
+            const float il = ih * (e1 - (float)pr * ih);
+            const float qh = rint(qfs.xh * ih);              // >= 2^23, < 2^39
+            const float ql = fma(qfs.xh, ih, -qh) + qfs.xh * il + qfs.xl * ih;
+            u64 Q = ((u64)(u32)(qh * 2.3283064365386963e-10f) << 32) | (u64)float_int_low32_big(qh);
+            Q += (u64)(long)(int)rint(ql);
+            const u32 ql32 = (u32)Q;
+            const u32 qp_hi = mul_hi(ql32, p) + (u32)(Q >> 32) * p;
+            long r = (long)(q_first - (((u64)qp_hi << 32) | (u64)(ql32 * p)));
+            while (r < 0) { r += (long)p; --Q; }
+            while (r >= (long)p) { r -= (long)p; ++Q; }
+            const u32 r32 = (u32)r;
+            u64 t = r32 ? (u64)(p - r32) : 0UL;
+            u64 m0 = Q + (r32 ? 1UL : 0UL);
+            if (t & 1UL) { t += p; ++m0; }                   // q_first odd: odd multiple
+            xo = t >> 1;
+            lo = (u32)m0;
+            hi = (u32)(m0 >> 32);
+        } else {
+            const u64 first = first_odd_multiple((u64)p, q_first);
+            xo = (first - q_first) >> 1;
+            lo = (u32)first * inv32(p);
+            hi = (u32)rint(((float)first * (1.0f / (float)p) - (float)lo) * 2.3283064365386963e-10f);
+        }
+        if (xo >= wend) continue;
+#else
         const u64 first = first_odd_multiple((u64)p, q_first);
         const u64 xo = (first - q_first) >> 1;
         if (xo >= wend) continue;
@@ -6469,6 +6513,7 @@ __kernel void hl_harvest_mt(
         // high word from a float estimate (error << 2^31)
         const u32 lo = (u32)first * inv32(p);
         const u32 hi = (u32)rint(((float)first * (1.0f / (float)p) - (float)lo) * 2.3283064365386963e-10f);
+#endif
         // m0 = 30030 k0 + r0 (2^32 = 143022 * 30030 + 16636)
         const u32 q1 = lo / 30030u, r1 = lo - q1 * 30030u;
         const u32 t1 = hi * 16636u + r1;
