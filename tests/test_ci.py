@@ -317,6 +317,35 @@ check(out["rec"]["status"] == "PASS" and calls == ["stop", "promote", "start"]
       and "bench.py crashed" in out["rec"]["benchmark"]["error"] and "Traceback" in txt,
       "a benchmark error after the promotion: the PASS stands, error recorded and logged")
 
+# --- release pruning: every journal's releases are kept; fail closed ----------
+from gbci import releases as rel_mod  # noqa: E402
+rdir = Path(TMP) / "releases"
+jdir = Path(TMP) / "prod"
+jdir.mkdir(exist_ok=True)
+names = ["aaaaaaaaaaa1", "aaaaaaaaaaa2"] + [f"bbbbbbbbbbb{i}" for i in range(7)]
+for i, nm in enumerate(names):
+    (rdir / nm).mkdir(parents=True, exist_ok=True)
+    os.utime(rdir / nm, (1e9 + i, 1e9 + i))           # aaaa... are the OLDEST
+g.set_link("active", rdir / names[-1])
+(jdir / "main.journal").write_text("PASS 100 102 t limit=102 start=100 release=aaaaaaaaaaa1\n")
+(jdir / "backfill.journal").write_text("PASS 100 102 t limit=102 start=100 release=bbbbbbbbbbb6\n")
+(jdir / "main.recheck").write_text("")
+(jdir / "backfill.journal").write_text("RECHECK 100 102 t outcome=CONFIRMED release=aaaaaaaaaaa2\n")
+(Path(TMP) / "production.json").write_text(json.dumps({"journal": str(jdir / "backfill.journal")}))
+check(rel_mod.named_releases() == {"aaaaaaaaaaa1", "aaaaaaaaaaa2"},
+      "named_releases: every journal in production's directory, RECHECK rows included")
+log_since(rel_mod.prune_releases)
+left = sorted(d.name for d in rdir.iterdir())
+check("aaaaaaaaaaa1" in left and "aaaaaaaaaaa2" in left,
+      "prune keeps a release named only by a journal production is not running (2026-10-19)")
+check(len(left) < len(names), "prune still removes unnamed old releases")
+(jdir / "backfill.journal").unlink()
+(rdir / "ccccccccccc0").mkdir()
+before = sorted(d.name for d in rdir.iterdir())
+txt = log_since(rel_mod.prune_releases)
+check(sorted(d.name for d in rdir.iterdir()) == before and "prune skipped" in txt,
+      "prune fails closed when production's journal is missing")
+
 # goldbach_live: a persistent error is reported once, not on every redraw
 err = io.StringIO()
 with contextlib.redirect_stderr(err):
