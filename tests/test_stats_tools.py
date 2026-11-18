@@ -130,8 +130,45 @@ def main():
             f.write(f"2026-10-01T00:00:00 p(n)=9811 n={S0 + 77} q=1 cpu_check=OK  NEW RECORD\n")
         rc, out = run([str(ROOT / "scripts/goldbach_live.py"), "--once"], d)
         check("BEATEN: p(n) = 9811" in out, "verified p(n) > 9781 -> BEATEN banner")
+    fix_tests()
     print(f"test_stats_tools: {len(FAIL)} failure(s) -> {'FAIL' if FAIL else 'PASS'}")
     return 1 if FAIL else 0
+
+
+def fix_tests():
+    """scripts/gstats_fix.py: a re-run that differs only in primes / twins
+    corrects the state; anything else is refused; a second apply is a no-op."""
+    fix = str(ROOT / "scripts/gstats_fix.py")
+    base = ("GBSTATS v2 version={v} start=100 limit=298 evens=100 evens_sampled=100 tail_t=3000 tail_evens=2 "
+            "pmax=3011 primes={p} twins={t} primes30={p30} twins30={t30} new_first={nf} beyond=- tail=3001:1,,1\n")
+    old = base.format(v="2.2.0", p=36, t=5, p30="5,5,4,4,5,5,4,4", t30="2,2,1", nf="3001:120")
+    new = base.format(v="2.5.1", p=37, t=6, p30="5,5,4,5,5,5,4,4", t30="2,2,2", nf="3001:120;3011:150")
+    with tempfile.TemporaryDirectory() as d:
+        dp = pathlib.Path(d)
+        state = ("# state\ntail_t 3000\nrange 100 298\nevens 100 100\n"
+                 "primes30 50 50 40 40 50 50 40 40\ntwins30 20 20 10\n")
+        (dp / "s").write_text(state)
+        (dp / "log").write_text("GBSTATS v2 version=2.2.0 start=0 limit=98 evens=50\n" + old)
+        (dp / "rerun").write_text(new)
+        args = [fix, "--state", "s", "--log", "log", "--rerun", "rerun"]
+        rc, out = run(args, d)
+        check(rc == 0 and "dry run" in out and (dp / "s").read_text() == state, "gstats_fix: dry run changes nothing")
+        rc, out = run(args + ["--primecount", "36"], d)
+        check(rc == 1 and "primecount" in out, "gstats_fix: refuses a re-run that disagrees with primecount")
+        rc, out = run(args + ["--primecount", "37", "--apply"], d)
+        st = (dp / "s").read_text()
+        check(rc == 0 and "primes30 50 50 40 41 50 50 40 40\n" in st and "twins30 20 20 11\n" in st,
+              "gstats_fix: applies the per-class deltas")
+        check("GBFIX v1 start=100 limit=298" in (dp / "log").read_text() and any(dp.glob("s.bak-*")),
+              "gstats_fix: logs a GBFIX line and keeps a backup")
+        rc, out = run(args + ["--apply"], d)
+        check(rc == 0 and "already applied" in out and (dp / "s").read_text() == st, "gstats_fix: idempotent")
+        (dp / "rerun").write_text(new.replace("tail=3001:1,,1", "tail=3001:2,,1"))
+        rc, out = run(args, d)
+        check(rc == 1 and "tail" in out, "gstats_fix: refuses when a field it cannot correct differs")
+        (dp / "rerun").write_text(new.replace("3001:120;", "3001:122;"))
+        rc, out = run(args, d)
+        check(rc == 1 and "first occurrence" in out, "gstats_fix: refuses a changed first occurrence")
 
 
 if __name__ == "__main__":

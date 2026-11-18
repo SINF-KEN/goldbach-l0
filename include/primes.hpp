@@ -24,11 +24,18 @@ std::vector<uint32_t> odd_primes_up_to(uint32_t n);
 /// @return the odd primes <= n, ascending (empty for n < 3).
 std::vector<uint32_t> segmented_odd_primes_up_to(uint64_t n);
 
-/// segmented_odd_primes_up_to with a binary disk cache ("GBPR", u64 limit,
-/// u64 count, u32 primes): loads @p cache_path when its limit equals @p n
-/// and its payload passes the content check (the odd primes < 64 first, then
-/// strictly ascending odd values <= n), otherwise generates the list and
-/// publishes the cache atomically (temp file, fsync, rename).
+/// FNV-1a 64 over the 32-bit words of a prime payload (the cache's header
+/// hash): any single changed word changes it. ~0.09 s for the 109M primes
+/// below sqrt(5e18).
+uint64_t prime_payload_hash(const uint32_t* p, size_t cnt);
+/// segmented_odd_primes_up_to with a binary disk cache ("GBP2", u64 limit,
+/// u64 count, u64 prime_payload_hash, u32 primes): loads @p cache_path when
+/// its limit equals @p n, its size matches, the payload hash matches and the
+/// payload passes the content check (the odd primes < 64 first, then strictly
+/// ascending odd values <= n); otherwise generates the list and publishes the
+/// cache atomically (temp file, fsync, rename). The content check alone let a
+/// prime replaced by an odd composite between its neighbours through (one
+/// changed entry, thousands of false primes in the map).
 /// @param cache_path  cache file, or nullptr to skip caching.
 /// @pre    n < 2^32.
 /// @post   a damaged cache is never trusted; a failed write leaves no file
@@ -55,16 +62,21 @@ public:
     ~PrimeCacheView() { release(); }
 
     /// Loads the odd primes <= @p n. Tries, in order: the keyed file
-    /// <cache_path>.<n>, the legacy file <cache_path> (limit == n), the
-    /// smallest keyed cache with a larger limit (exposing only its prefix
-    /// <= n); on a miss generates the list and writes <cache_path>.<n>.
-    /// A mapped file is used only if the part this run uses passes the
-    /// content check (see segmented_odd_primes_up_to_cached).
+    /// <cache_path>.<n>, the smallest keyed cache with a larger limit
+    /// (exposing only its prefix <= n); on a miss generates the list and
+    /// writes <cache_path>.<n>. A file is used only if it passes map_file.
     /// @param n           prime limit (inclusive), < 2^32.
     /// @param cache_path  cache base name; nullptr means "base_primes.cache".
     /// @return a view of the odd primes <= n, ascending.
     static PrimeCacheView load(uint64_t n, const char* cache_path);
 
+    /// Maps one cache file and verifies it: format "GBP2", limit == @p n (or
+    /// > n with @p allow_larger: only its primes <= n are exposed), exact
+    /// size, payload hash, content check. A present but damaged or outdated
+    /// file is reported on stderr.
+    /// @return true with @p out viewing the file; false (out unchanged) otherwise.
+    static bool map_file(const std::string& file, uint64_t n, bool allow_larger,
+                         PrimeCacheView& out);
     /// @return pointer to the first prime, or nullptr for an empty view.
     const uint32_t* data() const { return ptr_; }
     /// @return number of primes in the view.
@@ -202,5 +214,14 @@ bool is_prime_u64(uint64_t n);
 /// Trial-division primality, O(sqrt n); used by the reference checker only.
 /// @return true iff @p n is prime.
 bool is_prime_trial(uint64_t n);
+
+/// The CPU fallback's witness search (the verifier's leftovers): the smallest
+/// odd prime p with n - p prime, testing first @p cands (ascending odd primes:
+/// all of them up to @p cand_bound) and then every odd p in (cand_bound, n / 2]
+/// by deterministic Miller-Rabin, so an even needing p > cand_bound (a new
+/// p(n) record above 4e18) is found, not failed.
+/// @return p(n); 2 for n = 4 (4 = 2 + 2); 0 when no partition exists (a
+///         Goldbach counterexample, or n odd / n < 4).
+uint64_t cpu_min_goldbach_prime(uint64_t n, const uint16_t* cands, size_t ncand, uint64_t cand_bound);
 
 } // namespace gb

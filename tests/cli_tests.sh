@@ -69,6 +69,14 @@ for knob in GB_CHECK_BGROUPS=0 GB_STATS_BGROUPS=0 GB_BUCKET_GROUPS=0 GB_CHECK_BG
     else echo "  FAIL $knob $mode: exit $rc: $(tail -1 <<<"$out")"; fail=1; fi
 done
 
+echo "knobs of the pipelines removed in v2.6 are refused before any GPU work -> exit 1"
+for knob in GB_SPLIT=0 GB_C30=0 GB_CLASSMAP=6 GB_HITLIST=0 GB_TWIN_CAP=10 GB_MASK_GROUPS=0; do
+    out=$(env "$knob" "$BIN" --start 1000000 --limit 2000000 --csv 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && grep -q "removed in v2.6" <<<"$out" && ! grep -q "result=PASS" <<<"$out"; then
+        echo "  ok   $knob refused"
+    else echo "  FAIL $knob: exit $rc: $(tail -1 <<<"$out")"; fail=1; fi
+done
+
 echo "valid spellings agree; CPU reference passes"
 a=$("$BIN" --cpu-check 200000 2>&1); ra=$?
 b=$("$BIN" --cpu-check 2e5 2>&1); rb=$?

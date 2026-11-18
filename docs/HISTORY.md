@@ -3,7 +3,7 @@
 The optimization log, moved out of [PROJECT-REFERENCE.md](PROJECT-REFERENCE.md)
 with its section numbers unchanged, so "§9.2x" references in the code, the
 commit messages and the other documents still mean the same thing: every
-kernel or host change kept or dropped, with its measurements (§9.2–§9.2w),
+kernel or host change kept or dropped, with its measurements (§9.2–§9.2aa),
 the per-version performance record (§13.2), and the removed wheel
 representation (§15). Section numbers without a file name refer to this file
 when they are listed here, otherwise to PROJECT-REFERENCE.md (§1–§16).
@@ -1291,6 +1291,52 @@ exact, but 7.1% / 7.0% slower than tile kernel + window pass (sieve 196 ->
 thread and prime costs more than the tile kernel's table path); dropped.
 
 --------------------------------------------------------------------------
+### 9.2aa Audit round: positive coverage, hashed prime cache, legacy pipelines removed (v2.6.0, 2026-11-17)
+An adversarial audit of origin/main 9f58a5d (CORRECTNESS.md §6) tested the
+project's claims instead of reading them. What it changed:
+- **Positive coverage.** A mutant that never launched `check30_a` printed
+  `result=PASS leftovers=0` over 7 segments of 4e18 + 3e9 with 6 unchecked
+  (tail 302 -> 49, nothing flagged). check30_a / check30_b now count the
+  evens they resolve (one sub-group atomic each); `collect_slot` requires
+  A resolved + pending == evens and B resolved + leftovers == pending, and a
+  sampled segment's exact histogram + leftovers == evens. Mutants skipping
+  either phase now fail (`coverage: phase A resolved 0 + pending 0 != ...`,
+  `phase B resolved 0 + leftovers 0 != pending 106522`). Same counters in
+  the sparse checker against the segment's evens in [start, limit].
+- **Hashed prime cache ("GBP2").** 1009 -> 1011 in a cache (ascending, odd:
+  the content check passed) gave 9,658 false primes in a 1e12 + 2e11 map and
+  a silent PASS. The header now carries an FNV-1a 64 hash of the payload
+  (0.09 s at sqrt(5e18)); fresh generation costs 2.6 s, so old caches are
+  simply regenerated.
+- **Legacy pipelines removed.** `seg30` accepts every segment, so the twin
+  and class-split checkers, the dense and mod-6 maps and the bucket ring ran
+  only under A/B knobs; ~1,180 kernel lines (module 2.47 -> 1.98 MB compiled)
+  and their host paths are gone, the knobs refused. The allocations kept so
+  the device-memory layout would not move (S1 / S5, the seven unpacked
+  statistics buffers): 1e12 at 4e18, 6 ABBA rounds, 7.2177 vs 7.2199 s
+  (0.03%, noise). Pending list 1/8 -> 1/32 of a segment (peak use 586K of
+  29.2M entries).
+- **Measured after the round** (production configuration, 1e12 windows,
+  6 ABBA rounds vs origin/main 9f58a5d, GBSTATS lines identical): gpu
+  median 7.2660 vs 7.2639 s at 4e18 (+0.03%), 7.3506 vs 7.3415 s ending at
+  5e18 (+0.12%): within the run-to-run spread. The sparse checker's
+  counters cost more: a per-word valid-mask count +15% check_s, a per-word
+  popcount +4%; the kept form (valid evens once per item in phase A, pending
+  words / examined evens in phase B, 64-bit atomics: ~1.2e11 evens per
+  segment overflowed u32 counters in the first version) costs +1.7% gpu_s
+  (1e13 at 4e18: 4.95 vs 4.88 s).
+- **Operations.** The release prune protected only the journal production
+  currently ran: 23 of the 25 binaries behind the PASS rows were deleted
+  when production switched to the gap-backfill journal (2026-10-19) and
+  back. Every journal is protected now, a missing one prunes nothing, and
+  the 25 release commits are tagged `release/<id>`. The faulted 2026-10-03
+  slice's counts are corrected in the statistics state (gstats_fix.py,
+  applied 2026-11-17: +21 primes, +2 twin pairs; tail, pmax and sampled
+  evens identical in the re-run).
+- **Measured, not changed**: `--sparse` 1.015e12 evens/s at 4e18 (14.6x the
+  dense path's 69.3 G): `ci/sparse_crosscheck.sh` re-verifies the range
+  independently in ~5.7 days.
+
 ## 13. Performance
 
 
