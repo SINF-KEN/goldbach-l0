@@ -5867,7 +5867,7 @@ __kernel void hl_harvest_mt(
         const u64 first = first_odd_multiple((u64)p, q_first);
         const u64 xo = (first - q_first) >> 1;
         if (xo >= wend) continue;
-        // m0 = first / p (exact division, m0 < 2^35): low word by the inverse,
+        // m0 = first / p (exact division, m0 < 2^38: host): low word by the inverse,
         // high word from a float estimate (error << 2^31)
         const u32 lo = (u32)first * inv32(p);
         const u32 hi = (u32)rint(((float)first * (1.0f / (float)p) - (float)lo) * 2.3283064365386963e-10f);

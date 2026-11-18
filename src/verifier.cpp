@@ -510,16 +510,16 @@ private:
     /// HL_MT feasibility for hit-listed primes >= pmin: multipliers m of
     /// every hit in [m_lo, m_hi]; needs p^3 > limit and p^2 > m_hi (a
     /// composite m then has a factor < p), the table's sieving primes
-    /// (<= sqrt(m_hi)) far below m_lo, m_hi < 2^37 (hl_harvest_mt's
-    /// quotient words) and a table below ~3.5 GB.
+    /// (<= sqrt(m_hi)) far below m_lo, m_hi < 2^38 (hl_harvest_mt's
+    /// quotient words: hi < 64) and a table below 3.5 GiB.
     bool mt_geometry(uint64_t pmin, uint64_t& m_lo, uint64_t& m_hi) const {
         const uint64_t pmax = sieve_primes[sieve_count - 1];
         m_lo = q_first0 / pmax;
         m_hi = limit / pmin + 2;
         const uint64_t s_max = uint64_t(std::sqrt(double(m_hi))) + 2;
         return pmin > 1 && pmin * pmin > limit / pmin + 1 && pmin * pmin > m_hi &&
-               2 * s_max < m_lo && m_hi < (uint64_t(1) << 37) &&
-               (m_hi - m_lo) / 30030 * 720 < (uint64_t(7) << 29);
+               2 * s_max < m_lo && m_hi < (uint64_t(1) << 38) &&
+               (m_hi - m_lo) / 30030 * 720 < (uint64_t(7) << 29);   // table < 3.5 GiB (32-bit offsets)
     }
     uint32_t mt_k_lo = 0, mt_blocks = 0;   // multiplier table: blocks [k_lo, k_lo + blocks) of 30030
     uint32_t mt_s_begin = 0, mt_s_end = 0; // its sieving primes (indices into sieve_primes)
@@ -1167,9 +1167,21 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         // number of hits per segment), when the multiplier table is feasible.
         const uint64_t mt_minp = q_odds_full * HL_MT_MINP_NUM / HL_MT_MINP_DEN;
         uint64_t m_lo_t = 0, m_hi_t = 0;
+        // the table limits (size, m < 2^38) raise the threshold where needed
+        uint64_t mt_p = std::max<uint64_t>(env::u64("GB_BUCKET_MINP", mt_minp), 1);
+        if (!mt_geometry(mt_p, m_lo_t, m_hi_t)) {
+            uint64_t lo = mt_p, hi = std::max<uint64_t>(mt_p, minp_default);
+            if (mt_geometry(hi, m_lo_t, m_hi_t)) {
+                while (hi - lo > 1) {
+                    const uint64_t mid = lo + (hi - lo) / 2;
+                    (mt_geometry(mid, m_lo_t, m_hi_t) ? hi : lo) = mid;
+                }
+                mt_p = hi;
+            }
+        }
         mt_try = env::onoff("GB_HITLIST", true) && env::onoff("GB_HL_MT", true) &&
-                 mt_geometry(std::max<uint64_t>(env::u64("GB_BUCKET_MINP", mt_minp), 1), m_lo_t, m_hi_t);
-        uint64_t minp = env::u64("GB_BUCKET_MINP", mt_try ? mt_minp : minp_default);
+                 mt_geometry(mt_p, m_lo_t, m_hi_t);
+        uint64_t minp = mt_try ? mt_p : env::u64("GB_BUCKET_MINP", minp_default);
         if (!mt_try && env::onoff("GB_MINP_FLOOR", true))
             minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
@@ -1253,6 +1265,11 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                          hl_mt ? "on" : "off", (unsigned long long)m_lo, (unsigned long long)m_hi,
                          (unsigned long long)(k_hi - k_lo), sb, se);
     }
+    // With HL_MT the packed kernel waits for mid_window (barrier): it then
+    // shortens with every prime moved to the hit lists, while beside
+    // mid_window its span did not (2026-11-18: q_odds / 4 equal either way,
+    // 35M gpu -2 % only without the overlap). GB_ML_OVERLAP=1 forces it.
+    if (hl_mt && !env::present("GB_ML_OVERLAP")) ml_overlap = false;
     // filed hits: prime m only, density 1 / (ln m_lo * 5760 / 30030) among the
     // coprime multipliers (+5 %; a region overflow fails the run closed)
     if (hl_mt) {
