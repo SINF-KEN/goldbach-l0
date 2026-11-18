@@ -556,6 +556,9 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef MQ_MAXP
 #define MQ_MAXP 60000000u
 #endif
+#ifndef MQ_V4
+#define MQ_V4 1
+#endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
 // < 130M 299.5, < 100M 294.7, < 80M 292.5, < 60M 290.7, < 40M 291.5).
@@ -565,7 +568,7 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #define SKR_R 215441u            // 17 * 19 * 23 * 29
 #define SKR_H 0x8208200u         // top bit of each field
 #define SKR_L 0x0410410u         // low bit of each field
-__constant uint WHL_SF[5760] = {
+__constant uint WHL_SF[5768] = {
     0x0410418u, 0x4514401u, 0x4D30022u, 0x5C01063u, 0x00628C1u, 0x08830E3u, 0x20E4832u, 0x3120C71u, 0x3941492u, 0x48124D3u, 0x6073C23u, 0x04D0881u,
     0x0CF10A3u, 0x2552902u, 0x3423831u, 0x3C44053u, 0x54A0CB2u, 0x64E1CF3u, 0x0943444u, 0x28508C2u, 0x3891901u, 0x40B2012u, 0x50F3051u, 0x5913872u,
     0x69548B7u, 0x2CC3482u, 0x3D044C3u, 0x5561011u, 0x5C11835u, 0x10B40D1u, 0x18D48F3u, 0x3131443u, 0x4822CA2u, 0x5863CE3u, 0x70C0833u, 0x1522091u,
@@ -1045,7 +1048,8 @@ __constant uint WHL_SF[5760] = {
     0x1844051u, 0x2064873u, 0x38C14D2u, 0x4902401u, 0x5122C22u, 0x6163C66u, 0x1CB2016u, 0x4C004D1u, 0x5420CF2u, 0x6461C21u, 0x6C82445u, 0x21200E1u,
     0x2940903u, 0x4032053u, 0x58938B2u, 0x68D48F3u, 0x0D31443u, 0x2422CA1u, 0x2C434C5u, 0x54E1051u, 0x5D01873u, 0x01630D2u, 0x1034007u, 0x4912CE2u,
     0x5953C11u, 0x6004432u, 0x7040871u, 0x0461092u, 0x14A20D4u, 0x3524043u, 0x4C10CA2u, 0x5C51CE3u, 0x00B3431u, 0x08D3C52u, 0x1910093u, 0x30018F1u,
-    0x3822003u, 0x5083863u, 0x68E04C2u, 0x0521501u, 0x0D41C12u, 0x1C12C53u, 0x34744B1u, 0x3C900D3u, 0x54F1822u, 0x6532861u, 0x6D53088u, 0x38E2471u
+    0x3822003u, 0x5083863u, 0x68E04C2u, 0x0521501u, 0x0D41C12u, 0x1C12C53u, 0x34744B1u, 0x3C900D3u, 0x54F1822u, 0x6532861u, 0x6D53088u, 0x38E2471u,
+    0x0410418u, 0x4514401u, 0x4D30022u, 0x5C01063u, 0x00628C1u, 0x08830E3u, 0x20E4832u, 0x3120C71u   // padding: entries 0..7 again (MQ_V4 loads up to 8 at w <= 5759)
 };
 // SKR_MR[o_i + (p mod r_i) r_i + (q mod r_i)] = q p^-1 mod r_i (the multiplier m of q = p m)
 __constant uchar SKR_MR[2020] = {
@@ -1181,7 +1185,7 @@ inline void mark_multiples_skr(volatile __global u64* prime_map, const u64 bit0,
 #endif
 #define SKR2_H 0x8102040u
 #define SKR2_L 0x0204081u
-__constant uint WHL_SF2[5760] = {
+__constant uint WHL_SF2[5768] = {
     0x0204081u, 0x2244891u, 0x264C993u, 0x2E5CB97u, 0x3A74E9Du, 0x3E7CF80u, 0x4A94006u, 0x520020Au, 0x000830Cu, 0x0818510u,
     0x1430816u, 0x2048B1Cu, 0x2450C1Eu, 0x3068F05u, 0x3879109u, 0x3C8120Bu, 0x4898291u, 0x5004495u, 0x061C79Bu, 0x163CB84u,
     0x1E4CD88u, 0x2254E8Au, 0x2A6508Eu, 0x2E6D190u, 0x367C114u, 0x5210803u, 0x0420A07u, 0x1038D0Du, 0x1440E0Fu, 0x2868099u,
@@ -1757,7 +1761,8 @@ __constant uint WHL_SF2[5760] = {
     0x446858Bu, 0x4C7878Fu, 0x5080891u, 0x0E04D9Bu, 0x120CE9Du, 0x1E25184u, 0x2A3C20Au, 0x324C40Eu, 0x3E64714u, 0x4A7CA1Au,
     0x4E84B1Cu, 0x0C09007u, 0x1011109u, 0x1C2818Fu, 0x2438393u, 0x4070A82u, 0x4880C86u, 0x4C88D88u, 0x5498F8Cu, 0x02A108Eu,
     0x0A0C012u, 0x1A2C41Au, 0x2644701u, 0x2E54905u, 0x3A6CC0Bu, 0x3E74D0Du, 0x4684F11u, 0x529D217u, 0x0000099u, 0x0C18380u,
-    0x1830686u, 0x204088Au, 0x244898Cu, 0x2C58B90u, 0x3870E96u, 0x3C78F98u, 0x489001Eu, 0x50A0203u, 0x5404305u, 0x1E44B15u
+    0x1830686u, 0x204088Au, 0x244898Cu, 0x2C58B90u, 0x3870E96u, 0x3C78F98u, 0x489001Eu, 0x50A0203u, 0x5404305u, 0x1E44B15u,
+    0x0204081u, 0x2244891u, 0x264C993u, 0x2E5CB97u, 0x3A74E9Du, 0x3E7CF80u, 0x4A94006u, 0x520020Au   // padding: entries 0..7 again (MQ_V4 loads up to 8 at w <= 5759)
 };
 __constant uchar SKR_MR2[5860] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
@@ -1968,6 +1973,36 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         MQ_F(0u, 31u) MQ_F(1u, 37u) MQ_F(2u, 41u) MQ_F(3u, 43u)
 #undef MQ_F
     }
+#if MQ_V4
+    // Four wheel entries per table load (round 6): the per-visit gathers of
+    // WHL_SF / WHL_SF2 (each lane its own w, ~one cache line per lane per
+    // message) bounded the loop; one d32x4 load per lane feeds 4 visits (the
+    // tables carry entries 0..3 again at 5760..5763, so a load at w <= 5759
+    // never runs off; the wrap still happens at the visit that reaches WHL_N).
+#define MQ_VISIT(E, F) { \
+        if (((((E ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H && \
+            (!use2 || ((((F ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H)) \
+            map_clear_chk(m32, bit, g); \
+        const u32 step = p * (E & 15u); \
+        if (n - bit <= step) break; \
+        bit += step; \
+        if (++w == WHL_N) { w = 0u; if (use1) T = skr_wrap(T); if (use2) T2 = skr2_wrap(T2); } }
+    for (;;) {
+#if MQ_V4 == 2
+        const uint8 ev = vload8(0, WHL_SF + w);
+        uint8 fv = (uint8)(0u);
+        if (use2) fv = vload8(0, WHL_SF2 + w);
+        MQ_VISIT(ev.s0, fv.s0) MQ_VISIT(ev.s1, fv.s1) MQ_VISIT(ev.s2, fv.s2) MQ_VISIT(ev.s3, fv.s3)
+        MQ_VISIT(ev.s4, fv.s4) MQ_VISIT(ev.s5, fv.s5) MQ_VISIT(ev.s6, fv.s6) MQ_VISIT(ev.s7, fv.s7)
+#else
+        const uint4 ev = vload4(0, WHL_SF + w);
+        uint4 fv = (uint4)(0u);
+        if (use2) fv = vload4(0, WHL_SF2 + w);
+        MQ_VISIT(ev.x, fv.x) MQ_VISIT(ev.y, fv.y) MQ_VISIT(ev.z, fv.z) MQ_VISIT(ev.w, fv.w)
+#endif
+    }
+#undef MQ_VISIT
+#else
     for (;;) {
         const u32 e = WHL_SF[w];
         if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H &&
@@ -1978,6 +2013,7 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         bit += (u32)step;
         if (++w == WHL_N) { w = 0u; if (use1) T = skr_wrap(T); if (use2) T2 = skr2_wrap(T2); }
     }
+#endif
 }
 
 /// mark_multiples_skr with the second residue set too.

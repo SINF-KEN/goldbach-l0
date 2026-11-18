@@ -198,7 +198,10 @@ Module::Module(const Context& ctx, const std::string& spv_path) : ctx_(ctx.conte
 
     ze_module_desc_t desc{};
     desc.stype        = ZE_STRUCTURE_TYPE_MODULE_DESC;
-    desc.format       = ZE_MODULE_FORMAT_IL_SPIRV;
+    // A native ocloc binary (*.bin, e.g. built with -force_stos_opt) loads
+    // as is; anything else is SPIR-V compiled by the driver.
+    const bool native = spv_path.size() > 4 && spv_path.compare(spv_path.size() - 4, 4, ".bin") == 0;
+    desc.format       = native ? ZE_MODULE_FORMAT_NATIVE : ZE_MODULE_FORMAT_IL_SPIRV;
     desc.inputSize    = data.size();
     desc.pInputModule = reinterpret_cast<const uint8_t*>(data.data());
     ZE_CHECK(zeModuleCreate(ctx.context(), ctx.device(), &desc, &module_, nullptr));
