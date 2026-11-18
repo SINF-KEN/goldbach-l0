@@ -1288,7 +1288,12 @@ inline void large_packed_body(
     // beyond the segment is rejected by the mark loop (first > q_last).
     const bool hi_range = (q_first >> 60) != 0;
     const ff_x qf_split = ff_split(q_first);
-    #pragma unroll
+    // NOT unrolled (2026-11-18): the 16 inlined copies of the setup + mark
+    // loop made the kernel instruction-fetch bound; a rolled loop over the
+    // item's primes is large_s -5.8% (bench +3.2% long / +3.3% long-end).
+    // Unroll 2 measured the same as 1; the sieve kernels' batch loops showed
+    // no such effect.
+    #pragma unroll 1
     for (u32 lane = 0; lane < LARGE_PACK_PPI; ++lane) {
         const u64 p = pv[lane];
         if (c0 + lane >= large_count) break;
