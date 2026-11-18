@@ -323,6 +323,10 @@ struct RunSetup {
     // GB_C30_LATE (default on): count30 after the checker instead of beside
     // phase A, so it runs beside phase B and the next segment's tile sieve
     bool c30_late = env::onoff("GB_C30_LATE", true);
+    // GB_ML_OVERLAP (default on): no barrier between mid_window (atomic AND
+    // store, MIDW_ANDST 2) and the packed large kernel, which then starts
+    // beside the window pass's tail (+0.5%)
+    bool ml_overlap = env::onoff("GB_ML_OVERLAP", true);
     uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
     uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
     RunStats stats;
@@ -1914,8 +1918,9 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
 
 /// Step 4b' (mid windows, §9.2x): after a barrier (the tile kernel's stores
 /// and mid_setup complete), mid_window rebuilds each 128 KB window of the
-/// class map with the mid primes' marks and stores it back with plain
-/// stores; the packed kernel's barrier then orders its atomics after them.
+/// class map with the mid primes' marks and ANDs it into the map with
+/// atomics (MIDW_ANDST 2), so the packed kernel may run beside it
+/// (GB_ML_OVERLAP; else its barrier orders its atomics after them).
 void DenseRun::enqueue_midwin(const Segment& sg) {
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     const uint32_t c5w32 = sg.c5w * 2u;
@@ -2080,7 +2085,13 @@ void DenseRun::enqueue_packed_large(const Segment& sg, uint32_t hl_jb) {
     // manifested as nondeterministic lost composite marks
     // (tools/debug_map.cpp: the map vs Miller-Rabin diff varied run
     // to run until the barrier was added).
-    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    // GB_ML_OVERLAP: mid_window ANDs its windows into the map atomically
+    // (MIDW_ANDST 2), so the packed kernel may run beside it: both only
+    // AND-clear bits with atomics. The barrier enqueue_midwin appends before
+    // mid_window already follows the tile sieve's stores, mid_setup and the
+    // hit-list harvest (enqueued before it), which is all this kernel needs.
+    const bool ml_ovl = ml_overlap && mid_n > 0;
+    if (!ml_ovl) ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     Kernel& kl = hl_fuse ? *k_hla : k_large;
     kl.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     kl.set_arg(1, sizeof(d_large_bases),  &d_large_bases);
@@ -2102,9 +2113,12 @@ void DenseRun::enqueue_packed_large(const Segment& sg, uint32_t hl_jb) {
         kl.set_arg(16, sizeof(bkt_err), &bkt_err);
     }
     const uint64_t large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
-    if (large_items > 0)
-        kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
+    if (large_items > 0) {
+        if (ml_ovl) kl.launch_overlap(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
+                                      ev.large[sg.slot]);
+        else kl.launch(ctx.list(), uint32_t((large_items + large_wg - 1) / large_wg),
                        ev.large[sg.slot]);
+    }
 }
 
 /// Step 4d (GB_BUCKET_VERIFY): rebuild the map without buckets into the

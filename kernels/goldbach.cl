@@ -3911,11 +3911,12 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 }
 
 /// @pre    mid_setup of this segment wrote i0tab; the tile sieve's stores are
-///         visible (barrier before); no concurrent writer of the map (the
-///         window is written back with plain stores). Class bits < 2^24.
+///         visible (barrier before); MIDW_ANDST 2: other writers of the map
+///         only AND-clear bits atomically (the packed kernel may overlap);
+///         MIDW_ANDST 0 / 1: no concurrent writer. Class bits < 2^24.
 /// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
 #ifndef MIDW_ANDST
-#define MIDW_ANDST 1
+#define MIDW_ANDST 2             // 2: atomic AND store (the packed kernel may overlap)
 #endif
 #ifndef MIDW_SKIP
 #define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
@@ -4061,7 +4062,13 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     {
         __global uint4* g4 = (__global uint4*)gm;
         __local const uint4* w4 = (__local const uint4*)win;
-#if MIDW_ANDST
+#if MIDW_ANDST == 2
+        // atomic AND: the packed large kernel may already be marking
+        for (u32 i = lid; i < nw; i += wg) {
+            const u32 x = win[i];
+            if (x != ~0u) atomic_and((volatile __global u32*)gm + i, x);
+        }
+#elif MIDW_ANDST
         #pragma unroll 8
         for (u32 i = lid; i < nw4; i += wg) g4[i] &= w4[i];
         for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] &= win[i];
