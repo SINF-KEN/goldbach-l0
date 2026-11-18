@@ -496,6 +496,7 @@ private:
     uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
     bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
     uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
+    uint32_t slot_gphis[2] = {0, 0};       // count30's phases in phase order (block-walk patterns)
     uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
     bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
     uint64_t sampled_evens = 0;            // evens of the sampled segments
@@ -1090,7 +1091,7 @@ void DenseRun::allocate_slot_buffers() {
             std::memset(b.x_cnt[s], 0, 16 * 4);
             b.g_part[s]  = static_cast<uint64_t*>(ctx.alloc_shared(size_t(GAPS30_GROUPS_MAX) * 8));
             b.g_tail[s]  = static_cast<uint32_t*>(ctx.alloc_shared((2 + 2 * GAPS30_TCAP) * 4));
-            b.g_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared(GAPS30_HBINS * 4));
+            b.g_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared((GAPS30_HBINS + GAPS30_PBINS) * 4));
             reset_gaps(s);
         }
         b.tile_first[s] = use_table
@@ -1137,7 +1138,7 @@ void DenseRun::reset_gaps(int s) {
     b.g_tail[s][0] = b.g_tail[s][1] = 0;
     b.x_cnt[s][11] = ~0u;                   // count30's first prime position (atomic_min)
     b.x_cnt[s][12] = 0;
-    std::memset(b.g_hist[s], 0, GAPS30_HBINS * 4);
+    std::memset(b.g_hist[s], 0, (GAPS30_HBINS + GAPS30_PBINS) * 4);
 }
 
 /// Merges a completed slot's statistics buffers (after its check event).
@@ -1150,8 +1151,18 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
         const bool w = walked_slot[sl];
         if (w)
             for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
+        // count30's block walk: the internal gaps of the blocks with two or
+        // more primes, by pattern (bins after the histogram)
+        uint32_t hx[GAPS30_HBINS];
+        if (w) {
+            std::memcpy(hx, b.g_hist[sl], sizeof(hx));
+            const uint32_t dint = add_pattern_gaps(hx, b.g_hist[sl] + GAPS30_HBINS, slot_gphis[sl]);
+            // count30's maximum covers the gaps into blocks only
+            if (dint && (wmax >> 32) <= 2ull * dint && b.x_cnt[sl][11] != ~0u)
+                wmax = walk_max_exact(slot_qfirst[sl], b.x_cnt[sl][11], b.x_cnt[sl][12]);
+        }
         gstats->add_gap_segment(slot_qfirst[sl], slot_evens[sl], b.x_cnt[sl], b.g_tail[sl],
-                                w ? &wmax : nullptr, w ? b.g_hist[sl] : nullptr);
+                                w ? &wmax : nullptr, w ? hx : nullptr);
     }
     gstats->add_counts(b.x_cnt[sl]);
     // ready for the slot's next segment (enqueued after this collect)
@@ -1705,7 +1716,7 @@ void DenseRun::pack_stats_buffers() {
         const size_t at_x_cnt   = take(16 * 4);
         const size_t at_g_part  = take(size_t(GAPS30_GROUPS_MAX) * 8);
         const size_t at_g_tail  = take((2 + 2 * size_t(GAPS30_TCAP)) * 4);
-        const size_t at_g_hist  = take(size_t(GAPS30_HBINS) * 4);
+        const size_t at_g_hist  = take(size_t(GAPS30_HBINS + GAPS30_PBINS) * 4);
         for (int s = 0; s < 2; ++s) {
             unsigned char* base = static_cast<unsigned char*>(ctx.alloc_shared(block_bytes));
             stats_block[s] = base;
@@ -2507,6 +2518,7 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
     slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
     slot_qfirst[sg.slot] = sg.q_first;
+    slot_gphis[sg.slot] = g_phis;
     k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cnt->set_arg(1, 4, &cw32);
     k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);

@@ -4841,6 +4841,26 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 #endif
 #define G30_CBINS 64u
 #define G30_LH (G30_HBINS + (G30_SIMD - 1u) * G30_CBINS)
+// Block walk (2026-11-18): one loop iteration per non-empty block of 30
+// instead of per prime. The gap into the block's first prime is binned as
+// before; a block with two or more primes adds one count to its pattern bin
+// (256, after the histogram: hist[G30_HBINS + x]) and the host adds the
+// pattern's internal gaps (fixed by the segment's phases). Pattern index of
+// the slot nibble mask m (slot s at bit 4 s): bits s0 s4 s1 s5 s2 s6 s3 s7.
+// The walk maximum covers the gaps into blocks only (an internal gap is
+// < 30; the host settles a segment whose largest such gap is not larger
+// than the largest internal one: a per-block table lookup cost the walk its
+// gain).
+#ifndef G30_BLK
+#define G30_BLK 1
+#endif
+#define G30_PBINS 256u
+inline u32 g30_pat(const u32 m)
+{
+    u32 x = (m | (m >> 15)) & 0x3333u;
+    x = (x | (x >> 2)) & 0x0F0Fu;
+    return (x | (x >> 4)) & 0xFFu;
+}
 inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, __global const u32* restrict lim,
                            const u32 ord, const u32 phis, const u32 pos_lo, const u32 tb,
                            __global u32* restrict gt, const u32 tcap)
@@ -4899,12 +4919,21 @@ __kernel void count30(
         __global u32* restrict hist)
 {
     __local u32 sh[13];
+#if G30_BLK
+    __local u32 lh[G30_LH + G30_PBINS];      // + pattern bins
+#else
     __local u32 lh[G30_LH];
+#endif
     __local u64 red[G30_MAX_SG];
     const u32 lid = get_local_id(0);
     if (lid < 13u) sh[lid] = lid == 11u ? ~0u : 0u;
+#if G30_BLK
+    if (walk)
+        for (u32 i = lid; i < G30_LH + G30_PBINS; i += get_local_size(0)) lh[i] = 0u;
+#else
     if (walk)
         for (u32 i = lid; i < G30_LH; i += get_local_size(0)) lh[i] = 0u;
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     u32 ph[8];                                // phi of class c: its half offset in a block of 30
     #pragma unroll
@@ -5040,6 +5069,27 @@ __kernel void count30(
                 }
                 #pragma unroll
                 for (u32 k = 0; k < 8; ++k) W[k] = rotate(W[k], 32u - 4u * r0);
+#if G30_BLK
+                u32 nb = any[i];
+                const u32 h0 = 15u * 32u * (w + i);
+                while (nb) {
+                    const u32 b = ctz(nb);
+                    nb &= nb - 1u;
+                    const u32 k = b >> 2;
+                    const u32 x01 = (k & 1u) ? W[1] : W[0], x23 = (k & 1u) ? W[3] : W[2];
+                    const u32 x45 = (k & 1u) ? W[5] : W[4], x67 = (k & 1u) ? W[7] : W[6];
+                    const u32 x03 = (k & 2u) ? x23 : x01, x47 = (k & 2u) ? x67 : x45;
+                    const u32 m = (((k & 4u) ? x47 : x03) >> (b & 3u)) & 0x11111111u;
+                    const u32 hb = h0 + 15u * b;
+                    const u32 h = hb + ((phis >> ctz(m)) & 15u);
+                    const u32 d = h - hp;
+                    hp = hb + ((phis >> (31u - clz(m))) & 15u);
+                    atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
+                    if (d > dmax) { dmax = d; dpos = h; }
+                    if (m & (m - 1u))                   // internal gaps: the pattern bin
+                        atomic_inc(&lh[G30_LH + g30_pat(m)]);
+                }
+#else
                 u32 nb = any[i], m = 0u, hb = 0u;
                 const u32 h0 = 15u * 32u * (w + i);
                 while (nb | m) {
@@ -5061,6 +5111,7 @@ __kernel void count30(
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
                     if (d > dmax) { dmax = d; dpos = h; }
                 }
+#endif
             }
         }
     }
@@ -5098,6 +5149,10 @@ __kernel void count30(
                 for (u32 k = 1; k < G30_SIMD; ++k) t += lh[G30_HBINS + (k - 1u) * G30_CBINS + i];
             if (t) atomic_add(hist + i, t);
         }
+#if G30_BLK
+        for (u32 i = lid; i < G30_PBINS; i += get_local_size(0))
+            if (lh[G30_LH + i]) atomic_add(hist + G30_HBINS + i, lh[G30_LH + i]);
+#endif
         if (lid == 0) {
             u64 a = 0;
             for (u32 s = 0; s < get_num_sub_groups(); ++s) a = max(a, red[s]);
