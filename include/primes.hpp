@@ -140,7 +140,7 @@ SmallPrimeGroups small_prime_group_masks(const uint32_t* sieve_primes,
 SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
                                               uint32_t mask_count,
                                               const std::vector<uint64_t>& per_prime,
-                                              uint32_t max_period = 4096);
+                                              uint32_t max_period = 4096, uint32_t skip = 1);
 /// Canonical group tables (class modes): every prime's marks at index 0 mod p,
 /// so the tables depend on the primes only; a progression reads word x of
 /// group g at table word (x - Y_g) mod P_g (Y_g from small_prime_group_offsets).

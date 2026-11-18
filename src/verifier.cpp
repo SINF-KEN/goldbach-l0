@@ -950,7 +950,9 @@ void DenseRun::size_buffers() {
     mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
-        mask_groups0 = small_prime_group_masks(sieve_primes, mask_count, 3, mask_period);   // sizes only
+        mask_groups0 = class_mode   // sizes and descriptors (class maps: canonical grouping)
+            ? small_prime_group_masks_canonical(sieve_primes, mask_count, c30 ? 15u : 3u, mask_period)
+            : small_prime_group_masks(sieve_primes, mask_count, 3, mask_period);
     mask_groups_n = (mask_groups_on && mask_groups0.count() <= 8)
                                  ? mask_groups0.count() : 0u;
     mask_group_words = mask_groups0.words.size();
