@@ -332,6 +332,32 @@ inline void map_clear_w(volatile __global u32* m32, const u32 bit, const cmap g)
     atomic_and(m32 + (ad >> 5), CLR_MASK(ad));
 }
 
+// map_clear_w that first reads the word (L1-uncached, L2-cached load) and
+// skips the atomic when the bit is already clear (round 5, 2026-11-18).
+// For the packed primes (p >= cbrt(q)) a mark p m is redundant iff m is
+// composite (~75 % of the marks), and m's factor (<= sqrt(m) < 1.3M) is a
+// tile / mid-window prime whose clears are complete before the packed kernel
+// starts (barrier after mid_window), so the read sees them: one L2 read
+// instead of one L2 atomic on 3 of 4 marks (gpu -6 % at 4e18). Exact under
+// any interleaving: map bits only go 1 -> 0 while this runs (every concurrent
+// writer AND-clears), so a 0 read is a real clear and a 1 read just marks.
+// (2026-10-19 the same filter lost 3 %: mid windows did not exist, most
+// redundant marks were not yet visible.)
+uint __builtin_IB_lsc_load_global_uint(__global uint* base, int immElemOff, enum LSC_LDCC cacheOpt);
+#define LDCC_L1UC_L3C 2          // L1 uncached, L3 (= Xe2 L2) cached
+/// @pre    as map_clear_w; every other writer of the map during the call only
+///         clears bits (atomic AND).
+/// @post   as map_clear_w.
+inline void map_clear_chk(volatile __global u32* m32, const u32 bit, const cmap g)
+{
+    if (g.cm != 2u) { map_clear_w(m32, bit, g); return; }
+    const u32 t = bit / 15u;
+    const u32 ad = c30_class(bit - 15u * t, g) * g.off5 + t;
+    const u32 w = __builtin_IB_lsc_load_global_uint((__global u32*)(m32 + (ad >> 5)), 0,
+                                                    (enum LSC_LDCC)LDCC_L1UC_L3C);
+    if ((w >> (ad & 31u)) & 1u) atomic_and(m32 + (ad >> 5), CLR_MASK(ad));
+}
+
 // ----------------------------------------------------------------------------
 // Clear the odd multiples bit0, bit0 + p, ... (< q_odds) with 32-bit atomics.
 // All arithmetic is 32-bit: Xe2 has no native 64-bit integer ALU, and the
@@ -1946,7 +1972,7 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         const u32 e = WHL_SF[w];
         if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H &&
             (!use2 || ((((WHL_SF2[w] ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H))
-            map_clear_w(m32, bit, g);
+            map_clear_chk(m32, bit, g);
         const u64 step = (u64)p * (e & 15u);
         if ((u64)(n - bit) <= step) break;
         bit += (u32)step;
