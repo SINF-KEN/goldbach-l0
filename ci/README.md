@@ -91,6 +91,9 @@ python3 ci/goldbach_ci.py production stop [--now] | start | status | adopt
 python3 ci/goldbach_ci.py rollback [--now]     # previous release -> active, restart production
 python3 ci/goldbach_ci.py count-check          # banked slices' prime counts vs primecount
 python3 ci/goldbach_ci.py recheck [START]      # re-run queued (or one) banked slice(s), compare
+python3 scripts/gstats_fix.py --state goldbach_stats.state --log goldbach_stats.log \
+    --rerun RERUN_LOG --primecount N [--apply]  # a re-run's counts into the statistics state
+ci/sparse_crosscheck.sh run | status           # second verification of the range by --sparse
 python3 ci/goldbach_ci.py poll | daemon        # retry queue, branch watching, count checks
 python3 ci/goldbach_ci.py bootstrap            # first time: HEAD -> active release
 python3 ci/production_env.py ci/production-env.json --prod-dir . [--dry-run]   # apply the GB_* knobs
@@ -152,8 +155,13 @@ python3 ci/production_env.py ci/production-env.json --prod-dir . [--dry-run]   #
 `ci-state/releases/<commit12>/`: `goldbach_l0`, `stats_ref`, `kernels/*.spv`,
 `RELEASE`, `meta.json` (commit, version, code fingerprint). `active` /
 `previous` are symlinks switched by atomic rename; a code-identical promotion
-keeps `previous`. Kept: active, previous, every release named in the journal,
-the one production runs, the 3 newest others.
+keeps `previous`. Kept: active, previous, every release named by ANY journal
+or recheck file in the production directory (not only the journal
+production.json names now: switching to the gap-backfill journal on
+2026-10-19 pruned 23 of the 25 binaries behind the PASS rows), the one
+production runs, the 3 newest others. If a journal cannot be read nothing is
+pruned. Every named release commit is pinned with a local tag
+`release/<id>`, so its source survives the deletion of its branch.
 
 After a crash or reboot the daemon (`recover`) kills GPU jobs a dead CI left
 behind, records the run as `INTERRUPTED`, **queues it for a retry**

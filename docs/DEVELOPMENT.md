@@ -55,9 +55,8 @@ user-local tools; only the Actions are in its scope.
 
 | Command | Needs | What |
 |---|---|---|
-| `ctest --test-dir build -LE gpu` | nothing | `host_tests` (host math vs brute force, cache and state damage, plans), `check_constants` (host <-> kernel constant mirrors, README version and C++ badge), `cli_tests` (CLI contract), `stats_known` (p(n) vs Oliveira e Silva's table), `stats_tools`, `known_windows` (the reference table of an independent verifier's published windows, and the comparison logic) |
-| `ctest --test-dir build -L gpu` | the GPU | `tests/gpu_validate.sh`: exact statistics vs `stats_ref` (incl. across 2^63), the published windows of `tests/known_windows.py`, end to end in every checker mode, hit lists / bucket ring vs a full rebuild, the bit-exact kernel validators (~12 min; `bash tests/gpu_validate.sh build quick` ~2 min) |
-| `python3 tests/test_ci.py` | nothing | the local CI's logic (journal chain, caches, gates) |
+| `ctest --test-dir build -LE gpu` | nothing | `host_tests` (host math vs brute force, cache and state damage, plans), `check_constants` (host <-> kernel constant mirrors, README version and C++ badge), `cli_tests` (CLI contract, removed knobs refused), `test_ci` (the local CI's logic: journal chain, caches, gates, release pruning), `stats_known` (p(n) vs Oliveira e Silva's table), `stats_tools` (incl. `scripts/gstats_fix.py`), `known_windows` (the reference table of an independent verifier's published windows, and the comparison logic) |
+| `ctest --test-dir build -L gpu` | the GPU | `tests/gpu_validate.sh`: exact statistics vs `stats_ref` (incl. across 2^63), the published windows of `tests/known_windows.py`, end to end with statistics on / off, without hit lists and on the in-order list (every segment's coverage accounting must hold), hit lists vs a full rebuild, the bit-exact kernel validators (~12 min; `bash tests/gpu_validate.sh build quick` ~2 min) |
 | `./build/debug_map`, `debug_check_hi`, ... | the GPU, tools | the kernel validators individually |
 
 Run the GPU suite after any kernel or host change. Every regression test

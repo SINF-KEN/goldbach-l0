@@ -83,16 +83,15 @@ goldbach-l0/
 ├── src/
 │   ├── main.cpp            CLI + human / --csv / --json / --per-seg output
 │   ├── l0_context.cpp      Context (immediate in-order list), Module, Kernel
-│   ├── primes.cpp          segmented sieve, GBPR cache, masks, Miller-Rabin
+│   ├── primes.cpp          segmented sieve, GBP2 (hashed) cache, masks, Miller-Rabin, CPU fallback search
 │   ├── verifier.cpp        run_gpu (dense pipeline: RunSetup / DenseRun phases), verify_cpu, device info
 │   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
 │   └── sparse.cpp          run_gpu_sparse
 ├── kernels/
 │   ├── goldbach.cl         dense kernels: make_prime_map, sieve_large_packed,
-│   │                       hl_harvest / hl_apply, bucket_* (GB_HITLIST=0),
-│   │                       check30_*, count30; legacy checker modes;
-│   │                       validation kernels (sieve_large_primes, check_numbers*,
-│   │                       prep_large_fb, unpack_large_test, map_compare)
+│   │                       hl_harvest / hl_apply, check30_*, count30;
+│   │                       validation kernels (sieve_large_primes, prep_large_fb,
+│   │                       unpack_large_test, map_compare)
 │   ├── sparse.cl           sparse kernels
 │   └── *_bmg.spv           shipped modules (byte-identical to the pinned ocloc)
 ├── tests/                  host_tests, stats_ref, check_constants, cli_tests,
@@ -114,7 +113,7 @@ predecessor history bundle.
 
 Build targets (CMakeLists.txt): `goldbach_l0`, `host_tests`, `stats_ref`;
 with tools: `goldbach_bench`, `goldbach_tuner`, `debug_sieve`,
-`debug_check`, `debug_check_hi`, `debug_fb`, `debug_map`, `debug_sparse`.
+`debug_check_hi`, `debug_fb`, `debug_map`, `debug_sparse`.
 Validators depend on the `kernels` target.
 
 --------------------------------------------------------------------------
@@ -122,20 +121,18 @@ Validators depend on the `kernels` target.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `VERSION` | "2.5.1" | echoed by `--info` / `--csv` |
+| `VERSION` | "2.6.0" | echoed by `--info` / `--csv` |
 | `WG_SIZE` | 256 | threads per work-group; 128/512/1024 measured within noise |
 | `TILE_WORDS` | 2048 | 16 KB SLM per tile (v1.8.1 optimum, [§9.2d](HISTORY.md#92d-v181--tile-size-medium-stage-setup-float-float-modulo); `GB_TILE_WORDS` + ocloc `-DTILE_WORDS` to change) |
 | `BITS_PER_TILE` | 131,072 | odd numbers per tile (TILE_WORDS x 64; the kernel's WORDS_PER_THREAD = TILE_WORDS / WG_SIZE = 8 words per thread) |
 | `LARGE_PRIMES_PER_ITEM` | 4 | primes per large-kernel work-item (~98M items -> ~24.5M at 4e18). MUST stay mirrored in goldbach.cl |
-| `CHECK_WORDS_PER_ITEM` | 4 | 64-even words per check work-item (256 evens). MUST match WORDS_PER_ITEM in goldbach.cl |
 | `MAX_GB_PRIME` | 9781 | largest candidate prime needed (published 4e18 verification); ~1,206 primes, u16 (2.4 KB) |
 | `LARGE_PACK_PPI` / `LARGE_PACK_GROUP` | 16 / 512 | sieve_large_packed: primes per work-item / per packing group (host); MUST match LARGE_PACK_PPI / LARGE_PACK_SG in goldbach.cl |
 | `LARGE_WG_SIZE` | 128 | large-kernel work-group size (`GB_LARGE_WG` overrides: a multiple of 32 in [32, 1024]) |
-| `CHECK_PHASE_B_GROUPS` | 640 | check_phase_b grid-stride work-groups (`GB_CHECK_BGROUPS` overrides) |
-| `MED_MIN_P` / `MED_MIN_P_CLASS` | 256 / 512 | tile-kernel primes >= this (and < split) use the prime-parallel SLM-atomic stage 3m (dense map / class map); `GB_MED_P=N` overrides |
-| `CHECK30_PLAN` (include/check30.hpp) | 15 classes x 3-4 segments | mod-30 checker (production since v1.13.0, [§9.2j](HISTORY.md#92j-v1130--round-6--745-long---735-long-end-mod-30-checker)): per n mod 30 the (candidate class s, pattern mask, funnels) segments of phase A; `GB_C30_PLAN` overrides, `GB_C30=0` = the v1.12.0 merge30 + class-split checker |
-| `CHECK_PHASE_A_W64` | 12 | phase-A item width in 64-bit words (768 evens), all word checkers; MUST match A_W64 (14 until 2026-10-05, [§9.2p](HISTORY.md#92p-re-tunes-after-the-round-tile-sieve-profile-2026-10-05)) |
-| `CHECK_SPLIT_CANDS` / `CHECK_SPLIT_STAGES` | 38 / "7/3" | class-split checker (v1.11.0, [§9.2h](HISTORY.md#92h-v1110--round-4--24-long--long-end-class-split-checker-class-map)): phase-A funnels per class list and stage masks (sexy-prime triplets, then pairs); `GB_SPLIT_CAP` / `GB_SPLIT_STAGES` override |
+| `CHECK_PHASE_B_GROUPS` | 640 | check30_b grid-stride work-groups (`GB_CHECK_BGROUPS` overrides) |
+| `MED_MIN_P` | 512 | tile-kernel primes >= this (and < split) use the prime-parallel SLM-atomic stage 3m; `GB_MED_P=N` overrides |
+| `CHECK30_PLAN` (include/check30.hpp) | 15 classes x 3-4 segments | mod-30 checker (production since v1.13.0, [§9.2j](HISTORY.md#92j-v1130--round-6--745-long---735-long-end-mod-30-checker)): per n mod 30 the (candidate class s, pattern mask, funnels) segments of phase A; `GB_C30_PLAN` overrides |
+| `CHECK_PHASE_A_W64` | 12 | phase-A item width in 64-bit words (768 evens); MUST match A_W64 (14 until 2026-10-05, [§9.2p](HISTORY.md#92p-re-tunes-after-the-round-tile-sieve-profile-2026-10-05)) |
 | `MASK_MAX_P` | 64 | primes < 64 use whole-word AND masks (17 odd primes 3..61; 1088 mask words = 8.5 KB). MUST match kernel |
 | `DEFAULT_LIMIT` | 100,000,000 | default verification range [4, limit] |
 | `DEFAULT_SEGMENT_EVEN` | 467,500,000 | default segment span (integer span; 233.75M evens; 425M from v1.12.0 to v2.3.0, [§9.2u](HISTORY.md#92u-hit-lists-fused-apply-one-walk-harvest-2026-10-06)). Comment block records the measurements. tools/run_range.sh uses 467.5M (GB_RANGE_SEGMENT), bench.py each binary's default |
@@ -260,8 +257,8 @@ Every `GB_*` knob is parsed strictly (include/env.hpp): a malformed value is
 an error (`error: GB_X='v': expected ...`, exit 1), never 0 or the default.
 Numbers are whole strings in decimal, `0x` hex or `0`-prefixed octal within
 the knob's range (no sign, junk, overflow; empty is malformed). On/off switches
-(`GB_SPLIT`, `GB_C30`, `GB_STATS`, `GB_BUCKET`, `GB_HITLIST`, `GB_MASK_GROUPS`,
-`GB_UNORDERED`, `GB_RIDGE`, `GB_SPARSE`) take `0` or `1` (empty = unset);
+(`GB_STATS`, `GB_BUCKET`, `GB_UNORDERED`, `GB_RIDGE`, `GB_SPARSE`) take `0` or
+`1` (empty = unset);
 trace flags (`GB_PHASE`, `GB_INIT_TRACE`, `GB_RIDGE_DEBUG`,
 `GB_BUCKET_VERIFY_DUMP`) are on when set to anything; file paths treat empty
 as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
@@ -281,22 +278,19 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_SPARSE=1` / `GB_SCM_*` | sparse class map: select the path and its knobs (list in [§9.2k](HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp)); `GB_PHASE=1` prints per-segment tile / large / phase A / phase B times and the pending rate, `GB_INIT_TRACE=1` the init breakdown |
 | `GB_PHASE=1` | per-segment host-phase trace to stderr: prep (offsets/table), enqueue (args/l1/l2/l3), wait, collect + raw kernel start/end ticks and sieve->large / large->check gaps. Default off (a few clock reads per segment) |
 | `GB_BUCKET_VERIFY_DUMP=1` | with GB_BUCKET_VERIFY: on the first mismatch print the differing bits with Miller-Rabin truth |
-| `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | bucket sieve off / threshold prime / grid ([§9.2b](HISTORY.md#92b-bucket-sieve-for-the-largest-primes-v170); n >= 1) |
-| `GB_BUCKET_VERIFY=N` | validate the bucket sieve on every Nth segment (1 = all; N >= 1: 0 or empty is an error, it used to mean every segment) against a bucket-free rebuild; throws on any difference |
-| `GB_HITLIST=0` / `GB_HITLIST_K=n` | bucketed primes by the bucket ring instead of hit lists / hit-list batch length (default 128, n in [1, 128], else an error; list buffer < 4 GiB) ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)); GB_BUCKET_VERIFY checks either path |
+| `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | hit lists off (every large prime in the packed kernel) / threshold prime / grid of a separate hl_apply (n >= 1) |
+| `GB_BUCKET_VERIFY=N` | validate the hit-listed primes on every Nth segment (1 = all; N >= 1: 0 or empty is an error) against a rebuild with the packed kernel over all large primes; throws on any difference |
+| `GB_HITLIST_K=n` | hit-list batch length (default 128, n in [1, 128], else an error; list buffer < 4 GiB) ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)) |
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` ([§9.2w](HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest ([§9.2v](HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)) |
-| `GB_MASK_GROUPS=0` / `GB_MASK_PERIOD=N` | per-prime mask loop instead of the fused grouped stage / max group period in words (default 4096, <= 8 groups) |
+| `GB_MASK_PERIOD=N` | max mask-group period in words (default 4096; more than 8 groups fall back to the per-prime mask loop) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32 in [32, 1024], else the run fails; default 128) |
 | `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default (`exact`, also `1`): every segment; any other value is an error |
 | `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_MIDWIN=N` / `GB_MIDWIN_KB` / `GB_MIDWIN_WG` | mid-prime SLM window pass: primes [split, N) in windows of KB of SLM with work-groups of WG (defaults 2500000 / 128 / 1024; `GB_MIDWIN=0` off and the auto split back to 36000) ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
-| `GB_SPLIT=0` | v1.11.0 A/B: twin checker on the dense map (v1.10.1 behaviour) |
-| `GB_TWIN=0` / `GB_TWIN_CAP=K` | v1.10.0 A/B: the plain two-phase checker (implies `GB_SPLIT=0`) / twin funnels of the twin checker (default `CHECK_TWIN_CANDS` = 100) |
-| `GB_CLASSMAP=6` / `GB_CLASSMAP=0` | A/B: the v1.11.0 mod-6 class map / the dense map + split_map, both feeding the class-split checker (default `30`: mod-30 class map + merge30; any other value is an error) |
-| `GB_SPLIT_CAP=K` / `GB_SPLIT_STAGES=S` | class-split checker funnels per list / stage masks ("7/3", "3", "7:20/3" = at most 20 triplet funnels) |
+| removed in v2.6 | `GB_SPLIT`, `GB_SPLIT_CAP`, `GB_SPLIT_STAGES`, `GB_TWIN_CAP`, `GB_C30`, `GB_CLASSMAP`, `GB_HITLIST`, `GB_MASK_GROUPS`: their pipelines (twin / class-split checkers, dense / mod-6 maps, bucket ring) are gone; setting one is an error before any GPU work, never silently ignored |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
 | `ZET_ENABLE_METRICS=1` | driver-side metrics enablement (+ `sysctl dev.xe.observation_paranoid=0`, Metrics Library; see §14) |
 
@@ -317,7 +311,7 @@ first-bit and tile tables, reciprocals, packed primes) is in
 include/host_math.hpp, tested against brute force by host_tests.
 
 ```
-CPU setup: base primes to sqrt(limit) via mmap'd GBPR cache (segmented
+CPU setup: base primes to sqrt(limit) via the mmap'd, hash-checked GBP2 cache (segmented
            sieve on miss); goldbach candidates p<=9781 as u16; magic
            reciprocal + shift + ms32 tables for the split range
 L0 setup:  Context (immediate command list, IN_ORDER flag — LOAD-BEARING,
@@ -415,8 +409,8 @@ they hold the design notes of kernels still in production:
   `atomic_and` on the u32 half of a word; why 64-bit `atomic_and` is not used).
 - [§9.2b](HISTORY.md#92b-bucket-sieve-for-the-largest-primes-v170) and
   [§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)–[§9.2v](HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18):
-  the largest primes — bucket ring (`GB_HITLIST=0`), hit lists (default),
-  the unordered list, and the `GB_BUCKET_VERIFY` validation they need.
+  the largest primes — the bucket ring (removed in v2.6), the hit lists that
+  replaced it, the unordered list, and the `GB_BUCKET_VERIFY` validation.
 - [§9.2j](HISTORY.md#92j-v1130--round-6--745-long---735-long-end-mod-30-checker):
   the mod-30 checker; [§9.2k](HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp):
   the sparse class map (`--sparse`) and its knobs;
@@ -428,7 +422,10 @@ they hold the design notes of kernels still in production:
 Kept (and validated by debug_fb); the host no longer calls it. Do not
 confuse its presence with an active stage.
 
-### 9.4a Production checker (v1.7.0): check_phase_a + check_phase_b
+### 9.4a The v1.7.0 two-phase checker: check_phase_a + check_phase_b (history)
+Removed in v2.6 with the twin and class-split checkers; the mod-30 checker
+(check30_a / check30_b) keeps its two-phase structure. The notes below are
+the design record.
 - Measured (1e7 evens at 4e18): evens still unresolved after the first K
   candidates: K=64 6.5%, 96 2.0%, 128 0.62%, 192 0.06%, 256 0.007%,
   384 ~1e-6. A 256-even item runs until its HARDEST even resolves, so the
@@ -456,7 +453,7 @@ confuse its presence with an active stage.
   iteration, no fewer iterations), prefetching p / sparser exit tests.
 - check_s at 4e18 (2e9 window): 0.0198 -> 0.0137 (w32) -> 0.0102 (two-phase).
 
-### 9.4 check_numbers — shifted-bitset Goldbach check (v1.6 checker; validation reference)
+### 9.4 check_numbers — shifted-bitset Goldbach check (v1.6 checker; history, removed in v2.6)
 - Per work-item: WORDS_PER_ITEM=4 disjoint 64-even words (independent
   accumulators for ILP; 4 is the optimum, 8 spills).
 - Core algebra (goldbach.cl:496-513): with bit_n = (n - seg_start)/2 and
@@ -488,9 +485,11 @@ confuse its presence with an active stage.
 - primes.cpp: `odd_primes_up_to` EXCLUDES 2 on purpose (the GPU map stores
   only odd numbers; p=2's odd-multiple stepping is meaningless — comment
   at primes.cpp:23-26). `segmented_odd_primes_up_to` for huge n (2e9 at
-  4e18; flat bitmap would need ~2 GB). Cache format: magic "GBPR" + u64
-  limit + u64 count + u32 payload; PrimeCacheView mmaps it (keyed
-  filename so different limits coexist; zero-copy payload).
+  4e18; flat bitmap would need ~2 GB). Cache format (v2.6): magic "GBP2" +
+  u64 limit + u64 count + u64 FNV-1a 64 hash of the payload + u32 payload;
+  PrimeCacheView::map_file mmaps it and checks size, hash and content
+  (keyed filename so different limits coexist; zero-copy payload; a
+  pre-v2.6 "GBPR" file is reported and regenerated, ~2.6 s at sqrt(5e18)).
   `small_prime_mask_table`: 64 masks per prime indexed by word-index mod
   p; q_first must be ODD. `is_prime_u64`: deterministic Miller-Rabin,
   bases {2,3,5,7,11,13,17,19,23,29,31,37}, valid for all u64.
@@ -558,20 +557,19 @@ confuse its presence with an active stage.
 | Tool / gate | What it proves | Expected result |
 |---|---|---|
 | `--cpu-check 1000000` | independent trial-division Goldbach reference | PASS |
-| `ctest` → `host_tests` (CI: gcc, clang, ASan+UBSan) | host math the kernels trust, vs brute force: odd prime lists (flat, segmented, multi-block), the GBPR cache (miss, mmap hit, prefix of a larger cache, corrupted header, and — since v2.3.0 — a valid header over a damaged payload: zero hole, even entry, out of order, on both load paths; no temp files left), Miller–Rabin (sieve range, strong pseudoprimes, 2^64 − 59; all 10403 base-2 Fermat pseudoprimes below 2^32 from tests/data, the list checked by brute force below 2^22, and ψ1..ψ11; `GB_PSP_FILE=` streams Feitsma's full list below 2^64), all small-prime mask layouts (dense, step 6 / 30, groups, canonical + offsets), sparse first-hit and group offsets, split / mod-30 / sparse plan coverage, `validate_plan_scm` rejecting tampered plans, and the statistics state (merge, overlap, concurrent commits, truncation, tail_t mismatch, sampled-count mismatch). Every regression check fails on the code before its fix | `host_tests: ... 0 failed -> PASS` |
+| `ctest` → `host_tests` (CI: gcc, clang, ASan+UBSan) | host math the kernels trust, vs brute force: odd prime lists (flat, segmented, multi-block), the GBP2 cache (miss, mmap hit, prefix of a larger cache, corrupted header, and — since v2.3.0 — a valid header over a damaged payload: zero hole, even entry, out of order, on both load paths; no temp files left), Miller–Rabin (sieve range, strong pseudoprimes, 2^64 − 59; all 10403 base-2 Fermat pseudoprimes below 2^32 from tests/data, the list checked by brute force below 2^22, and ψ1..ψ11; `GB_PSP_FILE=` streams Feitsma's full list below 2^64), all small-prime mask layouts (dense, step 6 / 30, groups, canonical + offsets), sparse first-hit and group offsets, split / mod-30 / sparse plan coverage, `validate_plan_scm` rejecting tampered plans, and the statistics state (merge, overlap, concurrent commits, truncation, tail_t mismatch, sampled-count mismatch). Every regression check fails on the code before its fix | `host_tests: ... 0 failed -> PASS` |
 | `ctest` → `check_constants` (`tests/check_constants.py`) | every host ↔ kernel "MUST match" constant (config.hpp / sparse.hpp / split / check30 / verifier.cpp vs goldbach.cl, sparse.cl and the snapshots) the sparse module `-D` options in CI / CMake vs `scm_geo()`, and README.md's "Current release" and C++ badge vs config.hpp `VERSION` and `CMAKE_CXX_STANDARD` — static, no GPU | `0 mismatch(es) -> PASS` |
 | `ctest` → `stats_known` (`stats_ref --known`) | p(n) of T. Oliveira e Silva's published S(p) (9781, 9629, ... and small ones) and his record-holder property over the 2000 evens below each | `0 failure(s) -> PASS` |
 | `ctest` → `known_windows` (`tests/known_windows.py selftest`) | the published windows of GoldbachGPU v3.2.0 (Llorente-Saguer 2026; [4e18, 4e18 + 1e10 .. 1e15], 1e12 across 2^63): prime counts equal the published π(x) differences, every listed n has the listed p(n) (Miller–Rabin); `run` / `campaign` modes on a stand-in binary and synthetic campaign files | `-> PASS` |
 | `ctest` → `stats_tools` (`tests/test_stats_tools.py`) | scripts/gstats.py (totals, tail, records, --ref / --export on a synthetic t0) and scripts/goldbach_live.py (S(p) proven only with coverage from 4e18, MISMATCH events never shown as records) on synthetic files | `-> PASS` |
-| `ctest -L gpu` → `gpu_validate` (local, GPU) | `tests/gpu_validate.sh`: GPU statistics log + state vs `stats_ref` (tests/stats_compare.py) on 6 windows (one across 2^63), the published windows via `known_windows.py run` (quick: 4e18 + 1e10 and + 1e12; full also + 1e13 and 1e12 across 2^63), end to end in every checker mode, GB_BUCKET_VERIFY=1 (hit lists: both ends, multi-batch K = 5 / 50, ragged first / last segments; the GB_HITLIST=0 ring), `--cpu-check`, the debug_* validators when built | `gpu_validate: 0 failure(s) -> PASS` |
+| `ctest -L gpu` → `gpu_validate` (local, GPU) | `tests/gpu_validate.sh`: GPU statistics log + state vs `stats_ref` (tests/stats_compare.py) on 6 windows (one across 2^63), the published windows via `known_windows.py run` (quick: 4e18 + 1e10 and + 1e12; full also + 1e13 and 1e12 across 2^63), end to end in every checker mode, GB_BUCKET_VERIFY=1 (hit lists: both ends, multi-batch K = 5 / 50, ragged first / last segments), `--cpu-check`, the debug_* validators when built | `gpu_validate: 0 failure(s) -> PASS` |
 | `ctest` → `cli_tests` (`tests/cli_tests.sh`) | malformed numbers and options missing their value exit 2; empty / reversed ranges, `--split` > 2^32 - 1 and the removed `--wheel` exit 2; limits above 2^64 - 2^40 exit 1 before GPU work; `2e5` == `200000`; CPU reference PASS | `cli_tests: PASS` |
-| `test_ci.py` (CI static job) | the local CI's journal chain (incl. a PASS row disagreeing with its own `limit=`, a cut-off row), reference cache keys, exact gates | `0 failure(s) -> PASS` |
+| `ctest` → `test_ci` (also the CI static job) | the local CI's journal chain (incl. a PASS row disagreeing with its own `limit=`, a cut-off row), reference cache keys, exact gates, release pruning (every journal's releases kept; a missing journal prunes nothing) | `0 failure(s) -> PASS` |
 | CI `kernels` job | every module compiles; each shipped `.spv` passes `spirv-val`, is byte-identical to a fresh ocloc 26.40 compile (deterministic output) and contains every `__kernel` of its source | all `fresh` |
 | `debug_sieve` | tile kernel (table AND legacy paths) bit-exact vs CPU sieve | OK both, diff_words=0 |
-| `debug_check` | check kernel vs CPU; expected sole miss n=4 | OK (miss n=4 only) |
 | `debug_fb` | large-prime first-offset formula vs host reference | OK both geometries |
-| `GB_BUCKET_VERIFY=1` (verifier mode) | the map with hit lists (default) or the bucket ring (GB_HITLIST=0) == a rebuild with the packed kernel over ALL large primes, every segment, over long multi-segment runs (batch boundaries, p*p activation, ragged segments) — the ONLY check that sees bugs in the largest primes' marks (end-to-end PASS cannot) | no throw |
-| `debug_check_hi` | all checkers (two-phase at caps 0..4000, w32, v1.6; mod-30 checker: 4 plans x 8 cases on mod-30 class maps, GB_C30_ONLY=1; class-split: stage sets x caps x random / mod-3 / class-map inputs, split maps and class-layout checked[] too; GB_SPLIT_ONLY=1) vs a per-even CPU reference on random maps in the PRODUCTION geometry (4e18/5e18) + low range; exact checked[] and leftover set, map buffer allocated with no slack | CHECK_HI OK |
+| `GB_BUCKET_VERIFY=1` (verifier mode) | the map with hit lists == a rebuild with the packed kernel over ALL large primes, every segment, over long multi-segment runs (batch boundaries, p*p activation, ragged segments) — the ONLY check that sees bugs in the largest primes' marks (end-to-end PASS cannot) | no throw |
+| `debug_check_hi` | the mod-30 checker (check30_a / check30_b): 5 plans x 11 cases on mod-30 class maps (dense / sparse random maps at 4e18 / 5e18, low range, short lists), exact checked[], leftover set and coverage counters vs a per-even CPU reference | CHECK_HI OK |
 | `debug_sparse map START [DLT]` / `check START DLT [PERMILLE\|real] [SEED]` (`GB_SCM_M=2310\|30030`) | sparse class map: every map bit of a full segment vs an independent CPU sieve (+ MR spot checks of that truth); phase A + B vs a per-even CPU reference on real / random maps with forced leftovers ([§9.2k](HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp)) | MAP OK / CHECK OK |
 | `debug_map` (GB_MAP_SPV=file to test a variant spv; positional args are `q_first q_odds split [spv]`) | COMPLETE map (tile+masks+large) vs deterministic Miller-Rabin at real ranges — the authoritative map validator | OK |
 | end-to-end `--csv` | `result=PASS`, `leftovers=0` near 4e18; leftovers=1 (n=4) at low ranges | PASS both windows |
