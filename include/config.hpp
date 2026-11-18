@@ -107,6 +107,10 @@ inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
 // (BUCKET_MIN_P_FACTOR_MIDWIN_NUM / _DEN).
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN_NUM = 8;
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN_DEN = 5;
+// HL_MT (round 4): with the prime-multiplier filter the hit lists take every
+// prime above q_odds_full * NUM / DEN (multi-hit primes included).
+inline constexpr uint64_t HL_MT_MINP_NUM = 1;
+inline constexpr uint64_t HL_MT_MINP_DEN = 4;
 // Phase-A item width in 64-bit words (768 evens per item) of every word
 // checker. MUST match A_W64 in kernels/goldbach.cl. v1.13.0: 16 -> 14 (the
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
