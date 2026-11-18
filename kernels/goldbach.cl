@@ -574,6 +574,9 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef HL_END
 #define HL_END 1
 #endif
+#ifndef HL_BAL
+#define HL_BAL 256               // primes per round-robin chunk (0: 1024-prime blocks)
+#endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
 // < 130M 299.5, < 100M 294.7, < 80M 292.5, < 60M 290.7, < 40M 291.5).
@@ -5828,7 +5831,7 @@ XS_KERNEL(check30_xs3, 3u, XS_W3)
 // the bucket: GB_BUCKET_VERIFY checks the result against tile + packed over
 // ALL large primes.
 // ----------------------------------------------------------------------------
-#define HL_MAX_K 128
+#define HL_MAX_K 256
 #ifndef HL_SKR
 #define HL_SKR 1                 // harvest skips hits p m, m divisible by 17..29 (LARGE_SKR)
 #endif
@@ -6444,9 +6447,20 @@ __kernel void hl_harvest_mt(
     if (lid < HL_MAX_K) lpos[lid] = 0u;
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 wend = (u64)(nseg - 1u) * delta + q_odds_tail;   // window [0, wend) in bits
+#if HL_BAL
+    // balanced regions: HL_BAL-prime chunks dealt round-robin to the groups
+    // (chunk c to group c mod ngrp), so every region sees the same mix of
+    // prime sizes (with whole 1024-prime blocks the low groups of the first
+    // block got ~1.4x the mean hits); loads stay HL_BAL-contiguous
+    const u32 hb_l = lid % HL_BAL, hb_s = lid / HL_BAL, hb_n = wg / HL_BAL;
+    for (u32 t = 0;; ++t) {
+        const u32 i = a + ((t * hb_n + hb_s) * ngrp + grp) * HL_BAL + hb_l;
+        if (i >= b) break;
+#else
     for (u32 c0 = grp * wg; c0 < b - a; c0 += ngrp * wg) {
         const u32 i = a + c0 + lid;
         if (i >= b) break;
+#endif
         const u32 p = primes[i];
         const u64 first = first_odd_multiple((u64)p, q_first);
         const u64 xo = (first - q_first) >> 1;
