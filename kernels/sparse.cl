@@ -12,6 +12,8 @@
 // ============================================================================
 
 typedef ulong u64;
+// 64-bit coverage counters: a segment holds ~1.2e11 evens (M = 30030)
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
 typedef uint  u32;
 typedef ushort u16;
 
@@ -418,7 +420,8 @@ __kernel void scm_check_a(
         const u32 items_pad,
         __global const u32* restrict ivalid,
         const u32 write_checked,
-        const u32 pshift)                        // pending entry: cr << pshift | word << 32 | miss mask
+        const u32 pshift,                        // pending entry: cr << pshift | word << 32 | miss mask
+        __global u64* restrict acct)             // [0] += valid evens of the launched items
 {
     const u32 gid = get_global_id(0);
     const u32 cr = gid / items_pad;                    // uniform per work-group
@@ -859,6 +862,9 @@ __kernel void scm_check_a(
 
     // Pending: one entry per word with unresolved evens (cr << pshift | word <<
     // 32 | miss mask), a predicated store per word; phase B expands the bits.
+    // Coverage (host: collect): the valid evens of every launched item, once
+    // per item (a per-word count cost +4..15% check_s); phase B accounts for
+    // the pending words.
     u32 cnt = 0;
     #pragma unroll
     for (u32 i = 0; i < A3_WPL; ++i) {
@@ -867,6 +873,9 @@ __kernel void scm_check_a(
             ((__global u32*)(checked + (u64)cr * chk_stride))[kb >> 5] = acc[i];
         cnt += (acc[i] != ~0u) ? 1u : 0u;
     }
+    const u32 nv = live ? min(ihi, k0 + A3_WPL * 32u) - max(ilo, k0) : 0u;
+    const u32 vtot = sub_group_reduce_add(nv);
+    if (get_sub_group_local_id() == 0 && vtot) atom_add((volatile __global long*)acct, (long)vtot);
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
     u32 base = 0;
@@ -897,8 +906,9 @@ __kernel void scm_check_a(
 ///                    cr << 32 | i (host: CPU Miller-Rabin fallback).
 /// @pre   runs after scm_check_a of the same segment; pshift - 32 in [1, 31].
 /// @post  every pending even is either resolved by a genuine witness
-///        (checked bit set iff write_checked) or appended to leftovers;
-///        *leftover_count may exceed leftover_cap (host fails closed).
+///        (checked bit set iff write_checked; acct[1] counts it) or appended
+///        to leftovers; *leftover_count may exceed leftover_cap (host fails
+///        closed).
 __kernel void scm_check_b(
         __global const u32* restrict cmap32,
         const u32 stride32,
@@ -913,13 +923,17 @@ __kernel void scm_check_b(
         __global u32* restrict leftover_count,
         const u32 leftover_cap,
         const u32 write_checked,
-        const u32 pshift)
+        const u32 pshift,
+        __global u64* restrict acct)             // [1] += evens resolved, [2] += evens examined, [3] += words
 {
     const u32 n = min(*pending_count, pending_cap);
+    u32 nres = 0u, nex = 0u, nw = 0u;
     for (u32 x = get_global_id(0); x < n; x += get_global_size(0)) {
         const u64 e = pending[x];
         const u32 cr = (u32)(e >> pshift), w = (u32)(e >> 32) & ((1u << (pshift - 32u)) - 1u);
         u32 miss = (u32)e;
+        ++nw;
+        nex += (u32)popcount(miss);
         const u32 ro = rtab[cr], rc = rtab[SCM_CR + cr];
         while (miss) {
             const u32 i = 32u * w + (u32)ctz(miss);
@@ -938,6 +952,7 @@ __kernel void scm_check_b(
                 ok = hit != 0u;
             }
             if (ok) {
+                ++nres;
                 if (write_checked)
                     atomic_or((volatile __global u32*)(checked + (u64)cr * chk_stride) + (i >> 5),
                               1u << (i & 31u));
@@ -946,6 +961,12 @@ __kernel void scm_check_b(
                 if (slot < leftover_cap) leftovers[slot] = ((u64)cr << 32) | (u64)i;
             }
         }
+    }
+    const u32 rs = sub_group_reduce_add(nres), xs = sub_group_reduce_add(nex), ws = sub_group_reduce_add(nw);
+    if (get_sub_group_local_id() == 0) {                // every lane has left the loop
+        if (rs) atom_add((volatile __global long*)(acct + 1), (long)rs);
+        if (xs) atom_add((volatile __global long*)(acct + 2), (long)xs);
+        if (ws) atom_add((volatile __global long*)(acct + 3), (long)ws);
     }
 }
 

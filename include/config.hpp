@@ -18,8 +18,7 @@ namespace gb {
 // ScmEngine fail-closed paths); dense and --sparse kernels byte-identical.
 // v2.1.0: cleanup release — concluded experiment kernels/tools and their
 // A/B-only env knobs removed; production paths unchanged (spv byte-identical).
-// The selectors of earlier production paths (GB_SPLIT, GB_CLASSMAP, GB_TWIN,
-// GB_C30, ...) were kept; PROJECT-REFERENCE.md §7 lists every GB_* variable.
+// PROJECT-REFERENCE.md §7 lists every GB_* variable.
 // v2.2.0: exact Goldbach statistics on the dense path (include/gstats.hpp,
 // HISTORY.md §9.2l) and a tail-bounded mod-30 checker plan
 // (every phase-A member < 3000: complete ridges and p(n) >= 3000 tail).
@@ -45,7 +44,13 @@ namespace gb {
 // v2.5.1: the packed kernel's gap-stream loads bypass L3 (LSC L1S_L3UC): the
 // ~33 MB per segment stream no longer evicts the class map under the
 // atomics (+0.4%). Results unchanged.
-inline constexpr const char* VERSION = "2.5.1";
+// v2.6.0 (audit 2026-11-17, CORRECTNESS.md §6): positive coverage accounting
+// (every even of a segment counted as resolved or left for the CPU; a checker
+// that did not run fails the run, dense and --sparse); the prime cache carries
+// a payload hash ("GBP2"); the twin / class-split checkers, the dense / mod-6
+// maps and the bucket ring are removed (only A/B knobs reached them; those
+// knobs are refused). Results unchanged.
+inline constexpr const char* VERSION = "2.6.0";
 
 // ---- make_prime_map geometry --------------------------------------------
 // One work-group = one tile. SLM holds 64-bit words; one bit represents one
@@ -59,13 +64,9 @@ inline constexpr uint32_t WG_SIZE           = 256;                       // thre
 #endif
 inline constexpr uint32_t TILE_WORDS        = GB_TILE_WORDS;             // words of 64 odd numbers
 inline constexpr uint64_t BITS_PER_TILE     = uint64_t(TILE_WORDS) * 64; // 131,072 odd numbers (16 KB)
-// The large-prime kernel amortizes dispatch across a small, bounded batch.
-// Keep this mirrored in kernels/goldbach.cl. Four preserves short work-items
-// while reducing ~98M work-items at 4e18 to ~25M.
+// sieve_large_primes (the plain reference kernel of the validators): primes
+// per work-item. Keep this mirrored in kernels/goldbach.cl.
 inline constexpr uint32_t LARGE_PRIMES_PER_ITEM = 4;
-// check_numbers processes this many 64-even words per work-item. This must
-// match WORDS_PER_ITEM in kernels/goldbach.cl and is used for launch coverage.
-inline constexpr uint32_t CHECK_WORDS_PER_ITEM = 4;
 // sieve_large_packed: primes per packing group (one base u32 each) = 4 x the
 // kernel's subgroup width. MUST match LARGE_PACK_GROUP in kernels/goldbach.cl.
 #ifndef GB_LARGE_PACK_PPI
@@ -83,19 +84,14 @@ inline constexpr uint32_t LARGE_WG_SIZE = 32;
 // other multiple is divisible by a prime <= 13 and cleared by the small-prime
 // mask stage. MUST match WHEEL_W in kernels/goldbach.cl (30030 only).
 inline constexpr uint64_t WHEEL_W = 30030;
-// bucket_process grid-stride work-groups (GB_BUCKET_GROUPS overrides).
+// A separate hl_apply's grid-stride work-groups are 2 x this (only when no
+// prime is packed; GB_BUCKET_GROUPS overrides).
 inline constexpr uint32_t BUCKET_GROUPS = 1024;
-// Primes p > BUCKET_MIN_P_FACTOR * q_odds_full go to the bucket sieve
-// (GB_BUCKET_MINP=<p> overrides; floor q_odds_full). A bucket entry costs
-// ~200 ps per hit (read + mark + re-file), a packed prime ~40 ps of setup per
-// segment. The multiplier wheel (v1.9.0) cut the hits per prime to 480/1155
-// but not the packed setup, which moved the crossover from ~8 to ~3 x q_odds
-// (v1.10.0, 2e10 windows vs 1e9: 7e8 +9.4%, 5e8 +9.3%, 3.5e8 +9.6% steady;
-// +8.2 / +10.7 / +11.6% end; 2.5e8 flat then -3.4% after the packed setup got
-// cheaper). v1.10.1 (128-B-aligned buckets, wheel 30030), 1e11 windows at
-// 4.0/4.3/4.7/5.0e18 vs 2310 at 4 x: 30030 at 4 x +0.8/+0.9/+0.8/+0.8%,
-// 3 x +1.6/+1.6/+1.4/+1.2%, 2.5 x +1.3/+1.4/+1.1/+1.1%. Cost: the ring is
-// R x cap entries, ~6.9 GiB of VRAM at 3 x with the 30030 wheel (R ~199).
+// Primes p > BUCKET_MIN_P_FACTOR * q_odds_full go to the hit lists
+// (GB_BUCKET_MINP=<p> overrides; floor q_odds_full: at most one hit per
+// segment). The crossover against the packed kernel's per-segment setup was
+// measured for the bucket ring that preceded the hit lists (HISTORY.md
+// §9.2t): 3 x q_odds_full.
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
 // With the mid-prime SLM windows (HISTORY.md §9.2x) the packed kernel lost
 // most of its atomics and the crossover moved down: 1e11 at 4e18 (3 paired
@@ -118,30 +114,11 @@ inline constexpr uint64_t HL_MT_MINP_DEN = 20;
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
 // the rotate funnel (12 spill-free; +0.18% / +0.20% long / long-end).
 inline constexpr uint32_t CHECK_PHASE_A_W64    = 12;
-inline constexpr uint32_t CHECK_PHASE_B_GROUPS = 640;
 // Mod-30 phase B (check30_b, flattened probe loop CB_FLAT): a small grid that
 // runs beside the next segment's tile sieve instead of filling the GPU
 // (2026-11-18 r6b, 4e18 per segment: 640 groups 1.662 ms, 60 1.644, 40 1.634,
-// 30 1.644, 20 1.650; GB_C30_BGROUPS overrides).
+// 30 1.644, 20 1.650; GB_CHECK_BGROUPS overrides).
 inline constexpr uint32_t CHECK30_B_GROUPS = 40;
-// Twin checker (v1.10.0): phase A funnels over the lower members of twin
-// pairs (two candidates per funnel, kernels/goldbach.cl tw32), then phase B
-// probes the candidates those pairs did not cover (GB_TWIN_CAP overrides;
-// the plain v1.9.0 checker, cap 160, was removed). 2e10 window: 80 +0.4%, 90 +1.4%, 100 +1.1%, 120 +0.3%
-// over the plain checker with the rest list; plain cap 160 re-checked.
-inline constexpr uint32_t CHECK_TWIN_CANDS = 100;
-
-// Class-split checker (v1.11.0, include/split_check.hpp): funnels per class
-// list and the stage masks (bit d = candidate p + 6d; "7/3" = sexy-prime
-// triplets p, p+6, p+12, then pairs p, p+6 of the remaining primes).
-// Class map, 350M spans, check_s per 1e11 at 4e18: pairs "3" cap 60: 123.1 ms;
-// "7/3" cap 33/35/37/38/39: 125.9/120.0/116.8/116.6/116.3, cap 40/41/42:
-// 123.9/129.3/137.3 (the triplet list's 3-5-word gaps start forcing full
-// window reloads); -0.7% total at 4e18, 4.5e18 and 5e18. Stage limits
-// ("7:20/3") measured no better.
-inline constexpr uint32_t CHECK_SPLIT_CANDS = 38;
-inline constexpr const char* CHECK_SPLIT_STAGES = "7/3";
-
 // ---- Goldbach candidate primes ------------------------------------------
 // Largest "smallest prime" needed by any minimal Goldbach partition in the
 // published 4e18 verification (Oliveira e Silva et al.) is 9781.
@@ -169,15 +146,10 @@ inline constexpr uint32_t RIDGE_KEEP         = 30;
 inline constexpr uint32_t RIDGE_MIN_DEFAULT  = 3000;
 
 // Tile-kernel primes >= MED_MIN_P (and < the split) are walked prime-parallel
-// with SLM atomics instead of by every thread (make_prime_map stage 3m).
-// Measured at 4e18 with 64 KB tiles (split 40000, sieve_s over the 2e9 window): 128 -> 0.0152,
-// 256 -> 0.0138, 512 -> 0.0137, 1024 -> 0.0143, 2048 -> 0.0156, 4096 -> 0.0184.
-// v1.10.0 (batched medium-stage loads): 256 +0.6% over 512 (8 paired rounds).
-inline constexpr uint32_t MED_MIN_P = 256;
-// Class mode (v1.11.0): per 1e11 window sieve_s 261.7 (256) / 256.2 (384) /
-// 253.0 (512) / 261.8 (640) ms — fewer, longer class tiles favour the
-// thread-owned walk for a few more primes.
-inline constexpr uint32_t MED_MIN_P_CLASS = 512;
+// with SLM atomics instead of by every thread (make_prime_map stage 3m;
+// GB_MED_P overrides). Class map, per 1e11 window: sieve_s 261.7 (256) /
+// 256.2 (384) / 253.0 (512) / 261.8 (640) ms.
+inline constexpr uint32_t MED_MIN_P = 512;
 // With the mid-prime windows (medium primes up to the 1500th prime only,
 // load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
 inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
@@ -208,21 +180,13 @@ inline constexpr uint32_t MASK_MAX_P = 64;
 
 // ---- Defaults ------------------------------------------------------------
 inline constexpr uint64_t DEFAULT_LIMIT          = 100'000'000ULL;  // verify evens in [4, limit]
-// Segment span rationale: with the host prep overlapped and the prime map
-// L3-resident, 200-250M spans are the measured optimum — at this span the
-// 12-16 MB prime map fits the 18 MB L3, making the large-prime kernel's
-// scattered atomic marks far cheaper than when they hit GDDR (400M spans
-// fall off sharply). The matching split optimum is ~2400; see the split
-// selection comment in src/verifier.cpp.
-// v1.11.0 (mod-6 class map, 2/3 the bits): 350M spans — steady-state kernel
-// time per 1e11 at 4e18 / 5e18: -1.8% / -2.5% vs 250M (300M -0.8%, 325M
-// -1.4%, 375M 0%, 400M +0.1%, 500M: map leaves L3, large_s x5).
-// v1.12.0 (mod-30 class map, 8/15 of the bits): 425M — kernel time per 1e11
-// vs 350M: -1.5% / -1.3% (400M +0.1%, 450M -1.1%, 475M +0.8%, 500M +0.2%).
-// v2.4 (fused hit lists, one-walk harvest): 467.5M — gpu per 1e11 vs 425M
-// +1.16% / +1.29% faster (450M +0.6 / +1.0%, 480M +0.85 / +1.1%, 491.5M
-// +1.1 / +1.3%; 510M: map leaves L3, -34%). Tile-exact spans do not matter
-// (424.66M, 108 full tiles per class: +-0%).
+// Segment span: the largest span whose mod-30 class map (8/15 of the odd
+// numbers, ~15.6 MB at 467.5M) stays in the B580's 18 MB L3, where the
+// large-prime kernels' scattered atomic marks are cheap; past it the map
+// falls out of L3 and the large-prime time multiplies (510M: -34%). v2.4
+// (fused hit lists, one-walk harvest): 467.5M — gpu per 1e11 vs 425M +1.16% /
+// +1.29% (450M +0.6 / +1.0%, 480M +0.85 / +1.1%, 491.5M +1.1 / +1.3%).
+// Tile-exact spans do not matter (424.66M, 108 full tiles per class: +-0%).
 inline constexpr uint64_t DEFAULT_SEGMENT_EVEN   = 467'500'000ULL;
 inline constexpr uint32_t MAX_LEFTOVERS          = 1u << 20;        // compact exception list cap
 
