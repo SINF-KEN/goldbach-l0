@@ -2755,6 +2755,14 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 ///         and otherwise e is appended to pending (atomic counter; entries
 ///         beyond pending_cap are counted but not stored: the host fails
 ///         closed). The map is unchanged.
+// SIMD16 pinned (2026-11-18): the compiler's own choice measured 0.275 vs
+// 0.269 ms per segment of phase A (+0.25% overall)
+#ifndef CA_SG
+#define CA_SG 16
+#endif
+#if CA_SG
+__attribute__((intel_reqd_sub_group_size(CA_SG)))
+#endif
 __kernel void check30_a(
         __global const u32* restrict cmap32,     // 8 class arrays of cw32 u32 words
         const u32 cw32,
