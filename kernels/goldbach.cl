@@ -565,6 +565,15 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef MQ_HOIST
 #define MQ_HOIST 1
 #endif
+#ifndef HL_RKT
+#define HL_RKT 1
+#endif
+#ifndef HL_FX
+#define HL_FX 1
+#endif
+#ifndef HL_END
+#define HL_END 1
+#endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
 // < 130M 299.5, < 100M 294.7, < 80M 292.5, < 60M 290.7, < 40M 291.5).
@@ -6218,15 +6227,105 @@ __kernel void hl_harvest_mt(
         while ((u64)(nh + 1u) * p <= rem) ++nh;
         const u32 dmax = 2u * nh;
         // first coprime multiplier >= m0
-        u32 kr = k0 - k_lo, rr = r0;
+        u32 kr = k0 - k_lo;
+#if HL_RKT
+        // the first coprime residue >= r0 and its wheel index from one MQ_RK
+        // block (two when it lies in the next block; r0 odd: m0 is odd)
+        u32 w0;
+        {
+            const u32 jr = r0 >> 1;
+            const uint2 e = MQ_RK[jr >> 5];
+            const u32 bm = e.x & (0xFFFFFFFFu << (jr & 31u));
+            if (bm) {
+                const u32 b = ctz(bm);
+                w0 = e.y + popcount(e.x & ((1u << b) - 1u));
+            } else {
+                const u32 nb = (jr >> 5) + 1u;
+                const uint2 e2 = MQ_RK[(nb == 470u) ? 0u : nb];
+                const u32 b = ctz(e2.x);
+                w0 = e2.y + popcount(e2.x & ((1u << b) - 1u));
+                kr += (nb == 470u) ? 1u : 0u;           // wrapped past 30030
+            }
+        }
+        if (k0 < k_lo) { atomic_or(err, 32u); continue; }
+#else
+        u32 rr = r0;
         while (WHL_IDX[rr] == WHL_MISS) { rr += 2u; if (rr >= 30030u) { rr -= 30030u; ++kr; } }
         if (k0 < k_lo) { atomic_or(err, 32u); continue; }
         // table word / bit of that multiplier (bit index kr 5760 + w exceeds
         // 2^32 beyond m_lo + 2.2e10: word = kr 180 + w / 32, 5760 = 180 * 32)
         const u32 w0 = WHL_IDX[rr];
+#endif
+#if HL_END
+        // the walk's last table bit from the last multiplier m0 + dmax (its
+        // rank in MQ_RK): no per-hit window test, no per-word stop lookup
+        u32 wi = kr * 180u + (w0 >> 5);
+        const u32 kb = k0 - k_lo;
+        u32 wx, mlast;                                  // words [wi, wx), last word's mask
+        {
+            const u32 rend = r0 + dmax;                 // < 2^31 (dmax < 2 wend / p)
+            const u32 kq = rend / 30030u, re = rend - kq * 30030u;
+            const u32 ke = kb + kq;                     // block of m0 + dmax
+            u32 c = 0u;                                 // coprime residues in [0, re]
+            if (re) {
+                const u32 jr = (re - 1u) >> 1;
+                const uint2 e = MQ_RK[jr >> 5];
+                c = e.y + popcount(e.x & ((2u << (jr & 31u)) - 1u));
+            }
+            wx = c ? ke * 180u + ((c - 1u) >> 5) + 1u : ke * 180u;
+            mlast = c ? (2u << ((c - 1u) & 31u)) - 1u : 0xFFFFFFFFu;
+        }
+        if (wx > mt_words) { atomic_or(err, 32u); continue; }
+#if HL_FX
+        const float pf = (float)p, xof = (float)xo;
+        const u32 xlo = (u32)xo;
+#endif
+        u32 smask = 0xFFFFFFFFu << (w0 & 31u);
+        for (; wi < wx; ++wi) {
+            u32 word = mt[wi] & smask;
+            smask = 0xFFFFFFFFu;
+            if (wi + 1u == wx) word &= mlast;
+            const u32 kk = wi / 180u;
+            const u32 dmb = (kk - kb) * 30030u - r0;
+            const u32 lb = (wi - kk * 180u) * 32u;
+            while (word) {
+                const u32 bt = 31u - clz(word & (0u - word));
+                word &= word - 1u;
+                const u32 dm = dmb + lm[lb + bt];
+#if HL_FX
+                // x = xo + p h < 2^35: j from a float estimate (abs error of
+                // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                const u32 h = dm >> 1;
+                u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                int o = (int)(xlo + p * h - j * delta);
+#else
+                const u64 x = xo + (u64)p * (dm >> 1);
+                u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
+                int o = (int)((u32)x - j * delta);
+#endif
+                while (o < 0) { o += (int)delta; --j; }
+                while (o >= (int)delta) { o -= (int)delta; ++j; }
+                const u32 off = (u32)o;
+                if (j < nseg && off < HL_QO(j)) {
+                    const u32 idx = atomic_inc(&lpos[j]);
+                    if (idx < capg) lists[((size_t)j * ngrp + grp) * capg + idx] = off;
+                }
+                if (j >= 1u && j - 1u < nseg && off + delta < HL_QO(j - 1u)) {
+                    const u32 idx = atomic_inc(&lpos[j - 1u]);
+                    if (idx < capg) lists[((size_t)(j - 1u) * ngrp + grp) * capg + idx] = off + delta;
+                }
+            }
+        }
+    }
+#else
         u32 wi = kr * 180u + (w0 >> 5);
         u32 word = (wi < mt_words) ? mt[wi] & (0xFFFFFFFFu << (w0 & 31u)) : 0u;
         const u32 kb = k0 - k_lo;
+#if HL_FX
+        const float pf = (float)p, xof = (float)xo;
+        const u32 xlo = (u32)xo;
+#endif
         for (;;) {
             if (wi >= mt_words) { atomic_or(err, 32u); break; }
             bool done = false;
@@ -6236,9 +6335,18 @@ __kernel void hl_harvest_mt(
                 const u32 kk = wi / 180u;
                 const u32 dm = (kk - kb) * 30030u + lm[(wi - kk * 180u) * 32u + bt] - r0;
                 if (dm > dmax) { done = true; break; }
+#if HL_FX
+                // x = xo + p h < 2^35: j from a float estimate (abs error of
+                // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                const u32 h = dm >> 1;
+                u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                int o = (int)(xlo + p * h - j * delta);
+#else
                 const u64 x = xo + (u64)p * (dm >> 1);
                 u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
                 int o = (int)((u32)x - j * delta);
+#endif
                 while (o < 0) { o += (int)delta; --j; }
                 while (o >= (int)delta) { o -= (int)delta; ++j; }
                 const u32 off = (u32)o;
@@ -6261,6 +6369,7 @@ __kernel void hl_harvest_mt(
             word = (wi < mt_words) ? mt[wi] : 0u;
         }
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lid < nseg) {
         const u32 c = lpos[lid];
