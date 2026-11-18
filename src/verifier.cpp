@@ -320,6 +320,9 @@ struct RunSetup {
 
     // ---- resolve_range ----------------------------------------------------
     uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS
+    // GB_C30_LATE (default on): count30 after the checker instead of beside
+    // phase A, so it runs beside phase B and the next segment's tile sieve
+    bool c30_late = env::onoff("GB_C30_LATE", true);
     uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
     uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
     RunStats stats;
@@ -2212,7 +2215,7 @@ void DenseRun::enqueue_check(Segment& sg) {
     slot_evens[sg.slot] = sg.seg_evens;
     if (sampled) sampled_evens += sg.seg_evens;
     xs_used[sg.slot] = sampled;
-    if (stats_on) {
+    if (stats_on && !c30_late) {
         enqueue_count30(sg, sampled);
     }
     if (sampled) {
@@ -2224,6 +2227,13 @@ void DenseRun::enqueue_check(Segment& sg) {
     } else {
         enqueue_check_twin(sg, a_groups, ridge_thresh_u32);
     }
+    // count30 late: after the checker, without a barrier, so it runs beside
+    // phase B and the next segment's tile sieve (an SLM-bound kernel that
+    // leaves issue slots free; beside phase A, which is ALU-bound, it cost
+    // ~1.5x as much). It only reads this slot's finished map (the barrier
+    // before phase A follows the marks); the next mid_window barrier and the
+    // host's wait on its event (collection) order everything after it.
+    if (stats_on && c30_late) enqueue_count30(sg, sampled);
     sg.enq_s = seconds_since(sg.t_enq);
     sg.launch_s = seconds_since(sg.t_launch0);
     sg.l3_s = seconds_since(sg.t_launch0);
@@ -2244,6 +2254,11 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     {
         uint32_t cls[8] = {0, 1, 2, 3, 4, 5, 6, 7};
         std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return sg.cgeo.phi[x] < sg.cgeo.phi[y]; });
+        // count30's gap walk takes the phase order as a rotation of the
+        // class order by ord & 15 (the residues sorted by (u - q0) mod 30)
+        for (uint32_t k = 0; k < 8; ++k)
+            if (cls[k] != (cls[0] + k) % 8)
+                throw std::runtime_error("count30: classes in phase order are not a rotation");
         for (uint32_t k = 0; k < 8; ++k) {
             g_ord |= cls[k] << (4 * k);
             g_phis |= sg.cgeo.phi[cls[k]] << (4 * k);
@@ -2276,7 +2291,8 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     k_cnt->set_arg(10, 4, &cwalk);
     k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
     k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
-    k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    if (c30_late) k_cnt->launch_overlap(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    else k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
     split_used[sg.slot] = true;
 }
 
@@ -2360,7 +2376,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_ca->set_arg(12, 4, &s30.tb);
     k_ca->set_arg(13, 4, &s30.phik);
     k_ca->set_arg(14, 4, &split_write_checked);
-    // launch_overlap: phase A may run alongside count30 (both only
+    // launch_overlap: phase A may run alongside count30 (GB_C30_LATE=0; both only
     // read the finished map; the barrier above follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
@@ -2530,6 +2546,7 @@ void DenseRun::collect_previous_segment(Segment& sg) {
     const uint32_t prev = uint32_t((stats.segments - 1) & 1);
     const auto t_wait = clock_::now();
     ZE_CHECK(zeEventHostSynchronize(ev.check[prev], UINT64_MAX));
+    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[prev], UINT64_MAX));
     sg.wait_s = seconds_since(t_wait);
     const auto t_coll = clock_::now();
 
@@ -2624,6 +2641,7 @@ void DenseRun::end_iteration(const Segment& sg) {
 void DenseRun::drain_final_segment() {
     const uint32_t last = uint32_t((stats.segments - 1) & 1);
     ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
+    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[last], UINT64_MAX));
 
     double ds = 0.0, dl = 0.0, dv = 0.0;
     query_slot(last, ds, dl, dv);
