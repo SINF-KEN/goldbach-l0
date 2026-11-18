@@ -75,8 +75,9 @@ inline constexpr uint32_t LARGE_PACK_PPI   = GB_LARGE_PACK_PPI;   // primes per 
 inline constexpr uint32_t LARGE_PACK_GROUP = 32 * LARGE_PACK_PPI; // SIMD32 subgroup
 // Work-group size of the large-prime kernel (a multiple of its SIMD32
 // subgroup). v1.10.0 (32-bit setup, buckets from 3 x q_odds): 128 beats 64 by
-// +0.8% (steady) / +1.3% (end); 32 -1.8%, 256 ties.
-inline constexpr uint32_t LARGE_WG_SIZE = 128;
+// +0.8% (steady) / +1.3% (end); 32 -1.8%, 256 ties. 2026-11-18, with the
+// rolled per-item prime loop: large_s per 1e11 128 322.5, 64 320.0, 32 319.1.
+inline constexpr uint32_t LARGE_WG_SIZE = 32;
 // Multiplier wheel of the large-prime / bucket marking (v1.9.0; 30030 since
 // v1.10.1): a prime p > 61 only marks p*m for m coprime to WHEEL_W; every
 // other multiple is divisible by a prime <= 13 and cleared by the small-prime
