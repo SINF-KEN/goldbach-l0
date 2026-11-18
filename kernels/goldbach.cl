@@ -2074,9 +2074,12 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+#ifndef MED_W7_MAXP
+#define MED_W7_MAXP 8192u
+#endif
 __constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
-inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0, const u32 qc7, const u32 s7)
+inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
+                          const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 nbits)
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
@@ -2099,19 +2102,22 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
     // and exactly the k = k7 (mod 7) are skipped: blocks of 7 p take six
     // marks at fixed offsets (no per-mark ALU), the tail tests each of at
     // most 7 candidates. qc7 = qc mod 7, s7 = s mod 7.
-    if (p == 7u) {
-        for (; bit < (u32)TILE_BITS; bit += p)
+    // Only primes with a few full 7p blocks per tile: above, the wheel's
+    // setup and the 7-candidate tail cost more than the marks they skip
+    // (low heights, split 36000: sieve +55 ms per 1e11 at 1e14).
+    if (p == 7u || p > (u32)MED_W7_MAXP) {
+        for (; bit < nbits; bit += p)
             atomic_and(&t32[bit >> 5], CLR_MASK(bit));
         return;
     }
-    if (bit < (u32)TILE_BITS) {
+    if (bit < nbits) {
         const u32 q0 = (qc7 + s7 * (tile_bit0 + bit)) % 7u;      // class bits < 2^24
         const u32 k7 = ((7u - q0) * INV7[(s7 * p) % 7u]) % 7u;
         const u32 p6 = 6u * p, p7 = 7u * p;
         u32 o[6];
         #pragma unroll
         for (u32 t = 0; t < 6u; ++t) o[t] = (t + (t >= k7 ? 1u : 0u)) * p;
-        for (; bit + p6 < (u32)TILE_BITS; bit += p7) {
+        for (; bit + p6 < nbits; bit += p7) {
             #pragma unroll
             for (u32 t = 0; t < 6u; ++t) {
                 const u32 b = bit + o[t];
@@ -2120,10 +2126,16 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
         }
         for (u32 d = 0; d < 7u; ++d) {
             const u32 b = bit + d * p;
-            if (b >= (u32)TILE_BITS) break;
+            if (b >= nbits) break;
             if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK(b));
         }
     }
+}
+
+inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
+                          const u32 tile_bit0, const u32 qc7, const u32 s7)
+{
+    med_prime_f32n(t32, fb, p, tile_bit0, qc7, s7, (u32)TILE_BITS);
 }
 
 // One prime of the thread-owned walk (table path) in 32-bit / float
@@ -2159,6 +2171,19 @@ inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
 // Medium-stage load batch (v1.10.0). sieve_s per 2e10 window: unbatched
 // 0.0824, 2 -> 0.0775, 4 -> 0.0745, 8 -> 0.0728 (+3.6% total), 12 ties,
 // 16 spills (-3.7%); a two-stage pipeline on top measured no better.
+// Medium-stage load balance (2026-11-18): the medium primes are dealt to
+// the threads in rows of WG_SIZE, and the barrier after the stage waits for
+// the thread with the most marks: with p = 521 (215 marks per tile) in row
+// 0 that thread had 1.6-1.8x the mean. The first MED_SPLITN primes are two
+// items each (one per tile half) and the rows alternate direction (snake):
+// max / mean 1.15. 0 = one item per prime, rows in order.
+// Fused mask stage in the coalesced word order (2026-11-18, +0.1%)
+#ifndef MASK_COAL
+#define MASK_COAL 1
+#endif
+#ifndef MED_SPLITN
+#define MED_SPLITN 128
+#endif
 #ifndef MED_BATCH
 #define MED_BATCH 8
 #endif
@@ -2275,14 +2300,27 @@ __kernel void make_prime_map(
         // word index mod the product of its primes) and stored ONCE. The
         // per-prime path costs a global load plus an SLM read-modify-write
         // per prime (17) per word; this costs n_groups (7) loads per word.
+#if MASK_COAL
+        // Coalesced: word i * WG_SIZE + me (the barrier below orders these
+        // plain stores before every owner's walk), so a sub-group reads
+        // consecutive table entries instead of entries 8 words apart.
+        const u32 x = (u32)(tile_bit0 >> 6) + me;          // global word index < 2^32
+#else
         const u32 x = (u32)((tile_bit0 >> 6) + my_word0);  // global word index < 2^32
+#endif
         u32 ph[MAX_MASK_GROUPS], per[MAX_MASK_GROUPS], off[MAX_MASK_GROUPS];
+#if MASK_COAL
+        u32 stp[MAX_MASK_GROUPS];
+#endif
         #pragma unroll
         for (u32 g = 0; g < MAX_MASK_GROUPS; ++g) {
             if (g < n_groups) {
                 off[g] = group_desc[2 * g];
                 per[g] = group_desc[2 * g + 1];
                 ph[g] = x % per[g];
+#if MASK_COAL
+                stp[g] = (u32)WG_SIZE % per[g];
+#endif
                 if (group_y) {                  // canonical table: read word (x - Y) mod P
                     const u32 y = group_y[cls * MAX_MASK_GROUPS + g];
                     ph[g] = (ph[g] + per[g] - y) % per[g];
@@ -2295,10 +2333,19 @@ __kernel void make_prime_map(
             for (u32 g = 0; g < MAX_MASK_GROUPS; ++g) {
                 if (g < n_groups) {
                     v &= group_masks[off[g] + ph[g]];
+#if MASK_COAL
+                    ph[g] += stp[g];
+                    ph[g] -= (ph[g] >= per[g]) ? per[g] : 0u;
+#else
                     ph[g] = (ph[g] + 1u == per[g]) ? 0u : ph[g] + 1u;
+#endif
                 }
             }
+#if MASK_COAL
+            tile[i * WG_SIZE + me] = v;
+#else
             tile[my_word0 + i] = v;
+#endif
         }
     } else
     for (u32 i = 0; i < WORDS_PER_THREAD; ++i)
@@ -2581,6 +2628,51 @@ __kernel void make_prime_map(
             sieve_primes[sieve_split - 1u] < (1u << 23)) {   // uniform (med_prime_f32 PRE)
             __global const u32* fb32 = (__global const u32*)fb_global;   // low words
             const u32 tb = (u32)tile_bit0;
+#if MED_SPLITN
+            // (only for short medium ranges, as the mid-window split's 1500:
+            // with many rows the imbalance is small and the index ALU costs,
+            // -1..-2% at split 36000)
+            if (sieve_split - own_end <= 16u * WG_SIZE)
+            // Items: the halves of the first m2 medium primes (most marks;
+            // one item per tile half), then one per remaining prime. Rows
+            // of WG_SIZE items alternate direction (a snake); MED_BATCH rows
+            // per load batch.
+            {
+                const u32 m2 = min((u32)MED_SPLITN, sieve_split - own_end);
+                const u32 nit = sieve_split - own_end + m2;
+                const u32 nrow = (nit + WG_SIZE - 1u) / WG_SIZE;
+                const u32 meo = WG_SIZE - 1u - me;
+                u32 r = 0;
+                for (; r + MED_BATCH <= nrow; r += MED_BATCH) {
+                    u32 fbv[MED_BATCH], pv[MED_BATCH], hv[MED_BATCH];
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 it = (r + u) * WG_SIZE + (((r + u) & 1u) ? meo : me);
+                        const u32 jj = own_end + ((it < 2u * m2) ? (it >> 1) : it - m2);
+                        hv[u] = (it < 2u * m2) ? (1u + (it & 1u)) : 0u;
+                        const bool ok = it < nit;
+                        fbv[u] = ok ? fb32[2u * jj] : 0xFFFFFFFFu;
+                        pv[u] = ok ? sieve_primes[jj] : 0u;
+                    }
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 h = (hv[u] == 2u) ? (u32)TILE_BITS / 2u : 0u;
+                        med_prime_f32n(t32 + (h >> 5), fbv[u], pv[u], tb + h, qc7v, s7v,
+                                       hv[u] ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                    }
+                }
+                for (; r < nrow; ++r) {
+                    const u32 it = r * WG_SIZE + ((r & 1u) ? meo : me);
+                    if (it >= nit) continue;
+                    const u32 jj = own_end + ((it < 2u * m2) ? (it >> 1) : it - m2);
+                    const u32 hs = (it < 2u * m2) ? (1u + (it & 1u)) : 0u;
+                    const u32 h = (hs == 2u) ? (u32)TILE_BITS / 2u : 0u;
+                    med_prime_f32n(t32 + (h >> 5), fb32[2u * jj], sieve_primes[jj], tb + h, qc7v, s7v,
+                                   hs ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                }
+                j = sieve_split;
+            }
+#endif
             for (; j + (MED_BATCH - 1) * WG_SIZE < sieve_split; j += MED_BATCH * WG_SIZE) {
                 u32 fbv[MED_BATCH], pv[MED_BATCH];
                 #pragma unroll
@@ -4289,6 +4381,14 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 ///         and otherwise e is appended to pending (atomic counter; entries
 ///         beyond pending_cap are counted but not stored: the host fails
 ///         closed). The map is unchanged.
+// SIMD16 pinned (2026-11-18): the compiler's own choice measured 0.275 vs
+// 0.269 ms per segment of phase A (+0.25% overall)
+#ifndef CA_SG
+#define CA_SG 16
+#endif
+#if CA_SG
+__attribute__((intel_reqd_sub_group_size(CA_SG)))
+#endif
 __kernel void check30_a(
         __global const u32* restrict cmap32,     // 8 class arrays of cw32 u32 words
         const u32 cw32,
@@ -5402,9 +5502,13 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 }
 
 /// @pre    mid_setup of this segment wrote i0tab; the tile sieve's stores are
-///         visible (barrier before); no concurrent writer of the map (the
-///         window is written back with plain stores). Class bits < 2^24.
+///         visible (barrier before); MIDW_ANDST 2: other writers of the map
+///         only AND-clear bits atomically (the packed kernel may overlap);
+///         MIDW_ANDST 0 / 1: no concurrent writer. Class bits < 2^24.
 /// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
+#ifndef MIDW_ANDST
+#define MIDW_ANDST 2             // 2: atomic AND store (the packed kernel may overlap)
+#endif
 #ifndef MIDW_SKIP
 #define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
 #endif
@@ -5485,6 +5589,15 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     // core, so the window load / store latency is exposed; uint4 issues 4x
     // fewer messages (2026-11-18: window pass -5.5 ms per 1e11, +0.8%)
     const u32 nw4 = nw >> 2;
+#if MIDW_ANDST
+    // the window starts as ones and is ANDed into the map at the store: no
+    // exposed load phase before the marks (one work-group per Xe core)
+    {
+        __local uint4* w4 = (__local uint4*)win;
+        for (u32 i = lid; i < nw4; i += wg) w4[i] = (uint4)(~0u);
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = ~0u;
+    }
+#else
     {
         __global const uint4* g4 = (__global const uint4*)gm;
         __local uint4* w4 = (__local uint4*)win;
@@ -5492,6 +5605,7 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         for (u32 i = lid; i < nw4; i += wg) w4[i] = g4[i];
         for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = gm[i];
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     volatile __local u32* v = (volatile __local u32*)win;
     __global const u32* it = i0tab + (size_t)cls * n;
@@ -5539,8 +5653,20 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     {
         __global uint4* g4 = (__global uint4*)gm;
         __local const uint4* w4 = (__local const uint4*)win;
+#if MIDW_ANDST == 2
+        // atomic AND: the packed large kernel may already be marking
+        for (u32 i = lid; i < nw; i += wg) {
+            const u32 x = win[i];
+            if (x != ~0u) atomic_and((volatile __global u32*)gm + i, x);
+        }
+#elif MIDW_ANDST
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) g4[i] &= w4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] &= win[i];
+#else
         #pragma unroll 8
         for (u32 i = lid; i < nw4; i += wg) g4[i] = w4[i];
         for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] = win[i];
+#endif
     }
 }
