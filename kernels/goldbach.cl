@@ -164,6 +164,33 @@ inline u32 mod_ff(const ff_x x, const u32 p)
     return (u32)r;
 }
 
+/// mod_ff that also returns the quotient: x = Q p + r with *qlo = Q mod 2^32
+/// and *qhf = qh, the float estimate of Q (|qh - Q| < 2^-23 Q + 2^20).
+/// @pre    as mod_ff.
+inline u32 mod_ff_q(const ff_x x, const u32 p, u32* qlo, float* qhf)
+{
+    const float pf = (float)p;
+    const int pr = (int)p - (int)pf;
+    const float ih = 1.0f / pf;
+    const float e1 = fma(-pf, ih, 1.0f);
+    const float il = ih * (e1 - (float)pr * ih);
+    const float qh = rint(x.xh * ih);
+    const float ql = fma(x.xh, ih, -qh) + x.xh * il + x.xl * ih;
+    u32 q32 = float_int_low32_big(qh) + (u32)(int)rint(ql);
+    int r = (int)(x.x32 - q32 * p);
+    q32 -= (r < 0) ? 1u : 0u;
+    r += (r < 0) ? (int)p : 0;
+    q32 += (r >= (int)p) ? 1u : 0u;
+    r -= (r >= (int)p) ? (int)p : 0;
+    if ((u32)r >= p) {
+        while (r < 0) { r += (int)p; --q32; }
+        while (r >= (int)p) { r -= (int)p; ++q32; }
+    }
+    *qlo = q32;
+    *qhf = qh;
+    return (u32)r;
+}
+
 /// x mod p without a 64-bit division (float-float quotient, see above; exact).
 /// @pre    x < 2^63, 1 <= p < 2^32.
 /// @return x mod p.
@@ -494,6 +521,12 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 // (y = ((e ^ T) | H) - L: a field's top bit drops iff that field of e ^ T is 0).
 #ifndef LARGE_SKR
 #define LARGE_SKR 1
+#endif
+#ifndef LARGE_MQ
+#define LARGE_MQ 1
+#endif
+#ifndef MQ_MAXP
+#define MQ_MAXP 60000000u
 #endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
@@ -1866,6 +1899,57 @@ inline u32 skr2_wrap(const u32 T)
 #undef SKR_W
     return o;
 }
+/// mark_multiples_skr / _skr2 with the multiplier residues given (LARGE_MQ):
+/// m30 = m0 mod 30030, mr = m0 mod SKR_R, mr2 = m0 mod 31*37*41*43 of the
+/// odd multiple q = p m0 at bit0 — no WHL_INV gather, no inverse tables.
+/// @pre    as mark_multiples_skr2; use2: also skip the second residue set.
+inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
+                              const u32 p, const u32 n, u32 m30, u32 mr, u32 mr2,
+                              const bool use1, const bool use2, const cmap g)
+{
+    volatile __global u32* m32 = (volatile __global u32*)prime_map;
+    u32 bit = bit0;
+    if (bit >= n) return;
+    u32 k2 = 0u;                                        // 2 * probes
+    while (WHL_IDX[m30] == WHL_MISS) {
+        if (n - bit <= p) return;
+        bit += p;
+        k2 += 2u;
+        m30 += 2u; if (m30 >= WHEEL_W) m30 -= WHEEL_W;
+    }
+    u32 w = WHL_IDX[m30];
+    mr += k2; mr -= (mr >= SKR_R) ? SKR_R : 0u;
+    u32 T = 0x7DF7DF0u;                                  // no field can match (e < 32)
+    if (use1) {
+        const u32 e0 = WHL_SF[w] >> 4;
+        T = 0u;
+#define MQ_F(i, r) { const u32 a = mr % r; const u32 x = (e0 >> (6u * i)) & 63u; \
+        T |= ((x >= a) ? x - a : x + r - a) << (4u + 6u * i); }
+        MQ_F(0u, 17u) MQ_F(1u, 19u) MQ_F(2u, 23u) MQ_F(3u, 29u)
+#undef MQ_F
+    }
+    u32 T2 = 0x7EFDFBFu;                                 // no field can match (e2 < 64)
+    if (use2) {
+        mr2 += k2; mr2 -= (mr2 >= 2022161u) ? 2022161u : 0u;
+        const u32 f0 = WHL_SF2[w];
+        T2 = 0u;
+#define MQ_F(i, r) { const u32 a = mr2 % r; const u32 x = (f0 >> (7u * i)) & 127u; \
+        T2 |= ((x >= a) ? x - a : x + r - a) << (7u * i); }
+        MQ_F(0u, 31u) MQ_F(1u, 37u) MQ_F(2u, 41u) MQ_F(3u, 43u)
+#undef MQ_F
+    }
+    for (;;) {
+        const u32 e = WHL_SF[w];
+        if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H &&
+            (!use2 || ((((WHL_SF2[w] ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H))
+            map_clear_w(m32, bit, g);
+        const u64 step = (u64)p * (e & 15u);
+        if ((u64)(n - bit) <= step) break;
+        bit += (u32)step;
+        if (++w == WHL_N) { w = 0u; if (use1) T = skr_wrap(T); if (use2) T2 = skr2_wrap(T2); }
+    }
+}
+
 /// mark_multiples_skr with the second residue set too.
 /// @pre    as mark_multiples_skr; qfr2 = q_first mod 31*37*41*43.
 inline void mark_multiples_skr2(volatile __global u64* prime_map, const u64 bit0,
@@ -2757,7 +2841,12 @@ inline void large_packed_body(
         if (c0 + lane >= large_count) break;
         if (hi_range && p < (1UL << 30)) {
             const u32 p32 = (u32)p;
+#if LARGE_MQ
+            u32 qlo; float qhf;
+            const u32 r = mod_ff_q(qf_split, p32, &qlo, &qhf);
+#else
             const u32 r = mod_ff(qf_split, p32);
+#endif
             u32 t = r ? p32 - r : 0u;
             t += (t & 1u) ? p32 : 0u;
             if (p32 >= (u32)q_odds) {                    // at most one hit (bit < p)
@@ -2778,6 +2867,24 @@ inline void large_packed_body(
                 }
                 continue;
             }
+#if LARGE_MQ
+            if (p32 < MQ_MAXP && p32 >= (1u << 21)) {
+                // m0 = (q_first + t) / p = Q + (r != 0) + (t >= p): Q = qhi 2^32 + qlo,
+                // qhi from the float estimate (error << 2^31). p >= 2^21 keeps
+                // qhi < 2^42 / 2^32 = 1024 (q_first < 2^63), so qhi * 1919493 < 2^32.
+                // (Production: p >= the mid-window bound 2.5M; the GB_BUCKET_VERIFY
+                // reference also runs the mid primes through here.)
+                const u32 qhi = (u32)rint((qhf - (float)qlo) * 2.3283064365386963e-10f);
+                const u32 ee = (r ? 1u : 0u) + ((t >= p32) ? 1u : 0u);
+                const u32 m30 = (qhi * 16636u + qlo % 30030u + ee) % 30030u;
+                const bool use1 = p32 < SKR_MAXP, use2 = p32 < SKR2_MAXP;
+                const u32 mr = use1 ? (qhi * 150961u + qlo % SKR_R + ee) % SKR_R : 0u;
+                const u32 mr2 = use2 ? (qhi * 1919493u % 2022161u + qlo % 2022161u + ee) % 2022161u : 0u;
+                mark_multiples_mq(prime_map, t >> 1, p32, (u32)q_odds, m30, mr, mr2,
+                                  use1, use2, g);
+                continue;
+            }
+#endif
 #if LARGE_SKR
             if (p32 < SKR2_MAXP) {
                 mark_multiples_skr2(prime_map, (u64)(t >> 1), p32, q_odds, qfw, qfr, qfr2, g);
