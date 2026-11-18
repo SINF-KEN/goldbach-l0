@@ -3,7 +3,7 @@
 The optimization log, moved out of [PROJECT-REFERENCE.md](PROJECT-REFERENCE.md)
 with its section numbers unchanged, so "§9.2x" references in the code, the
 commit messages and the other documents still mean the same thing: every
-kernel or host change kept or dropped, with its measurements (§9.2–§9.2w),
+kernel or host change kept or dropped, with its measurements (§9.2–§9.2aa),
 the per-version performance record (§13.2), and the removed wheel
 representation (§15). Section numbers without a file name refer to this file
 when they are listed here, otherwise to PROJECT-REFERENCE.md (§1–§16).
@@ -1201,8 +1201,97 @@ Measured and dropped in the same round:
   and table loads (~18 ms); the packed kernel's setup floor (decode +
   modulo + hit lists: 125 ms of 429) with a modulo chained across the 16
   primes of a work-item.
+### 9.2x Mid-prime SLM windows (GB_MIDWIN, 2026-11-17)
+The packed kernel paid ~30 ps per mark for the primes just above the split
+(L2 atomics on the L3-resident map: 430k..4M cost 94.5 ms per 1e11 in the
+2026-10-18 ablations), the tile kernel's medium stage ~11 ps per mark with
+its visits, but its 16 KB tiles limited it to p < 430k (one visit per prime
+per tile). `mid_setup` / `mid_window` add a second pass over the class map
+in 128 KB SLM windows (a work-group of 1024 per window, 15 windows per class
+array, 120 per segment):
+- `mid_setup` (per segment, launched beside the tile kernel): for every mid
+  prime the dense bit b0 of its first odd multiple (`mod_ff`, as the packed
+  kernel), then per class c its first class bit
+  `i0 = (b0 + k p - phi_c) / 15` with `k = (phi_c - b0) p^-1 mod 15`.
+- `mid_window` (after a barrier behind the tile kernel, before the packed
+  kernel's barrier): loads its window, clears every class-map multiple of
+  every mid prime with SLM `atomic_and` (first bit from i0 by an exact float
+  remainder: class bits < 2^24), stores the window back. It marks all
+  multiples with multiplier coprime to 30, a superset of the packed
+  kernel's wheel-30030 marks; the extra ones are composites already clear.
+- The packed list starts at the window bound; the device prime list now
+  uploads [0, bound) (it skipped [split, bucket_begin) unless
+  GB_BUCKET_VERIFY: the first build read p = 0 there and hung).
+Per 1e11 at 4e18, single runs, gpu ms (base 724.5): 64 KB windows of 512
+lose (bound 4M: 743) because the visits dominate; 128 KB of 1024: bound
+2M / 3M / 4M / 6M 693.9 / 693.2 / 694.0 / 701.9. Lowering the split moves
+the medium stage over too (bound 3M): split 36000 / 24000 / 12250 / 9000 /
+6000 / 3500 693.2 / 682.7 / 677.0 / 674.1 / 671.8 / 670.8; split 800..3500
+x bound 2..4M all 670..676. WG 512 at 128 KB: 733. SIMD16 (MIDW_SG) -3%
+window time vs the compiler's SIMD32; MIDW_BATCH 4 > 8 > 16. Overlapping
+the pass with the previous segment's checker (event waits on the tile
+kernel and mid_setup instead of the barrier): null (669.8 vs 670.6), the
+checker already fills the machine.
+Result (bench.py, 5 paired rounds, 1e11, measured on the active bb3a96f
+tree): long +8.44% (95% CI +-0.25%), long-end +8.52% (+-0.15%). Window
+pass ~81 ms, tile kernel ~114 ms (was 168), packed + hit lists 353 ms (was
+435). With split 1500 the host's per-segment first bits and tile tables
+cover 1500 primes instead of 36000. Exact: GB_BUCKET_VERIFY=1 PASS on 1e11
+at 4e18 (every segment's map equal to tile + packed over all large primes),
+stats state, ridges, primes and twins identical at 4e18 and 5e18.
+Also measured: hit-list K 192 / 256 null (+0.01 / -0.07%, HL_MAX_K raised
+to try them); count30 in the 256-register mode (`-ze-opt-large-grf-kernel
+count30` as a module build option) removes its 1.7 KB spill but loses 3.5%
+(half the threads per EU); the whole module at 256 registers makes
+check30_a spill.
+Tried on top of it and lost (bench.py, 5 paired rounds, both windows, vs
+the window pass at +8.45% / +8.31%): skipping the window marks on q = 0
+mod 7 / 7, 11 / 7, 11, 13 (already cleared by the masks; MIDW_SKIP 1-3,
+a residue counter per mark) +5.9 / +4.1 / +2.1%: the per-mark ALU costs
+more than the 14..28% of SLM atomics it saves (window pass +16 / +28 / +41
+ms), as the mod-7 skip did in the tile kernel. Interleaving the packed
+kernel's work-groups from both ends of the prime list (small-p atomic-heavy
+groups beside one-hit groups) +7.8%, a 1:2 interleave +7.1% (packed +3 /
++8 ms). Segment 485M / 500M (the class-bit float bound allows up to ~503M)
++7.2% / +7.5% (sieve +7 ms). A fused kernel that builds each 128 KB
+window from the group masks and replaces the tile kernel: -7% (§9.2z).
+### 9.2y Hit-list threshold 3 -> 2 x q_odds with the mid windows (2026-11-17)
+The mid windows (§9.2x) took the many-mark primes below 2.5M out of the
+packed kernel, so its remaining cost is mostly per-prime setup and the
+crossover between a packed prime (setup every segment) and a hit-listed one
+(one harvested u32 per hit) moved down. GB_BUCKET_MINP sweep, 1e11 at
+4e18, 3 paired rounds, gpu ms: 4 x 687.7, 3.5 x 677.8, 3 x 667.1,
+2.5 x 660.0, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2, 1.25 x 659.8,
+1 x 662.2 (the correctness floor). BUCKET_MIN_P_FACTOR_MIDWIN = 2 whenever
+the window pass runs (3 otherwise). bench.py vs main ef82633, 5-6 paired
+rounds: long +1.29% (CI +-0.11%), long-end +1.26% (+-0.07%). Exact: stats
+state, ridges, primes, twins identical at 4e18 and 5e18; GB_BUCKET_VERIFY=1
+PASS at 4e18. Also re-checked with the windows (3 rounds, within noise):
+GB_MED_P 384 / 768 / 1024, GB_LARGE_WG 64 / 256.
+
+### 9.2z mod_ff is wrong for small primes; the fused window sieve (2026-11-17)
+A fused kernel that builds each 128 KB window from the group masks and
+sieves every prime from 67 up in it (replacing the tile kernel) gave a
+wrong map, and bisecting by the first window prime led to p = 109: the
+packed kernel's float-float remainder `mod_ff` is not exact for small p.
+A GPU self-test of mod_ff against the exact remainder (divisibility by the
+64-bit inverse) over 1024 odd q per prime: every prime 67..251 fails at
+q ~ 4e18, primes up to 271 near 5e18, up to 491 at q up to 9.2e18; none of
+512..2.5M (1024 q in 4e18..9.2e18) or 2.5M..2^31 (16 q in 4e18..4.004e18)
+fails. The correction term rint(ql) grows like x / p and stops fitting the
+int conversion. Production never reached it (packed primes >= 430k, now
+>= 2.5M; mid_setup primes >= 12577), but `--split` below ~95 sent primes
+< 512 to the packed kernel, and GB_BUCKET_VERIFY's reference uses the same
+kernel, so it agreed with the wrong map (a split-17 run "passed" verify
+while its prime count was off). Now: the split prime is clamped to >= 4096
+(MOD_FF_MIN_P), and mid_setup takes the exact 64-bit remainder (bench.py
+vs mod_ff: +0.03% / +0.05%, null). With that the fused window kernel is
+exact, but 7.1% / 7.0% slower than tile kernel + window pass (sieve 196 ->
+242 ms: its owned walk in 1024-thread windows with a float setup per
+thread and prime costs more than the tile kernel's table path); dropped.
+
 --------------------------------------------------------------------------
-### 9.2x Audit round: positive coverage, hashed prime cache, legacy pipelines removed (v2.6.0, 2026-11-17)
+### 9.2aa Audit round: positive coverage, hashed prime cache, legacy pipelines removed (v2.6.0, 2026-11-17)
 An adversarial audit of origin/main 9f58a5d (CORRECTNESS.md §6) tested the
 project's claims instead of reading them. What it changed:
 - **Positive coverage.** A mutant that never launched `check30_a` printed

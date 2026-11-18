@@ -121,7 +121,7 @@ Validators depend on the `kernels` target.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `VERSION` | "2.5.1" | echoed by `--info` / `--csv` |
+| `VERSION` | "2.6.0" | echoed by `--info` / `--csv` |
 | `WG_SIZE` | 256 | threads per work-group; 128/512/1024 measured within noise |
 | `TILE_WORDS` | 2048 | 16 KB SLM per tile (v1.8.1 optimum, [§9.2d](HISTORY.md#92d-v181--tile-size-medium-stage-setup-float-float-modulo); `GB_TILE_WORDS` + ocloc `-DTILE_WORDS` to change) |
 | `BITS_PER_TILE` | 131,072 | odd numbers per tile (TILE_WORDS x 64; the kernel's WORDS_PER_THREAD = TILE_WORDS / WG_SIZE = 8 words per thread) |
@@ -192,7 +192,7 @@ usage: goldbach_l0 [--limit N] [--start N] [--segment N] [--split N]
 | `--limit N` | 100000000 | verify evens in [start, N]. N accepts full decimal or e-notation (`4e18` = `4000000000000000000`); junk, hex/octal and u64 overflow exit 2 with an error |
 | `--start N` | 4 | first even: rounded up to even, at least 4. Everything below `start` is ASSUMED verified (campaign slices). No even n >= 4 in [start, limit] (e.g. start > limit) is a usage error (exit 2) |
 | `--segment N` | 467500000 | integer span per segment; forced >= 2, even; shrunk to total range (min 2 segments kept for pipeline overlap); a span whose odd count exceeds 32 bits fails closed (exit 1) |
-| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count; > 2^32 - 1 is a usage error |
+| `--split N` | 0 | base-prime split index; 0 = auto -> min(sieve_count, 1500) while the mid-window pass runs ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)), else min(sieve_count, 36000) (verifier.cpp), clamped >= mask_count and to a split prime >= 4096 (`MOD_FF_MIN_P`, [§9.2z](HISTORY.md#92z-mod_ff-is-wrong-for-small-primes-the-fused-window-sieve-2026-11-17)); > 2^32 - 1 is a usage error |
 | `--spv FILE` | kernels/goldbach_bmg.spv | SPIR-V module path |
 | `--prime-cache FILE` | base_primes.cache | keyed by limit: `<file>.<limit>` is tried first, then the legacy shared file; miss regenerates + writes |
 | `--cpu-check N` | off | independent trial-division Goldbach check of [4, N], then exit (exit 0 = PASS) |
@@ -288,6 +288,7 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default (`exact`, also `1`): every segment; any other value is an error |
 | `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
+| `GB_MIDWIN=N` / `GB_MIDWIN_KB` / `GB_MIDWIN_WG` | mid-prime SLM window pass: primes [split, N) in windows of KB of SLM with work-groups of WG (defaults 2500000 / 128 / 1024; `GB_MIDWIN=0` off and the auto split back to 36000) ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | removed in v2.6 | `GB_SPLIT`, `GB_SPLIT_CAP`, `GB_SPLIT_STAGES`, `GB_TWIN_CAP`, `GB_C30`, `GB_CLASSMAP`, `GB_HITLIST`, `GB_MASK_GROUPS`: their pipelines (twin / class-split checkers, dense / mod-6 maps, bucket ring) are gone; setting one is an error before any GPU work, never silently ignored |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
@@ -344,7 +345,8 @@ Map must be sized in WHOLE tiles — the tile kernel writes whole tiles, a
 partial last tile would write past the buffer (device-lost comment,
 verifier.cpp).
 
-Auto split: `min(sieve_count, 36000)` (rationale and measurements in the
+Auto split: `min(sieve_count, 1500)` while the mid-window pass runs (HISTORY.md
+§9.2x), else `min(sieve_count, 36000)` (rationale and measurements in the
 comment at the split selection in verifier.cpp). The split is what makes 4e18 feasible:
 walking all ~98M base primes per tile blew the driver watchdog (engine
 reset).
@@ -560,7 +562,7 @@ the design record.
 | `ctest` → `stats_known` (`stats_ref --known`) | p(n) of T. Oliveira e Silva's published S(p) (9781, 9629, ... and small ones) and his record-holder property over the 2000 evens below each | `0 failure(s) -> PASS` |
 | `ctest` → `known_windows` (`tests/known_windows.py selftest`) | the published windows of GoldbachGPU v3.2.0 (Llorente-Saguer 2026; [4e18, 4e18 + 1e10 .. 1e15], 1e12 across 2^63): prime counts equal the published π(x) differences, every listed n has the listed p(n) (Miller–Rabin); `run` / `campaign` modes on a stand-in binary and synthetic campaign files | `-> PASS` |
 | `ctest` → `stats_tools` (`tests/test_stats_tools.py`) | scripts/gstats.py (totals, tail, records, --ref / --export on a synthetic t0) and scripts/goldbach_live.py (S(p) proven only with coverage from 4e18, MISMATCH events never shown as records) on synthetic files | `-> PASS` |
-| `ctest -L gpu` → `gpu_validate` (local, GPU) | `tests/gpu_validate.sh`: GPU statistics log + state vs `stats_ref` (tests/stats_compare.py) on 6 windows (one across 2^63), the published windows via `known_windows.py run` (quick: 4e18 + 1e10 and + 1e12; full also + 1e13 and 1e12 across 2^63), end to end in every checker mode, GB_BUCKET_VERIFY=1 (hit lists: both ends, multi-batch K = 5 / 50, ragged first / last segments; the GB_HITLIST=0 ring), `--cpu-check`, the debug_* validators when built | `gpu_validate: 0 failure(s) -> PASS` |
+| `ctest -L gpu` → `gpu_validate` (local, GPU) | `tests/gpu_validate.sh`: GPU statistics log + state vs `stats_ref` (tests/stats_compare.py) on 6 windows (one across 2^63), the published windows via `known_windows.py run` (quick: 4e18 + 1e10 and + 1e12; full also + 1e13 and 1e12 across 2^63), end to end in every checker mode, GB_BUCKET_VERIFY=1 (hit lists: both ends, multi-batch K = 5 / 50, ragged first / last segments), `--cpu-check`, the debug_* validators when built | `gpu_validate: 0 failure(s) -> PASS` |
 | `ctest` → `cli_tests` (`tests/cli_tests.sh`) | malformed numbers and options missing their value exit 2; empty / reversed ranges, `--split` > 2^32 - 1 and the removed `--wheel` exit 2; limits above 2^64 - 2^40 exit 1 before GPU work; `2e5` == `200000`; CPU reference PASS | `cli_tests: PASS` |
 | `ctest` → `test_ci` (also the CI static job) | the local CI's journal chain (incl. a PASS row disagreeing with its own `limit=`, a cut-off row), reference cache keys, exact gates, release pruning (every journal's releases kept; a missing journal prunes nothing) | `0 failure(s) -> PASS` |
 | CI `kernels` job | every module compiles; each shipped `.spv` passes `spirv-val`, is byte-identical to a fresh ocloc 26.40 compile (deterministic output) and contains every `__kernel` of its source | all `fresh` |

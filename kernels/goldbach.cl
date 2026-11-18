@@ -145,7 +145,12 @@ inline u32 float_int_low32_big(const float v)
 // < 2 p < 2^31 above). Hence r is exact in int, the selects fix the usual
 // +-1 error and the guarded loops the rest. (Measured by CPU emulation over
 // 1.4e7 (x, p) pairs: max |r| = 5.4e8.)
-/// @pre    x from ff_split of a value < 2^63; 1 <= p < 2^30;
+// NOT for small p: a GPU self-test against the exact remainder (2026-11-17,
+// HISTORY.md 9.2z) found wrong results for every prime 67..251 at x ~ 4e18
+// and for primes up to 491 at x up to 9.2e18 (the correction term no longer
+// fits), and none for 512..2^31 (1.2e9 (x, p) pairs). Callers keep p >=
+// MOD_FF_MIN_P = 4096 (host: the split prime; mid_setup uses the exact %).
+/// @pre    x from ff_split of a value < 2^63; 4096 <= p < 2^30;
 ///         x / p >= 2^23 (callers: x >= 2^60), so qh >= 2^23.
 /// @return x mod p, exact.
 inline u32 mod_ff(const ff_x x, const u32 p)
@@ -2532,4 +2537,176 @@ __kernel void sieve_large_packed_hl(
     hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
                   get_global_id(0), get_global_size(0));
     large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+}
+
+// ----------------------------------------------------------------------------
+// Mid-prime SLM windows (GB_MIDWIN, v2.6, HISTORY.md 9.2x): primes [split, P2) leave
+// the packed kernel's L2 atomics (~30 ps per mark) for a second sieve pass in
+// large SLM windows of the class map (one SLM atomic per mark plus one visit
+// per prime per window). mid_setup computes, once per segment, the first
+// class bit of every mid prime in every class; mid_window loads a window of
+// one class array into SLM, clears every multiple of every mid prime in it,
+// and stores it back. Clears are of odd multiples p m with m coprime to 30
+// (all multiples stored in the class map): a superset of the packed kernel's
+// wheel-30030 marks, all composite, so the map is the same.
+// ----------------------------------------------------------------------------
+#ifndef MIDW_BATCH
+#define MIDW_BATCH 4             // 2026-11-17: 4 > 8 = 16 (window pass -1%)
+#endif
+#ifndef MIDW_SG
+#define MIDW_SG 16               // SIMD16: window pass -3% vs the compiler's SIMD32
+#endif
+__constant uchar INV15[15] = {0, 1, 8, 0, 4, 0, 0, 13, 2, 0, 0, 11, 0, 7, 14};
+/// @pre    q_first odd; primes[a .. a + n) in (30, 2^32) coprime to 30;
+///         phis = 8 dense phases (nibbles) of the class arrays.
+/// @post   i0tab[c * n + j] = smallest class-c bit i whose q = q_first +
+///         2 (15 i + phi_c) is a multiple of primes[a + j].
+__kernel void mid_setup(__global const u32* restrict primes, const u32 a, const u32 n,
+                        const u64 q_first, const u32 phis, __global u32* restrict i0tab)
+{
+    const u32 j = get_global_id(0);
+    if (j >= n) return;
+    const u32 p = primes[a + j];
+    // exact 64-bit remainder: once per prime per segment, free beside the
+    // window pass (bench null), and valid for every p (mod_ff needs p >= 4096)
+    const u32 r = (u32)(q_first % (u64)p);
+    u32 t = r ? p - r : 0u;
+    t += (t & 1u) ? p : 0u;                 // q_first odd: first odd multiple at q_first + t
+    const u32 b0 = t >> 1;                  // its dense bit, < p
+    const u32 pinv = INV15[p % 15u];
+    const u32 b15 = b0 % 15u;
+    #pragma unroll
+    for (u32 c = 0; c < 8u; ++c) {
+        const u32 ph = (phis >> (4u * c)) & 15u;
+        const u32 k = ((ph + 15u - b15) * pinv) % 15u;   // b0 + k p = ph (mod 15)
+        i0tab[c * n + j] = (b0 + k * p - ph) / 15u;
+    }
+}
+
+/// @pre    mid_setup of this segment wrote i0tab; the tile sieve's stores are
+///         visible (barrier before); no concurrent writer of the map (the
+///         window is written back with plain stores). Class bits < 2^24.
+/// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
+#ifndef MIDW_SKIP
+#define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
+#endif
+// Marks of one prime in a window. With MIDW_SKIP the bits whose q is a
+// multiple of 7 (11, 13) are left alone: the tile kernel's small-prime masks
+// cleared them already, and a window's bit g (global class bit) has q = 0
+// mod m exactly when g = z_m (mod m), whatever p; d_m tracks (g - z_m) mod m.
+#define MIDW_MARK_LOOP(BIT, P, WB, V, WS)                                          \
+    {                                                                              \
+        u32 bit_ = (BIT);                                                          \
+        MIDW_SKIP_INIT(bit_, P, WS)                                                \
+        for (; bit_ < (WB); bit_ += (P)) {                                         \
+            if (MIDW_SKIP_TEST) atomic_and(&(V)[bit_ >> 5], CLR_MASK(bit_));       \
+            MIDW_SKIP_STEP                                                         \
+        }                                                                          \
+    }
+#if MIDW_SKIP >= 1
+#define MIDW_SK1_INIT(b, P, WS) u32 d7 = ((WS) + (b) + 7u - z7) % 7u; const u32 p7 = (P) % 7u;
+#define MIDW_SK1_STEP d7 += p7; d7 -= (d7 >= 7u) ? 7u : 0u;
+#define MIDW_SK1_TEST (d7 != 0u)
+#else
+#define MIDW_SK1_INIT(b, P, WS)
+#define MIDW_SK1_STEP
+#define MIDW_SK1_TEST true
+#endif
+#if MIDW_SKIP >= 2
+#define MIDW_SK2_INIT(b, P, WS) u32 d11 = ((WS) + (b) + 11u - z11) % 11u; const u32 p11 = (P) % 11u;
+#define MIDW_SK2_STEP d11 += p11; d11 -= (d11 >= 11u) ? 11u : 0u;
+#define MIDW_SK2_TEST && (d11 != 0u)
+#else
+#define MIDW_SK2_INIT(b, P, WS)
+#define MIDW_SK2_STEP
+#define MIDW_SK2_TEST
+#endif
+#if MIDW_SKIP >= 3
+#define MIDW_SK3_INIT(b, P, WS) u32 d13 = ((WS) + (b) + 13u - z13) % 13u; const u32 p13 = (P) % 13u;
+#define MIDW_SK3_STEP d13 += p13; d13 -= (d13 >= 13u) ? 13u : 0u;
+#define MIDW_SK3_TEST && (d13 != 0u)
+#else
+#define MIDW_SK3_INIT(b, P, WS)
+#define MIDW_SK3_STEP
+#define MIDW_SK3_TEST
+#endif
+#define MIDW_SKIP_INIT(b, P, WS) MIDW_SK1_INIT(b, P, WS) MIDW_SK2_INIT(b, P, WS) MIDW_SK3_INIT(b, P, WS)
+#define MIDW_SKIP_STEP MIDW_SK1_STEP MIDW_SK2_STEP MIDW_SK3_STEP
+#define MIDW_SKIP_TEST (MIDW_SK1_TEST MIDW_SK2_TEST MIDW_SK3_TEST)
+
+#if MIDW_SG
+__attribute__((intel_reqd_sub_group_size(MIDW_SG)))
+#endif
+__kernel void mid_window(__global u32* restrict map32, __global const u32* restrict primes,
+                         const u32 a, const u32 n, __global const u32* restrict i0tab,
+                         const u64 q_odds, const u32 phis, const u32 c5w32, const u32 wpc,
+                         const u32 win_bits, __local u32* restrict win, const u64 q_first)
+{
+    const u32 lid = get_local_id(0), wg = get_local_size(0);
+    const u32 cls = get_group_id(0) / wpc, w = get_group_id(0) - cls * wpc;
+    const u32 ph = (phis >> (4u * cls)) & 15u;
+    const u32 nc = (q_odds > (u64)ph) ? (u32)((q_odds - ph + 14UL) / 15UL) : 0u;
+    const u32 ws = w * win_bits;
+#if MIDW_SKIP
+    // class bit g has q = Q + 30 g, Q = q_first + 2 ph (the window's class):
+    // q = 0 (mod m) iff g = z_m = -Q / 30 (mod m)
+    const u64 qc = q_first + 2UL * ph;
+    const u32 z7 = ((7u - (u32)(qc % 7UL)) % 7u) * 4u % 7u;          // 1/30 = 4 (mod 7)
+#if MIDW_SKIP >= 2
+    const u32 z11 = ((11u - (u32)(qc % 11UL)) % 11u) * 7u % 11u;     // 1/30 = 7 (mod 11)
+#endif
+#if MIDW_SKIP >= 3
+    const u32 z13 = ((13u - (u32)(qc % 13UL)) % 13u) * 10u % 13u;    // 1/30 = 10 (mod 13)
+#endif
+#endif
+    if (ws >= nc) return;                   // uniform per work-group
+    const u32 wb = min(win_bits, nc - ws);  // valid bits of this window
+    const u32 nw = (wb + 31u) >> 5;
+    __global u32* gm = map32 + (size_t)cls * c5w32 + (ws >> 5);
+    for (u32 i = lid; i < nw; i += wg) win[i] = gm[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    volatile __local u32* v = (volatile __local u32*)win;
+    __global const u32* it = i0tab + (size_t)cls * n;
+    __global const u32* pr = primes + a;
+    u32 j = lid;
+    for (; j + (MIDW_BATCH - 1u) * wg < n; j += MIDW_BATCH * wg) {
+        u32 iv[MIDW_BATCH], pv[MIDW_BATCH];
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) { iv[u] = it[j + u * wg]; pv[u] = pr[j + u * wg]; }
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) {
+            const u32 p = pv[u];
+            u32 bit;
+            if (iv[u] >= ws) bit = iv[u] - ws;
+            else {                          // d < 2^24: exact float remainder (med_prime_f32)
+                const float df = (float)(ws - iv[u]);
+                const float pf = (float)p;
+                const float qf = trunc(df * (1.0f / pf));
+                float rf = fma(-qf, pf, df);
+                rf += (rf < 0.0f) ? pf : 0.0f;
+                rf -= (rf >= pf) ? pf : 0.0f;
+                const u32 rmu = (u32)rf;
+                bit = rmu ? p - rmu : 0u;
+            }
+            MIDW_MARK_LOOP(bit, p, wb, v, ws)
+        }
+    }
+    for (; j < n; j += wg) {
+        const u32 i0 = it[j], p = pr[j];
+        u32 bit;
+        if (i0 >= ws) bit = i0 - ws;
+        else {
+            const float df = (float)(ws - i0);
+            const float pf = (float)p;
+            const float qf = trunc(df * (1.0f / pf));
+            float rf = fma(-qf, pf, df);
+            rf += (rf < 0.0f) ? pf : 0.0f;
+            rf -= (rf >= pf) ? pf : 0.0f;
+            const u32 rmu = (u32)rf;
+            bit = rmu ? p - rmu : 0u;
+        }
+        MIDW_MARK_LOOP(bit, p, wb, v, ws)
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (u32 i = lid; i < nw; i += wg) gm[i] = win[i];
 }

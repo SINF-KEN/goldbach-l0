@@ -25,17 +25,20 @@ primes, prime and twin-prime counts, prime gaps).
 **v2.6.0: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
 top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
 on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580. (Measured
-on v2.5.1; v2.6.0, which adds positive coverage accounting and removes the
-unused pipelines, matched it bit for bit within +0.03% / +0.12% on 10¹²
-windows, 6 paired rounds.)
+on v2.5.1; the v2.6.0 audit changes — positive coverage accounting, the
+unused pipelines removed — matched it bit for bit within +0.03% / +0.12% on
+10¹² windows, 6 paired rounds.) v2.6.0 also adds the **mid-prime SLM
+windows** (+8.4%, HISTORY.md §9.2x) and the lower hit-list threshold that
+goes with them (+1.3%, §9.2y), measured in paired bench.py rounds against
+v2.5.1; the release figure follows from its CI benchmark.
 
 | Document | Contents |
 |---|---|
-| [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 audit |
+| [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 and v2.6.0 audits |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | hardware and software, build, tests, CI, the kernel shipping procedure, reproducibility, production operation |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | how performance is measured and compared; raw data in [bench/](bench/) |
 | [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, pipeline, kernels, host |
-| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2w, numbered as before), the per-version performance record, the removed wheel path |
+| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2aa, numbered as before), the per-version performance record, the removed wheel path |
 | [docs/PIPELINE.md](docs/PIPELINE.md) | the production run as a diagram, from `run_range.sh` to the journal |
 | [ci/README.md](ci/README.md) | the local CI: release gating, production control |
 
@@ -51,18 +54,21 @@ next:
 1. **`make_prime_map`** (tile sieve) — the map holds only `q` coprime to 30,
    as eight class arrays (one per residue mod 30); one work-group sieves one
    16 KB SLM tile: primes < 64 by whole-word mask tables, primes < 512 by
-   each thread in its own words, primes up to the split (~430 K)
+   each thread in its own words, primes up to the split (1500)
    prime-parallel with SLM atomics.
-2. **`sieve_large_packed`** — primes from the split to 3× the segment's odd
-   count (~6.4×10⁸), streamed at one byte per prime; a division-free
+2. **mid-prime windows** (`mid_setup` / `mid_window`) — primes from the
+   split to 2.5×10⁶ are sieved in 128 KB SLM windows of each class array,
+   one SLM atomic per mark instead of an L2 atomic.
+3. **`sieve_large_packed`** — primes from 2.5×10⁶ to 2× the segment's odd
+   count (~4.3×10⁸), streamed at one byte per prime; a division-free
    float-float modulo finds the first multiple, and only multipliers coprime
    to 30030 are marked (the others are multiples of a prime ≤ 13, already
    cleared): the **multiplier wheel**.
-3. **hit lists** (`hl_harvest` / `hl_apply`) — the largest primes hit a
+4. **hit lists** (`hl_harvest` / `hl_apply`) — the largest primes hit a
    segment at most once. Every 128 segments one pass finds all their hits in
    the coming batch and writes each as a 4-byte offset into its segment's
    list; each segment then streams its list and marks it.
-4. **`check30_a` / `check30_b`** — evens grouped by `n mod 30`, so for a
+5. **`check30_a` / `check30_b`** — evens grouped by `n mod 30`, so for a
    candidate class every `q = n - p` lies in one class array and
    consecutive evens are consecutive bits: 32 evens are tested at once by a
    funnel shift, against several candidates per funnel; phase B probes the

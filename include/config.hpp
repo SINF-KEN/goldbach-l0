@@ -92,6 +92,11 @@ inline constexpr uint32_t BUCKET_GROUPS = 1024;
 // measured for the bucket ring that preceded the hit lists (HISTORY.md
 // §9.2t): 3 x q_odds_full.
 inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
+// With the mid-prime SLM windows (HISTORY.md §9.2x) the packed kernel lost
+// most of its atomics and the crossover moved down: 1e11 at 4e18 (3 paired
+// rounds, gpu ms) 3 x 667.1, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2,
+// 1.25 x 659.8, 1 x 662.2 -> 2 x (+1.3%; §9.2y).
+inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN = 2;
 // Phase-A item width in 64-bit words (768 evens per item) of every word
 // checker. MUST match A_W64 in kernels/goldbach.cl. v1.13.0: 16 -> 14 (the
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
@@ -129,6 +134,19 @@ inline constexpr uint32_t RIDGE_MIN_DEFAULT  = 3000;
 // GB_MED_P overrides). Class map, per 1e11 window: sieve_s 261.7 (256) /
 // 256.2 (384) / 253.0 (512) / 261.8 (640) ms.
 inline constexpr uint32_t MED_MIN_P = 512;
+// Mid-prime SLM windows (verifier.cpp, kernels/goldbach.cl mid_setup /
+// mid_window, HISTORY.md §9.2x): default prime bound (GB_MIDWIN overrides,
+// 0 = off), the auto split while the pass is on, the window in KB of SLM
+// (MUST fit the device's per-work-group SLM) and its work-group size
+// (GB_MIDWIN_KB / GB_MIDWIN_WG override).
+inline constexpr uint64_t MIDWIN_P2_DEFAULT = 2500000;
+// Smallest prime the packed kernel's float-float remainder (mod_ff) may get:
+// it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split prime
+// is clamped to at least this (the tile kernel handles everything below).
+inline constexpr uint32_t MOD_FF_MIN_P = 4096;
+inline constexpr uint32_t MIDWIN_SPLIT = 1500;
+inline constexpr uint32_t MIDWIN_KB = 128;
+inline constexpr uint32_t MIDWIN_WG = 1024;
 
 // Small-prime mask sieve bound (must match MASK_MAX_P in kernels/goldbach.cl):
 // primes below this use whole-word AND masks in make_prime_map stage 3a.
