@@ -1468,7 +1468,8 @@ void DenseRun::allocate_large_prime_buffers() {
     d_hl_lists = nullptr;
     d_hl_counts = nullptr;
     if (hitlist) {
-        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4));
+        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4, 64,
+                                                              env::onoff("GB_HL_UNCOMP", false)));
         d_hl_counts = static_cast<uint32_t*>(ctx.alloc_device(size_t(HL_MAX_K_HOST) * hl_G * 4));
     }
     if (bucket_on && !hitlist) {
@@ -1658,7 +1659,10 @@ void DenseRun::build_mtab() {
     Kernel kb(mod, "mt_build");
     kb.set_group_size(1024);
     const size_t words = size_t(mt_blocks) * 180;
-    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4));
+    // uncompressed (GB_MT_UNCOMP, default on; 2026-11-18 r7): the harvest's
+    // scattered word reads skip the compression metadata, harvest -3.4 %
+    // (the lists themselves stay compressed: uncompressed they are +17 %)
+    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4, 64, env::onoff("GB_MT_UNCOMP", true)));
     kb.set_arg(0, sizeof(d_mtab), &d_mtab);
     kb.set_arg(1, sizeof(mt_blocks), &mt_blocks);
     kb.set_arg(2, sizeof(mt_k_lo), &mt_k_lo);
