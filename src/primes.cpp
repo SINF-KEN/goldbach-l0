@@ -319,10 +319,40 @@ std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
     return table;
 }
 
+// Folds the @p extra primes after the mask primes (sieve_primes[mask_count],
+// ...: 67, 71, ...) into the groups, each into the group of smallest period at
+// that point (2026-11-18 GB_MASK_XP: the fused mask stage clears them with no
+// extra loads; the tile's owned walk starts after them).
+static void fold_extra_primes(std::vector<std::vector<uint32_t>>& groups, const uint32_t* sieve_primes,
+                              uint32_t mask_count, uint32_t extra) {
+    for (uint32_t e = 0; e < extra && !groups.empty(); ++e) {
+        size_t best = 0;
+        uint64_t bp = ~0ull;
+        for (size_t g = 0; g < groups.size(); ++g) {
+            uint64_t per = 1;
+            for (uint32_t j : groups[g]) per *= sieve_primes[j];
+            if (per < bp) { bp = per; best = g; }
+        }
+        groups[best].push_back(mask_count + e);
+    }
+}
+
+// a^-1 mod m (gcd(a, m) = 1, m >= 1)
+static uint64_t inv_mod(uint64_t a, uint64_t m) {
+    int64_t g = int64_t(m), x = 0, y = 1, aa = int64_t(a % m);
+    while (aa) {
+        const int64_t q = g / aa, t = g - q * aa;
+        g = aa; aa = t;
+        const int64_t u = x - q * y;
+        x = y; y = u;
+    }
+    return uint64_t(((x % int64_t(m)) + int64_t(m)) % int64_t(m));
+}
+
 SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
                                               uint32_t mask_count,
                                               const std::vector<uint64_t>& per_prime,
-                                              uint32_t max_period, uint32_t skip) {
+                                              uint32_t max_period, uint32_t skip, uint32_t extra) {
     SmallPrimeGroups g;
     std::vector<std::vector<uint32_t>> groups;   // indices into sieve_primes
     uint64_t prod = 0;
@@ -336,6 +366,7 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
         groups.back().push_back(j);
         prod *= p;
     }
+    fold_extra_primes(groups, sieve_primes, mask_count, extra);
     for (const auto& grp : groups) {
         uint64_t period = 1;
         for (uint32_t j : grp) period *= sieve_primes[j];
@@ -343,7 +374,12 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
         g.desc.push_back(uint32_t(period));            // period
         for (uint64_t t = 0; t < period; ++t) {
             uint64_t m = ~0ull;
-            for (uint32_t j : grp) m &= per_prime[size_t(j) * 64 + t % sieve_primes[j]];
+            for (uint32_t j : grp) {
+                const uint64_t p = sieve_primes[j];
+                if (p < 64) { m &= per_prime[size_t(j) * 64 + t % p]; continue; }
+                // an extra prime (canonical tables only): marks at bit 0 (mod p)
+                for (uint64_t b = (p - (64 * t) % p) % p; b < 64; b += p) m &= ~(1ull << b);
+            }
             g.words.push_back(m);
         }
     }
@@ -358,41 +394,42 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
 // shift X_g (the CRT of the r_p) is a whole-word shift Y_g = X_g / 64 mod P_g.
 SmallPrimeGroups small_prime_group_masks_canonical(const uint32_t* sieve_primes,
                                                    uint32_t mask_count, uint32_t skip_mod,
-                                                   uint32_t max_period) {
+                                                   uint32_t max_period, uint32_t extra) {
     std::vector<uint64_t> per = small_prime_mask_table_step(sieve_primes, mask_count, 0, 1);
     for (uint32_t j = 0; j < mask_count; ++j)
         if (skip_mod % sieve_primes[j] == 0)
             std::fill_n(&per[size_t(j) * 64], 64, ~0ull);
-    return small_prime_group_masks_from(sieve_primes, mask_count, per, max_period, skip_mod);
+    return small_prime_group_masks_from(sieve_primes, mask_count, per, max_period, skip_mod, extra);
 }
 
 std::vector<uint32_t> small_prime_group_offsets(const uint32_t* sieve_primes,
                                                 uint32_t mask_count, uint64_t base,
-                                                uint32_t step, uint32_t max_period) {
-    std::vector<uint32_t> ys;
-    uint64_t P = 0, X = 0;                      // running CRT: X mod P
-    auto flush = [&]() {
-        if (!P) return;
-        uint64_t inv = 1;                       // 64^-1 mod P (P odd, <= max_period)
-        while ((inv * 64) % P != 1 % P) ++inv;
-        ys.push_back(uint32_t((X % P) * inv % P));
-    };
+                                                uint32_t step, uint32_t max_period,
+                                                uint32_t extra) {
+    // the canonical grouping (skip_mod | step), then the extra primes
+    std::vector<std::vector<uint32_t>> groups;
+    uint64_t prod = 0;
     for (uint32_t j = 0; j < mask_count; ++j) {
         const uint64_t p = sieve_primes[j];
         if (p < 3 || p >= 64) continue;
-        if (step % p == 0) continue;            // as the canonical grouping (skip_mod | step)
-        if (P == 0 || P * p > max_period) { flush(); P = 1; X = 0; }
-        uint64_t r = 0;                         // marks at i = r (mod p); any r if p | step
-        if (step % p != 0) {
-            uint64_t sinv = 1;
-            while ((sinv * step) % p != 1) ++sinv;
-            r = ((p - base % p) % p) * sinv % p;
-        }
-        uint64_t x = X;                         // x = X (mod P), x = r (mod p)
-        while (x % p != r) x += P;
-        X = x; P *= p;
+        if (step % p == 0) continue;
+        if (groups.empty() || prod * p > max_period) { groups.push_back({}); prod = 1; }
+        groups.back().push_back(j);
+        prod *= p;
     }
-    flush();
+    fold_extra_primes(groups, sieve_primes, mask_count, extra);
+    std::vector<uint32_t> ys;
+    for (const auto& grp : groups) {
+        uint64_t P = 1, X = 0;                  // running CRT: X mod P
+        for (uint32_t j : grp) {
+            const uint64_t p = sieve_primes[j];
+            // marks at i = r (mod p): base + step r = 0 (mod p)
+            const uint64_t r = ((p - base % p) % p) * inv_mod(step % p, p) % p;
+            X += P * (((r + p - X % p) % p) * inv_mod(P % p, p) % p);   // X = r (mod p) too
+            P *= p;
+        }
+        ys.push_back(uint32_t(X * inv_mod(64 % P, P) % P));   // 64 is invertible mod P (odd)
+    }
     return ys;
 }
 

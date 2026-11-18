@@ -140,16 +140,21 @@ SmallPrimeGroups small_prime_group_masks(const uint32_t* sieve_primes,
 SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
                                               uint32_t mask_count,
                                               const std::vector<uint64_t>& per_prime,
-                                              uint32_t max_period = 4096, uint32_t skip = 1);
+                                              uint32_t max_period = 4096, uint32_t skip = 1,
+                                              uint32_t extra = 0);
 /// Canonical group tables (class modes): every prime's marks at index 0 mod p,
 /// so the tables depend on the primes only; a progression reads word x of
 /// group g at table word (x - Y_g) mod P_g (Y_g from small_prime_group_offsets).
 /// @param skip_mod  primes dividing it get all-ones masks (no multiples in
 ///                  any class, e.g. 3 for the mod-6 map).
+/// @param extra    the next @p extra primes (sieve_primes[mask_count], ...,
+///                  >= 64) are folded into the groups too, each into the
+///                  group of smallest period (make_prime_map: GB_MASK_XP).
 /// @return canonical tables with the same grouping as small_prime_group_masks_from.
 SmallPrimeGroups small_prime_group_masks_canonical(const uint32_t* sieve_primes,
                                                    uint32_t mask_count, uint32_t skip_mod,
-                                                   uint32_t max_period = 4096);
+                                                   uint32_t max_period = 4096,
+                                                   uint32_t extra = 0);
 /// Per-group word offsets Y_g for the progression q = base + step*i against
 /// the canonical tables: Y_g = X_g * 64^-1 mod P_g, X_g the CRT of each
 /// prime's first-mark residue.
@@ -157,7 +162,8 @@ SmallPrimeGroups small_prime_group_masks_canonical(const uint32_t* sieve_primes,
 /// @return one offset per group, in group order.
 std::vector<uint32_t> small_prime_group_offsets(const uint32_t* sieve_primes,
                                                 uint32_t mask_count, uint64_t base,
-                                                uint32_t step, uint32_t max_period = 4096);
+                                                uint32_t step, uint32_t max_period = 4096,
+                                                uint32_t extra = 0);
 /// Class-map variant of small_prime_mask_table: index i <-> q = base + step*i
 /// (class mode: step 6). A prime dividing @p step has no multiples (all-ones
 /// masks); primes outside [3, 64) get all-zero entries.
