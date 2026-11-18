@@ -310,6 +310,9 @@ int main(int argc, char** argv) {
         // GB_SPARSE=1 selects the sparse path too (benchmark harness arms)
         if (gb::env::onoff("GB_SPARSE", false)) sparse = true;
         if (sparse && !spv_set) spv.clear();          // the geometry's module
+        // the built-in default: this executable's own kernels first (a release
+        // run from the production tree must not load the tree's modules)
+        else if (!spv_set) spv = gb::locate_module(spv, true);
         const gb::RunStats s = sparse
             ? gb::run_gpu_sparse(limit, segment, spv, verbose, start, uint32_t(split),
                                  prime_cache.c_str(), per_seg || json)

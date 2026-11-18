@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -189,7 +190,27 @@ void Context::host_sync() const {
 
 // ----------------------------------------------------------------- Module --
 
-Module::Module(const Context& ctx, const std::string& spv_path) : ctx_(ctx.context()) {
+std::string locate_module(const std::string& path, bool exe_first) {
+    namespace fs = std::filesystem;
+    const auto readable = [](const fs::path& p) { return std::ifstream(p, std::ios::binary).good(); };
+    if (path.empty()) throw std::runtime_error("no SPIR-V module path");
+    std::vector<fs::path> cand;
+    if (fs::path(path).is_relative()) {
+        std::error_code ec;
+        const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec) cand = {exe.parent_path() / path, exe.parent_path().parent_path() / path};
+    }
+    cand.insert(exe_first ? cand.end() : cand.begin(), fs::path(path));
+    std::string tried;
+    for (const fs::path& c : cand) {
+        if (readable(c)) return c.string();
+        tried += (tried.empty() ? "" : ", ") + c.string();
+    }
+    throw std::runtime_error("cannot open SPIR-V file: " + path + " (tried " + tried + ")");
+}
+
+Module::Module(const Context& ctx, const std::string& spv_path_arg) : ctx_(ctx.context()) {
+    const std::string spv_path = locate_module(spv_path_arg);
     std::ifstream f(spv_path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open SPIR-V file: " + spv_path);
     std::vector<char> data((std::istreambuf_iterator<char>(f)),
