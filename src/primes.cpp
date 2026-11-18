@@ -110,11 +110,26 @@ std::vector<uint32_t> segmented_odd_primes_up_to(uint64_t n) {
     return primes;
 }
 
+uint64_t prime_payload_hash(const uint32_t* p, size_t cnt) {
+    // FNV-1a over 32-bit words. Each step h -> (h ^ x) * P is a bijection of
+    // h for a fixed x and of x for a fixed h (P odd), so any one changed word
+    // changes the result deterministically.
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < cnt; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
 namespace {
+constexpr char CACHE_MAGIC[4] = {'G', 'B', 'P', '2'};
+constexpr size_t CACHE_HEADER = 28;   // magic, u64 limit, u64 count, u64 payload hash
+
 /// Content check of a cached prime payload: the odd primes below 64 first,
-/// then strictly ascending odd values <= lim. Catches truncation, holes
-/// (zeros), and files mixed from different writers; the header alone (magic,
-/// limit, count, size) cannot. O(cnt), sequential.
+/// then strictly ascending odd values <= lim. With the payload hash it also
+/// guards against a writer bug (the hash only proves the bytes are the ones
+/// written). O(cnt), sequential.
 /// @return true iff p[0, cnt) passes.
 bool prime_payload_ok(const uint32_t* p, size_t cnt, uint64_t lim) {
     static constexpr uint32_t head[] = {3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61};
@@ -124,56 +139,39 @@ bool prime_payload_ok(const uint32_t* p, size_t cnt, uint64_t lim) {
         if (p[i] <= p[i - 1] || (p[i] & 1u) == 0) return false;
     return cnt == 0 || p[cnt - 1] <= lim;
 }
+
+/// Publishes @p primes as the cache @p path atomically: a unique temp file,
+/// fsync, rename (writing the final path in place let a concurrent builder's
+/// truncation expose a zero-filled hole to a third process). The cache is
+/// optional: on any failure no file is left behind.
+void write_cache(const std::string& path, uint64_t n, const std::vector<uint32_t>& primes) {
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const uint64_t cnt = primes.size();
+    const uint64_t h = prime_payload_hash(primes.data(), primes.size());
+    bool ok = std::fwrite(CACHE_MAGIC, 1, 4, f) == 4 &&
+              std::fwrite(&n, 8, 1, f) == 1 &&
+              std::fwrite(&cnt, 8, 1, f) == 1 &&
+              std::fwrite(&h, 8, 1, f) == 1 &&
+              std::fwrite(primes.data(), 4, primes.size(), f) == primes.size();
+    ok = std::fflush(f) == 0 && ok;
+    ok = ::fsync(::fileno(f)) == 0 && ok;
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0)
+        std::remove(tmp.c_str());
+}
 } // namespace
 
 std::vector<uint32_t> segmented_odd_primes_up_to_cached(uint64_t n,
                                                         const char* cache_path) {
-    // Try the cache first: magic "GBPR" + u64 limit + u64 count + payload.
     if (cache_path) {
-        std::FILE* f = std::fopen(cache_path, "rb");
-        if (f) {
-            char magic[4];
-            uint64_t lim = 0, cnt = 0;
-            bool ok = std::fread(magic, 1, 4, f) == 4 &&
-                      std::memcmp(magic, "GBPR", 4) == 0 &&
-                      std::fread(&lim, 8, 1, f) == 1 &&
-                      std::fread(&cnt, 8, 1, f) == 1 &&
-                      lim == n && cnt > 0 && cnt < (1ull << 32);
-            if (ok) {
-                std::vector<uint32_t> primes;
-                primes.resize(size_t(cnt));
-                ok = std::fread(primes.data(), 4, size_t(cnt), f) == size_t(cnt);
-                std::fclose(f);
-                if (ok && prime_payload_ok(primes.data(), primes.size(), lim)) return primes;
-                if (ok) std::fprintf(stderr, "warning: prime cache %s failed validation; regenerating\n",
-                                     cache_path);
-            } else {
-                std::fclose(f);
-            }
-        }
+        PrimeCacheView v;
+        if (PrimeCacheView::map_file(cache_path, n, false, v))
+            return std::vector<uint32_t>(v.data(), v.data() + v.size());
     }
-
     auto primes = segmented_odd_primes_up_to(n);
-    if (cache_path) {
-        // Publish atomically: a unique temp file, fsync, rename. Writing the
-        // final path in place let a concurrent builder's truncation expose a
-        // zero-filled hole to a third process that mapped the file.
-        const std::string tmp = std::string(cache_path) + ".tmp." + std::to_string(::getpid());
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        if (f) {
-            const uint64_t cnt = primes.size();
-            const char magic[4] = {'G', 'B', 'P', 'R'};
-            bool ok = std::fwrite(magic, 1, 4, f) == 4 &&
-                      std::fwrite(&n, 8, 1, f) == 1 &&
-                      std::fwrite(&cnt, 8, 1, f) == 1 &&
-                      std::fwrite(primes.data(), 4, primes.size(), f) == primes.size();
-            ok = std::fflush(f) == 0 && ok;
-            ok = ::fsync(::fileno(f)) == 0 && ok;
-            ok = std::fclose(f) == 0 && ok;
-            if (!ok || std::rename(tmp.c_str(), cache_path) != 0)
-                std::remove(tmp.c_str());     // the cache is optional: just do without it
-        }
-    }
+    if (cache_path) write_cache(cache_path, n, primes);
     return primes;
 }
 
@@ -191,64 +189,57 @@ void PrimeCacheView::release() noexcept {
     count_ = 0;
 }
 
+bool PrimeCacheView::map_file(const std::string& file, uint64_t n, bool allow_larger,
+                              PrimeCacheView& out) {
+    const int fd = ::open(file.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st{};
+    char magic[4] = {};
+    uint64_t lim = 0, cnt = 0, hash = 0;
+    const char* why = nullptr;
+    void* m = MAP_FAILED;
+    if (fstat(fd, &st) != 0 || st.st_size < int64_t(CACHE_HEADER) || pread(fd, magic, 4, 0) != 4 ||
+        pread(fd, &lim, 8, 4) != 8 || pread(fd, &cnt, 8, 12) != 8 || pread(fd, &hash, 8, 20) != 8)
+        why = "short header";
+    else if (std::memcmp(magic, CACHE_MAGIC, 4) != 0)
+        why = "unknown format (older caches carry no payload hash)";
+    else if (!(lim == n || (allow_larger && lim > n))) {
+        ::close(fd);                     // another limit: not this run's file, not damaged
+        return false;
+    } else if (cnt == 0 || cnt >= (1ull << 32) || uint64_t(st.st_size) != CACHE_HEADER + cnt * 4)
+        why = "size does not match the header";
+    else if ((m = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
+        why = "mmap failed";
+    ::close(fd);
+    if (!why) {
+        const auto* p = reinterpret_cast<const uint32_t*>(static_cast<const char*>(m) + CACHE_HEADER);
+        if (prime_payload_hash(p, size_t(cnt)) != hash) why = "payload hash mismatch";
+        else if (!prime_payload_ok(p, size_t(cnt), lim)) why = "payload content check failed";
+        if (why) munmap(m, size_t(st.st_size));
+        else {
+            out.release();
+            out.map_ = m;
+            out.map_len_ = size_t(st.st_size);
+            out.ptr_ = p;
+            out.count_ = lim > n            // primes <= n only (a prefix: the payload is ascending)
+                ? size_t(std::upper_bound(p, p + cnt, uint32_t(std::min<uint64_t>(n, UINT32_MAX))) - p)
+                : size_t(cnt);
+            return true;
+        }
+    }
+    std::fprintf(stderr, "warning: prime cache %s ignored (%s); regenerating\n", file.c_str(), why);
+    return false;
+}
+
 PrimeCacheView PrimeCacheView::load(uint64_t n, const char* cache_path) {
     PrimeCacheView view;
     const char* path = cache_path ? cache_path : "base_primes.cache";
-    // Keyed filename: caches for different limits coexist instead of every
-    // small-limit run regenerating (and clobbering) the shared 392 MB file.
+    // Keyed filename: caches for different limits coexist.
     const std::string keyed = std::string(path) + "." + std::to_string(n);
-
-    // `allow_larger`: accept a cache built for lim >= n and expose only its
-    // primes <= n (a prefix: the payload is ascending), so every run below
-    // one big cache (e.g. sqrt(5e18)) shares it instead of writing its own
-    // ~430 MB file per distinct --limit.
-    auto try_mmap = [&view, n](const std::string& file,
-                               bool allow_larger = false) -> bool {
-        // Validate + mmap the cache payload (header: "GBPR", u64 lim, u64
-        // cnt, then cnt u32 primes). No payload copy at all.
-        int fd = ::open(file.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st{};
-        bool ok = fstat(fd, &st) == 0 && st.st_size >= 32;
-        char magic[4] = {};
-        uint64_t lim = 0, cnt = 0;
-        if (ok && pread(fd, magic, 4, 0) == 4 &&
-            std::memcmp(magic, "GBPR", 4) == 0 &&
-            pread(fd, &lim, 8, 4) == 8 && pread(fd, &cnt, 8, 12) == 8 &&
-            (lim == n || (allow_larger && lim > n)) && cnt > 0 && cnt < (1ull << 32) &&
-            st.st_size >= int64_t(20 + cnt * 4)) {
-            void* m = mmap(nullptr, size_t(st.st_size), PROT_READ,
-                           MAP_PRIVATE, fd, 0);
-            if (m != MAP_FAILED) {
-                view.map_ = m;
-                view.map_len_ = size_t(st.st_size);
-                view.ptr_ = reinterpret_cast<const uint32_t*>(
-                    static_cast<const char*>(m) + 20);
-                view.count_ = size_t(cnt);
-                if (lim > n)   // primes <= n only
-                    view.count_ = size_t(std::upper_bound(view.ptr_, view.ptr_ + cnt,
-                                                          uint64_t(n) > UINT32_MAX ? UINT32_MAX : uint32_t(n)) -
-                                         view.ptr_);
-                if (!prime_payload_ok(view.ptr_, view.count_, n)) {   // the part this run uses
-                    std::fprintf(stderr, "warning: prime cache %s failed validation; ignoring it\n",
-                                 file.c_str());
-                    munmap(m, size_t(st.st_size));
-                    view.map_ = nullptr;
-                    view.map_len_ = 0;
-                    view.ptr_ = nullptr;
-                    view.count_ = 0;
-                }
-            }
-        }
-        ::close(fd);
-        return view.ptr_ != nullptr;
-    };
-
-    // Fast paths: the per-limit cache file, then the legacy shared file
-    // (read-only) so existing caches keep working.
-    if (try_mmap(keyed)) return view;
-    if (try_mmap(path)) return view;
-    // Next: the smallest existing keyed cache <path>.<L> with L > n.
+    if (map_file(keyed, n, false, view)) return view;
+    // Next: the smallest keyed cache <path>.<L> with L > n, exposing its
+    // primes <= n, so every run below one big cache (e.g. sqrt(5e18)) shares
+    // it instead of writing a ~430 MB file per distinct --limit.
     {
         namespace fs = std::filesystem;
         const fs::path p(path);
@@ -264,12 +255,12 @@ PrimeCacheView PrimeCacheView::load(uint64_t n, const char* cache_path) {
             const uint64_t L = std::strtoull(num.c_str(), nullptr, 10);
             if (L > n && (best == 0 || L < best)) best = L;
         }
-        if (best && try_mmap((dir / (stem + std::to_string(best))).string(), true))
+        if (best && map_file((dir / (stem + std::to_string(best))).string(), n, true, view))
             return view;
     }
-
-    // Slow path: generate (writing the keyed cache), keep owned.
-    view.owned_ = segmented_odd_primes_up_to_cached(n, keyed.c_str());
+    // Slow path (~2.6 s at sqrt(5e18)): generate, publish the keyed cache.
+    view.owned_ = segmented_odd_primes_up_to(n);
+    write_cache(keyed, n, view.owned_);
     view.ptr_ = view.owned_.data();
     view.count_ = view.owned_.size();
     return view;
@@ -428,6 +419,19 @@ bool is_prime_u64(uint64_t n) {
         if (composite) return false;
     }
     return true;
+}
+
+uint64_t cpu_min_goldbach_prime(uint64_t n, const uint16_t* cands, size_t ncand, uint64_t cand_bound) {
+    if (n < 4 || (n & 1)) return 0;
+    if (n == 4) return 2;
+    for (size_t i = 0; i < ncand; ++i) {
+        const uint64_t p = cands[i];
+        if (p > n - p) return 0;                 // every candidate up to n / 2 failed
+        if (is_prime_u64(n - p)) return p;
+    }
+    for (uint64_t p = (cand_bound + 1) | 1; p <= n / 2; p += 2)
+        if (is_prime_u64(p) && is_prime_u64(n - p)) return p;
+    return 0;
 }
 
 bool is_prime_trial(uint64_t n) {

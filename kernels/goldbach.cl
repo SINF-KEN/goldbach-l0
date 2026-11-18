@@ -1,23 +1,33 @@
 // ============================================================================
-// goldbach.cl — B580 (Xe2) Level Zero kernels
+// goldbach.cl — B580 (Xe2) Level Zero kernels of the dense verifier
 //
-// make_prime_map : segmented odd-only sieve, one work-group per SLM tile
-//                  (16 KB since v1.8.1; covers base primes p < sieve_split only)
-// sieve_large_primes : one work-item per LARGE_PRIMES_PER_ITEM (4) base
-//                  primes p >= sieve_split, marks its multiples straight
-//                  into the global map (atomic AND).
-//                  This is what makes N=4e18 feasible: the tile walk's cost
-//                  no longer grows with pi(sqrt(N)) (~98M primes at 4e18 —
-//                  walking all of them per tile blew the driver watchdog).
-// check_numbers  : word-level Goldbach verification, WORDS_PER_ITEM*64 =
-//                  256 evens per work-item (4 disjoint 64-even words)
+// Production pipeline per segment (host: src/verifier.cpp; diagram:
+// docs/PIPELINE.md):
+//   make_prime_map       mod-30 class map (8 arrays, one per q mod 30 coprime
+//                        to 30), one work-group per 16 KB SLM tile: small
+//                        primes by mask tables, primes < 512 by each thread
+//                        in its own words, primes up to the split
+//                        prime-parallel (all SLM marks atomic)
+//   sieve_large_packed   primes from the split to 3 x the segment's odd count,
+//   (_hl)                one byte per prime, multiplier wheel 30030; the _hl
+//                        variant also applies this segment's hit list
+//   hl_harvest / hl_apply  hit lists for the largest primes (<= 1 hit per
+//                        segment), harvested once per batch of segments
+//   check30_a / check30_b  the mod-30 checker (phase A funnels, phase B
+//                        probes); check30_xs* / check30_xb on sampled
+//                        segments (exact p(n) histogram)
+//   count30              prime / twin counts and prime gaps (statistics)
+//   map_compare + sieve_large_packed over all large primes: GB_BUCKET_VERIFY
+// Validators only (goldbach-tools): sieve_large_primes (one work-item per
+// LARGE_PRIMES_PER_ITEM primes, the plain reference), prep_large_fb,
+// unpack_large_test.
 //
 // Geometry (see include/config.hpp; defaults):
 //   work-group        = 256 threads
-//   SLM per work-group= 16 KB = 2048 uint64 words = 131,072 odd numbers
-//   words per thread  = 8   (exactly ONE owner per word -> no atomics)
-//   subgroup size     = selected by the Xe2 compiler (16 or 32)
-//   one bit           = one odd number; bit i <-> q = q_first + 2*i
+//   SLM per work-group= 16 KB = 2048 uint64 words = 131,072 map bits
+//   words per thread  = 8
+//   one bit           = one odd q coprime to 30 (class array k, bit t <->
+//                       q = Q_k + 30 t)
 // ============================================================================
 
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
@@ -42,7 +52,6 @@
 // low half = u32 append count (atomic), then RIDGE_CAP pairs
 // (even n, smallest witness p). MUST match gb::RIDGE_CAP (include/config.hpp).
 #define RIDGE_CAP         65536
-#define WORDS_PER_ITEM    4
 #define LARGE_PRIMES_PER_ITEM 4
 // Small-prime mask sieve: primes < MASK_MAX_P are applied as whole-word ANDs
 // from a precomputed host table (mask[p][phase]) instead of per-bit RMWs.
@@ -1402,264 +1411,9 @@ __kernel void unpack_large_test(__global const u32* restrict bases,
 }
 
 // ----------------------------------------------------------------------------
-// Bucket sieve for the largest primes (v1.7.0): bucket_activate,
-// bucket_process, map_compare.
-//
-// Primes p > q_odds_full (the bit length of a full segment's q range) hit a
-// segment at most once, yet sieve_large_packed paid their setup (decode +
-// modulo, ~75% of them with zero marks) for all ~91M of them every segment.
-// Here each ACTIVE bucketed prime owns exactly one entry
-//     u64 entry = off | (u64)p << 32
-// = its next hit at bit `off` of the segment the entry is filed under. The
-// entries live in a ring of R buckets (bucket t % R holds segment t's hits;
-// R > max lookahead (q_odds_full + p_max) / delta + 1). Coordinates: segment
-// t covers global bits [t*delta, t*delta + q_odds_t), delta = segment span
-// / 2; consecutive q ranges OVERLAP by q_odds_full - delta bits (the 9781
-// back-extension), so a hit can belong to two segments.
-//   first_seg(x) = first segment containing global bit x
-//                = x < q_odds_full ? 0 : (x - q_odds_full) / delta + 1
-// bucket_process(segment k): for each entry of bucket k: mark `off`; then
-//   off >= delta -> the same hit is also in segment k+1: file it there
-//                   (off - delta);
-//   otherwise    -> file the NEXT hit x = off + p under first_seg(x)
-//                   relative to k (>= k+1 because p > q_odds_full).
-// The last segment of a run marks only (off < q_odds) and files nothing.
-// bucket_activate(k): files the first hit of primes [a, b) (host-chosen:
-// every prime whose first hit falls within the ring horizon k + R - 1 by
-// now); at k = 0 that is all primes with p*p < q_first0, later only the few
-// whose first hit is p*p itself.
-// Filing is aggregated per work-group (SLM counters per target bucket, one
-// global atomic per bucket per chunk). Any impossible state — bucket
-// overflow, an entry outside a non-last segment, a lookahead >= R, an
-// activation behind the current segment — sets a bit in *err and the host
-// throws (fail closed). Validated end to end by GB_BUCKET_VERIFY=1 (the
-// verifier rebuilds every segment's map without buckets and map_compare
-// counts differing words).
+// Map validation (GB_BUCKET_VERIFY): the bucket ring that once replaced the
+// largest primes' packed setup is gone (v2.6: hit lists since v2.3).
 // ----------------------------------------------------------------------------
-#define BKT_MAX_R 256           // ring size limit (wheel-30030 lookahead up to 11p/delta)
-#define BKT_E 8                 // entries per lane per chunk
-#define BKT_ERR_ENTRY     1u    // entry beyond a non-last segment
-#define BKT_ERR_OVERFLOW  2u    // bucket capacity exceeded
-#define BKT_ERR_LOOKAHEAD 4u    // target bucket >= R ahead
-#define BKT_ERR_LATE      8u    // activation target behind current segment
-
-// Exact floor(x / d) for x < 2^40, d >= 2^16 without a 64-bit division:
-// float estimate + exact integer fix-ups (precision only bounds iterations).
-/// @pre    d >= 1, inv_d ~ 1/d; (q + 1) d must not overflow.
-/// @return floor(x / d).
-inline u64 bkt_div(const u64 x, const u64 d, const float inv_d)
-{
-    u64 q = (u64)((float)x * inv_d);
-    while (q * d > x) --q;
-    while ((q + 1UL) * d <= x) ++q;
-    return q;
-}
-
-/// @pre    delta >= 1, inv_delta ~ 1 / delta; segment s covers global bits
-///         [s delta, s delta + q_odds_full).
-/// @return the first segment (relative index) whose q range contains global
-///         bit x: 0 if x < q_odds_full, else (x - q_odds_full) / delta + 1.
-inline u32 bkt_first_seg_rel(const u64 x, const u64 q_odds_full, const u64 delta,
-                             const float inv_delta)
-{
-    return (x < q_odds_full) ? 0u
-         : (u32)bkt_div(x - q_odds_full, delta, inv_delta) + 1u;
-}
-
-// Bucket entries are written once and read once, 3..125 segments later:
-// cache-controlled LSC accesses keep that ~70 MB/segment stream from
-// evicting the L3-resident prime map under the bucket marks.
-ulong __builtin_IB_lsc_load_global_ulong(__global ulong* base, int immElemOff, enum LSC_LDCC cacheOpt);
-/// Stores a bucket entry (plain store: uncached LSC stores measured 2-3.7x
-/// slower).
-/// @pre    p 8-byte aligned, inside the ring.
-/// @post   *p = v.
-inline void bkt_store(__global u64* p, const u64 v)
-{
-    *p = v;
-}
-/// Loads a bucket entry (L1S_L3UC: bypasses L3).
-/// @pre    p 8-byte aligned; *p was written by an earlier kernel of the
-///         same in-order list with a barrier in between (bucket entries and
-///         hit lists are never read by the kernel that wrote them).
-/// @return *p.
-inline u64 bkt_load(const __global u64* p)
-{
-    return __builtin_IB_lsc_load_global_ulong((__global u64*)p, 0, (enum LSC_LDCC)LDCC_L1S_L3UC);
-}
-
-// The ring is split over two allocations (buckets [0, split) and [split, R)):
-// on this driver the first submission touching a single allocation above
-// ~5 GiB cost ~35-45 ms of host time (4.97 GiB: none, 5.16 GiB: 33 ms), and
-// the 30030-wheel ring at 3 x q_odds is ~6.9 GiB. Two halves stay below it.
-/// @return base of bucket @p b (b < R) in the two-allocation ring.
-inline __global u64* bkt_bucket(__global u64* e0, __global u64* e1, const u32 split,
-                                const u32 cap, const u32 b)
-{
-    return (b < split) ? e0 + (u64)b * cap : e1 + (u64)(b - split) * cap;
-}
-
-// Work-group-aggregated filing of up to BKT_E entries per lane. d[e] = target
-// bucket distance from `slot` (0 = nothing to file, except when allow0).
-/// @param d,ne,has  per lane entry: bucket distance (< R), entry, valid flag.
-/// @pre    called by every work-item of the group; local size >= R (host:
-///         256 = BKT_MAX_R >= R); lcnt[0, R) zeroed and visible.
-/// @post   each valid entry is stored in bucket (slot + d) % R, or *err gets
-///         BKT_ERR_OVERFLOW when the bucket is full.
-inline void bkt_file(__global u64* entries, __global u64* entries1, const u32 split,
-                     volatile __global u32* restrict counts,
-                     const u32 cap, const u32 R, const u32 slot,
-                     const u32* d, const u64* ne, const bool* has,
-                     __local u32* lcnt, __local u32* lbase,
-                     volatile __global u32* restrict err)
-{
-    const u32 lid = get_local_id(0);
-    u32 pos[BKT_E];
-    #pragma unroll
-    for (u32 e = 0; e < BKT_E; ++e)
-        pos[e] = has[e] ? atomic_inc(&lcnt[d[e]]) : 0u;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if (lid < R && lcnt[lid])
-        lbase[lid] = atomic_add(&counts[(slot + lid) % R], lcnt[lid]);
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (u32 e = 0; e < BKT_E; ++e) {
-        if (!has[e]) continue;
-        const u32 idx = lbase[d[e]] + pos[e];
-        if (idx < cap) bkt_store(bkt_bucket(entries, entries1, split, cap, (slot + d[e]) % R) + idx, ne[e]);
-        else atomic_or(err, BKT_ERR_OVERFLOW);
-    }
-}
-
-/// Marks this segment's bucketed hits and re-files each prime's next hit.
-/// @pre    local size >= R (lcnt / lbase are reset and filled only for
-///         lid < local size; host: WG_SIZE = 256 >= R); p_max + q_odds_full < 2^32.
-/// @post   every entry of bucket @p slot is marked (off < q_odds) and, unless
-///         is_last, re-filed; any impossible state sets a bit in *err.
-__kernel void bucket_process(
-        volatile __global u64* restrict prime_map,
-        __global u64* entries,                   // buckets [0, split), [cap] each
-        volatile __global u32* restrict counts,  // [R]
-        const u32 cap,
-        const u32 R,
-        const u32 slot,                          // this segment's bucket (k % R)
-        const u64 q_odds,                        // this segment
-        const u64 q_odds_full,
-        const u64 delta,
-        const float inv_delta,
-        const u32 is_last,
-        volatile __global u32* restrict err,
-        const u32 qfw,                           // this segment's q_first mod WHEEL_W
-        __global u64* entries1,                  // buckets [split, R) (see bkt_bucket)
-        const u32 split,
-        const u32 cm, const u32 phi1, const u32 phi5, const u32 off5)   // class mode
-{
-    const cmap g = {cm, phi1, phi5, off5};
-    __local u32 lcnt[BKT_MAX_R], lbase[BKT_MAX_R];
-    const u32 lid = get_local_id(0);
-    const u32 n = min(counts[slot], cap);
-    const __global u64* in = bkt_bucket(entries, entries1, split, cap, slot);
-    const u64 chunk = (u64)get_local_size(0) * BKT_E;
-    for (u64 c0 = (u64)get_group_id(0) * chunk; c0 < n;
-         c0 += (u64)get_num_groups(0) * chunk) {             // uniform per group
-        if (lid < BKT_MAX_R) lcnt[lid] = 0u;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        u32 d[BKT_E]; u64 ne[BKT_E]; bool has[BKT_E];
-        #pragma unroll
-        for (u32 e = 0; e < BKT_E; ++e) {
-            has[e] = false; d[e] = 0u; ne[e] = 0UL;
-            const u64 i = c0 + (u64)e * get_local_size(0) + lid;
-            if (i >= n) continue;
-            const u64 ent = bkt_load(in + i);
-            const u32 off = (u32)ent;
-            const u32 p = (u32)(ent >> 32);
-            if (off < (u32)q_odds) {
-                map_clear_w((volatile __global u32*)prime_map, off, g);
-            } else if (!is_last) {
-                atomic_or(err, BKT_ERR_ENTRY);
-            }
-            if (is_last) continue;
-            const u32 dl = (u32)delta, qf = (u32)q_odds_full;
-            u32 noff;
-            if (off >= dl) {                     // same hit, also in segment k+1
-                d[e] = 1u; noff = off - dl;
-            } else {
-                // next hit = next multiplier coprime to 30: this hit's
-                // multiplier residue from q = q_first + 2*off, then the
-                // wheel step (1..3 p, so off + step*p may exceed 2^32)
-                const u32 mr = (((qfw + 2u * (off % (WHEEL_W / 2))) % WHEEL_W) *
-                                 WHL_INV[p % WHEEL_W]) % WHEEL_W;
-                const u32 w = WHL_IDX[mr];
-                if (w == WHL_MISS) { atomic_or(err, BKT_ERR_ENTRY); continue; }
-                const u64 x = (u64)off + (u64)p * WHL_STEP[w];
-                d[e] = bkt_first_seg_rel(x, q_odds_full, delta, inv_delta);
-                noff = (u32)(x - (u64)d[e] * delta);
-            }
-            if (d[e] == 0u || d[e] >= R) { atomic_or(err, BKT_ERR_LOOKAHEAD); continue; }
-            ne[e] = (u64)noff | ((u64)p << 32);
-            has[e] = true;
-        }
-        bkt_file(entries, entries1, split, counts, cap, R, slot, d, ne, has, lcnt, lbase, err);
-        barrier(CLK_LOCAL_MEM_FENCE);            // lcnt reuse next chunk
-    }
-}
-
-/// Files the first hit of primes [a, b) at segment k_cur.
-/// @pre    local size >= R (as bucket_process).
-/// @post   each prime has one entry in the ring, or *err has BKT_ERR_LATE /
-///         BKT_ERR_LOOKAHEAD / BKT_ERR_OVERFLOW set.
-__kernel void bucket_activate(
-        __global const u32* restrict primes,     // full base-prime list
-        const u32 a,                             // activate primes [a, b)
-        const u32 b,
-        __global u64* entries,                   // buckets [0, split)
-        volatile __global u32* restrict counts,
-        const u32 cap,
-        const u32 R,
-        const u32 k_cur,                         // current segment index
-        const u64 q_first0,                      // q_first of segment 0
-        const u64 q_odds_full,
-        const u64 delta,
-        volatile __global u32* restrict err,
-        __global u64* entries1,                  // buckets [split, R)
-        const u32 split)
-{
-    __local u32 lcnt[BKT_MAX_R], lbase[BKT_MAX_R];
-    const u32 lid = get_local_id(0);
-    const u32 n = b - a;
-    const u32 slot = k_cur % R;
-    const u64 chunk = (u64)get_local_size(0) * BKT_E;
-    for (u64 c0 = (u64)get_group_id(0) * chunk; c0 < n;
-         c0 += (u64)get_num_groups(0) * chunk) {
-        if (lid < BKT_MAX_R) lcnt[lid] = 0u;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        u32 d[BKT_E]; u64 ne[BKT_E]; bool has[BKT_E];
-        #pragma unroll
-        for (u32 e = 0; e < BKT_E; ++e) {
-            has[e] = false; d[e] = 0u; ne[e] = 0UL;
-            const u64 i = c0 + (u64)e * get_local_size(0) + lid;
-            if (i >= n) continue;
-            const u64 p = primes[a + i];
-            u64 G = (first_odd_multiple(p, q_first0) - q_first0) >> 1;
-            {   // advance to the first multiplier coprime to 30 (<= 2 odd steps)
-                u32 mr = (((u32)(q_first0 % (u64)WHEEL_W)) +
-                          2u * (u32)(G % (u64)(WHEEL_W / 2))) % WHEEL_W;
-                mr = (mr * WHL_INV[(u32)(p % (u64)WHEEL_W)]) % WHEEL_W;
-                while (WHL_IDX[mr] == WHL_MISS) { G += p; mr += 2u; if (mr >= WHEEL_W) mr -= WHEEL_W; }
-            }
-            // one-time u64 division per prime (activation only)
-            const u64 t = (G < q_odds_full) ? 0UL : (G - q_odds_full) / delta + 1UL;
-            if (t < k_cur) { atomic_or(err, BKT_ERR_LATE); continue; }
-            if (t - k_cur >= R) { atomic_or(err, BKT_ERR_LOOKAHEAD); continue; }
-            d[e] = (u32)(t - k_cur);
-            ne[e] = (G - t * delta) | (p << 32);
-            has[e] = true;
-        }
-        bkt_file(entries, entries1, split, counts, cap, R, slot, d, ne, has, lcnt, lbase, err);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-}
-
 // Validation (GB_BUCKET_VERIFY=1): count words that differ between two maps.
 /// @pre    a and b hold >= nwords words, written by earlier kernels.
 /// @post   *diff is incremented once per word i < nwords with a[i] != b[i];
@@ -1713,945 +1467,21 @@ __kernel void prep_large_fb(
 }
 
 // ----------------------------------------------------------------------------
-// check_numbers
-//
-// Word-level Goldbach verification: one work-item owns WORDS_PER_ITEM = 4
-// disjoint 64-even words (four uint64s of the `checked` bitset; see the
-// ILP note at the top of the kernel body).
-//
-// Coordinate math (the key trick):
-//   n = p + q,  q odd, p odd
-//   bit_n = (n - seg_start) / 2        (n-bitset: one bit per even)
-//   bit_q = (q - q_first) / 2          (q-bitset: one bit per odd)
-//   n - q = p                          ->  n = q + p
-//   bit_n = (q + p - seg_start)/2
-//         = (q - q_first)/2 + (p + q_first - seg_start)/2
-//         = bit_q + S,   with S = (p + q_first - seg_start) / 2
-//
-// q_first and seg_start are both odd/even respectively and chosen so that
-// (p + q_first - seg_start) is even for every odd p, so S is an exact
-// integer shift. For each candidate p the whole q-bitset window is shifted
-// by S bits and OR-ed into the accumulator:
-//
-//   acc |= (qw0 >> S) | (qw1 << (64 - S))
-//
-// One 64-bit OR covers up to 64 even numbers per candidate — the
-// "shifted bitset" bulk-marking formulation.
-//
-// The special case p = 2 (n = 2 + odd prime) is handled separately.
-//
-// After all candidates, any word != ~0 contributes its unresolved bit
-// positions to the compact leftover list (atomics only on misses).
+// Shared by the mod-30 checker (v2.6 removed the single-phase, twin and
+// class-split checkers it superseded).
 // ----------------------------------------------------------------------------
-/// Single-phase word checker.
-/// @pre    map complete for this segment; q_first odd, seg_start even;
-///         gb_primes ascending primes (2 is skipped).
-/// @post   checked[w] has bit i set iff even seg_start + 2
-///         (64 w + i) has a witness among gb_primes; every other valid even is
-///         appended to leftovers (count may exceed MAX_LEFTOVERS: host fails
-///         closed).
-__kernel void check_numbers(
-        __global const u64* restrict prime_map, // q segment bitset
-        __global u64* restrict checked,         // output: bit i <-> even index i
-        __global const u16* restrict gb_primes, // candidate primes p <= 9781
-        const u32 gb_count,
-        __global u32* restrict leftovers,       // compact exception list
-        __global u32* restrict leftover_count,
-        const u64 q_first,
-        const u64 q_odds,
-        const u64 seg_start,                    // first even n of the segment
-        const u64 seg_evens                     // number of evens in segment
-        )
-{
-    // ILP variant: each work-item owns WORDS_PER_ITEM disjoint 64-even words.
-    // Independent accumulators break the serial OR-chain: while acc0 waits on
-    // its loads, acc1..N-1 issue theirs. Adjacent work-items still coalesce.
-    const u64 word_idx = (u64)get_global_id(0) * WORDS_PER_ITEM;
-    if (word_idx * 64UL >= seg_evens) return;
-
-    const u64 map_words = (q_odds + 63UL) >> 6;
-
-    u64 acc[WORDS_PER_ITEM];
-    u64 evens_here[WORDS_PER_ITEM];
-    bool all_full = true;
-    #pragma unroll
-    for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-        acc[k] = 0UL;
-        const u64 wi = word_idx + k;
-        evens_here[k] = (wi * 64UL < seg_evens) ? min((u64)64, seg_evens - wi * 64UL) : 0UL;
-        if (evens_here[k] < 64UL) all_full = false;
-    }
-
-    // ---- odd candidates p = 3, 5, 7, ... ------------------------------------
-    // bit_n = (n - seg_start)/2, bit_q = (q - q_first)/2, q = n - p
-    //   bit_q = bit_n + T,   T = (seg_start - p - q_first) / 2   (signed!)
-    //
-    // acc bit j = map bit (base + j) with base = my_n_bit0 + T.
-    // The standard two-word extraction (qw0 >> r) | (qw1 << (64-r)) with
-    // r = base & 63 handles everything: negative word indices load as 0,
-    // which is exactly right for base < 0 (q < q_first cannot be used).
-    // Interior-check form: decompose T = Tw*64 + Tr
-    // ONCE per candidate => w0 = wi + Tw (one add per word) and r = Tr is
-    // IDENTICAL for all work-items and all words of a candidate. In the
-    // production geometry (q_first = seg_start - MAX_GB_PRIME, candidates
-    // <= MAX_GB_PRIME) T >= 0 for every candidate and map_words =
-    // ceil(q_odds/64) = words + 77 covers max(w0)+1 = words + 76, so the
-    // bounds guards are provably true and the hot path drops them
-    // (geo_safe uniform check; the low-range path where T can go negative
-    // keeps the original guarded loop). Semantics unchanged: same words,
-    // same funnel, same early exit.
-    const long Tbase = (long)seg_start - (long)q_first;
-    const u32 pmax = (gb_count > 0) ? gb_primes[gb_count - 1] : 3u;
-    const bool geo_safe = (Tbase - (long)pmax) >= 0;
-    if (geo_safe) {
-        for (u32 j = 0; j < gb_count; ++j) {
-            const u32 p = gb_primes[j];
-            if (p == 2) continue;   // p=2 only matters for n=4 (CPU fallback)
-
-            const long T  = (Tbase - (long)p) >> 1;   // exact: Tbase-p even
-            const u64 Tw = (u64)(T >> 6);             // >= 0 (geo_safe)
-            const u32  r  = (u32)(T & 63UL);
-
-            #pragma unroll
-            for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-                if (acc[k] == ~0UL) continue;      // this word fully verified
-                const u64 w0 = word_idx + Tw + k;  // = wi + Tw, in bounds
-                const u64 qw0 = prime_map[w0];
-                const u64 qw1 = prime_map[w0 + 1];
-
-                acc[k] |= r ? ((qw0 >> r) | (qw1 << (64UL - r))) : qw0;
-            }
-            if (all_full) {
-                bool done = true;
-                #pragma unroll
-                for (u32 k = 0; k < WORDS_PER_ITEM; ++k) done &= (acc[k] == ~0UL);
-                if (done) break;                   // all evens verified
-            }
-        }
-    } else {
-        for (u32 j = 0; j < gb_count; ++j) {
-            const u32 p = gb_primes[j];
-            if (p == 2) continue;   // p=2 only matters for n=4 (CPU fallback)
-
-            const long T = ((long)seg_start - (long)p - (long)q_first) / 2;
-
-            #pragma unroll
-            for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-                if (acc[k] == ~0UL) continue;      // this word fully verified
-                const long base = (long)((word_idx + k) * 64UL) + T;
-                const long w0   = base >> 6;       // arithmetic shift, may be -1
-                const u32  r    = (u32)(base & 63UL);
-
-                const u64 qw0 = (w0 >= 0 && (u64)w0       < map_words) ? prime_map[w0]     : 0UL;
-                const u64 qw1 = (w0 + 1 >= 0 && (u64)(w0 + 1) < map_words) ? prime_map[w0 + 1] : 0UL;
-
-                acc[k] |= r ? ((qw0 >> r) | (qw1 << (64UL - r))) : qw0;
-            }
-            if (all_full) {
-                bool done = true;
-                #pragma unroll
-                for (u32 k = 0; k < WORDS_PER_ITEM; ++k) done &= (acc[k] == ~0UL);
-                if (done) break;                   // all evens verified
-            }
-        }
-    }
-
-    // ---- mask partial word, write, report leftovers --------------------------
-    #pragma unroll
-    for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-        const u64 wi = word_idx + k;
-        if (evens_here[k] == 0UL) break;       // past segment end (words are ordered)
-        u64 a = acc[k];
-        if (evens_here[k] < 64UL) a &= (1UL << evens_here[k]) - 1UL;
-        checked[wi] = a;
-
-        if (a != ~0UL) {
-            // Report each unresolved even index (rare; atomics only on misses).
-            u64 miss = ~a;
-            if (evens_here[k] < 64UL) miss &= (1UL << evens_here[k]) - 1UL;
-            while (miss) {
-                const u32 b = (u32)ctz(miss);
-                miss &= miss - 1UL;
-                const u32 slot = atom_inc(leftover_count);
-                if (slot < MAX_LEFTOVERS) leftovers[slot] = (u32)(wi * 64UL + b);
-            }
-        }
-    }
-
-}
-
-
-// ----------------------------------------------------------------------------
-// check_numbers_w32 — 32-bit register-window checker (v1.7.0).
-//
-// A register-window variant keeping the 5 map words in registers (~0.1
-// loads per candidate instead of 8) gained only 7%: the checker is
-// ALU-bound, not load-bound: Xe2
-// has no native 64-bit integer shifts, so every 64-bit funnel
-// (m0 >> r) | (m1 << (64 - r)) and the 64-bit T arithmetic expand into
-// multi-instruction emulation. Here the SAME 256 evens per item are held as
-// 8 native u32 words (little-endian: u64 word w == u32 words 2w, 2w+1, so
-// the map and checked[] layouts are unchanged), the map window is 9 u32
-// registers sliding one u32 word at a time, and T = (Tbase - p) / 2 is
-// 32-bit (Tbase = seg_start - q_first = MAX_GB_PRIME in production). Each
-// funnel is 2 native shifts + 2 ORs.
-// Same candidates, early exit, leftovers and checked[] contract as
-// check_numbers. Low-range geometry (T may be negative) and any Tbase that
-// does not fit comfortably in 32 bits take the guarded 64-bit loop.
-// ----------------------------------------------------------------------------
-#define W32_EXIT_EVERY 1        // early-exit test every N candidates (power of 2)
-/// @pre    / @post as check_numbers (32-bit register-window variant).
-__kernel void check_numbers_w32(
-        __global const u64* restrict prime_map,
-        __global u64* restrict checked,
-        __global const u16* restrict gb_primes,
-        const u32 gb_count,
-        __global u32* restrict leftovers,
-        __global u32* restrict leftover_count,
-        const u64 q_first,
-        const u64 q_odds,
-        const u64 seg_start,
-        const u64 seg_evens)
-{
-    const u64 word_idx = (u64)get_global_id(0) * WORDS_PER_ITEM;
-    if (word_idx * 64UL >= seg_evens) return;
-    const u64 map_words = (q_odds + 63UL) >> 6;
-
-    u64 valid[WORDS_PER_ITEM];
-    u32 acc[2 * WORDS_PER_ITEM];
-    #pragma unroll
-    for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-        const u64 wi = word_idx + k;
-        const u64 ev = (wi * 64UL < seg_evens) ? min((u64)64, seg_evens - wi * 64UL) : 0UL;
-        valid[k] = (ev >= 64UL) ? ~0UL : ((1UL << ev) - 1UL);
-        acc[2 * k]     = ~(u32)valid[k];         // past-the-end evens pre-set
-        acc[2 * k + 1] = ~(u32)(valid[k] >> 32);
-    }
-
-    const long Tbase = (long)seg_start - (long)q_first;
-    const u32 pmax = (gb_count > 0) ? gb_primes[gb_count - 1] : 3u;
-    const bool fast = (Tbase - (long)pmax) >= 0 && Tbase < (1L << 30);   // uniform
-    if (fast) {
-        const __global u32* map32 = (const __global u32*)prime_map;
-        const u64 map32_last = 2UL * map_words - 1UL;
-        const u64 w32_0 = 2UL * word_idx;        // my first u32 word
-        const int tb = (int)Tbase;
-        int tw = ((tb - 3) >> 1) >> 5;           // max over candidates (p >= 3)
-        u64 wb = w32_0 + (u64)tw;
-        u32 m[9];
-        #pragma unroll
-        for (u32 i = 0; i < 9; ++i) m[i] = map32[min(wb + i, map32_last)];
-        for (u32 j = 0; j < gb_count; ++j) {
-            const int p = gb_primes[j];
-            if (p == 2) continue;
-            const int T = (tb - p) >> 1;         // >= 0 (fast => geo_safe)
-            const int twj = T >> 5;
-            while (tw > twj) {                   // uniform: slide window down
-                --tw; --wb;
-                #pragma unroll
-                for (u32 i = 8; i > 0; --i) m[i] = m[i - 1];
-                m[0] = map32[wb];
-            }
-            const u32 r = (u32)T & 31u;
-            if (r) {
-                const u32 l = 32u - r;
-                #pragma unroll
-                for (u32 i = 0; i < 8; ++i) acc[i] |= (m[i] >> r) | (m[i + 1] << l);
-            } else {
-                #pragma unroll
-                for (u32 i = 0; i < 8; ++i) acc[i] |= m[i];
-            }
-            if ((j & (W32_EXIT_EVERY - 1u)) == W32_EXIT_EVERY - 1u &&
-                (acc[0] & acc[1] & acc[2] & acc[3] & acc[4] & acc[5] & acc[6] & acc[7]) == ~0u)
-                break;
-        }
-    } else {
-        u64 a64[WORDS_PER_ITEM];
-        #pragma unroll
-        for (u32 k = 0; k < WORDS_PER_ITEM; ++k) a64[k] = ~valid[k];
-        for (u32 j = 0; j < gb_count; ++j) {
-            const u32 p = gb_primes[j];
-            if (p == 2) continue;
-            const long T = ((long)seg_start - (long)p - (long)q_first) / 2;
-            #pragma unroll
-            for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-                if (a64[k] == ~0UL) continue;
-                const long base = (long)((word_idx + k) * 64UL) + T;
-                const long w0   = base >> 6;
-                const u32  r    = (u32)(base & 63UL);
-                const u64 qw0 = (w0 >= 0 && (u64)w0       < map_words) ? prime_map[w0]     : 0UL;
-                const u64 qw1 = (w0 + 1 >= 0 && (u64)(w0 + 1) < map_words) ? prime_map[w0 + 1] : 0UL;
-                a64[k] |= r ? ((qw0 >> r) | (qw1 << (64UL - r))) : qw0;
-            }
-            if ((a64[0] & a64[1] & a64[2] & a64[3]) == ~0UL) break;
-        }
-        #pragma unroll
-        for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-            acc[2 * k] = (u32)a64[k];
-            acc[2 * k + 1] = (u32)(a64[k] >> 32);
-        }
-    }
-
-    #pragma unroll
-    for (u32 k = 0; k < WORDS_PER_ITEM; ++k) {
-        if (valid[k] == 0UL) break;              // past segment end (ordered)
-        const u64 wi = word_idx + k;
-        const u64 a = ((u64)acc[2 * k] | ((u64)acc[2 * k + 1] << 32));
-        checked[wi] = a & valid[k];
-        u64 miss = ~a & valid[k];
-        while (miss) {
-            const u32 b = (u32)ctz(miss);
-            miss &= miss - 1UL;
-            const u32 slot = atom_inc(leftover_count);
-            if (slot < MAX_LEFTOVERS) leftovers[slot] = (u32)(wi * 64UL + b);
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Two-phase checker (v1.7.0): check_phase_a + check_phase_b.
-//
-// Measured at 4e18 (fraction of evens still unresolved after the first K
-// candidates): K=64 6.5%, 96 2.0%, 128 0.62%, 192 0.06%, 256 0.007%,
-// 384 ~1e-6. Word-level checking resolves 64 evens per op, but a 256-even
-// item runs until its HARDEST even is resolved (~300 candidates on average
-// per subgroup), so most of the single-phase checker's time is spent on a
-// fraction of a percent of the evens.
-//
-// Phase A = check_numbers_w32 capped at the first cand_cap candidates. Every
-// even still unresolved is appended to `pending` (segment-local even index;
-// one atomic per subgroup via scan/reduce). checked[] gets the partial
-// result.
-// Phase B = one work-item per pending even (grid-stride): continues with
-// candidates [cand_cap, gb_count) one bit probe each, fully bounds-guarded
-// (no geometry assumptions), sets the even's checked[] bit on success, and
-// appends evens that no candidate resolves to the normal leftover list (CPU
-// Miller-Rabin fallback), exactly like the single-phase checkers.
-// The union covers the same candidates in the same order, so outputs are
-// identical to check_numbers (validated by tools/debug_check_hi).
-// pending_count may exceed pending_cap: the host fails closed if it does.
-// ----------------------------------------------------------------------------
-// Phase A item width in 64-bit words (2*A_W64 u32 words, 64*A_W64 evens);
-// MUST match the host's CHECK_PHASE_A_W64. Wider items spread the fixed
-// per-candidate work (candidate load, shift setup, run test, exit test)
-// over more words. check_s per 2e10 window: 2 -> 0.117, 4 -> 0.0905,
-// 8 -> 0.085, 12 -> 0.073, 16 -> 0.065, 20 -> 0.069, 24 -> 0.075,
-// 32 -> 0.163 (register spills). At 16 the compiler picks SIMD16.
-// Twin checker (v1.10.0). With twin = 1, check_phase_a reads the map as
-// the TWIN map, bit j = map bit j | map bit j - 1 ("q or q - 2 is prime"),
-// and its candidates are the LOWER members p of twin pairs (p, p + 2 both
-// prime): the window at T_p then holds map[i + T_p] | map[i + T_p - 1], i.e.
-// candidates p and p + 2 (T_{p+2} = T_p - 1) in ONE funnel. Every set bit
-// is the OR of two genuine map bits (bits outside [0, q_odds) are 0 in the
-// map; bit -1 is taken as 0), so a resolved even always has a genuine
-// witness. Phase A starts with ~0.07% of its funnels spent per resolved
-// even instead of every item running to the cap (P(all 1024 evens of an
-// item resolved after 160 single candidates) is only ~13%). The twin words
-// are formed as the register window is loaded (once per slide, not per
-// candidate), so no separate pass or buffer.
-/// @return map32[k], or with twin set the twin word (bit j = bit j | bit j - 1).
-inline u32 tw32(const __global u32* map32, const u64 k, const u32 twin)
-{
-    const u32 m = map32[k];
-    if (!twin) return m;
-    const u32 below = (k > 0) ? (map32[k - 1] >> 31) : 0u;
-    return m | (m << 1) | below;
-}
-/// @return map word w (0 outside [0, map_words)), twin-folded when twin is set.
-inline u64 tw64(const __global u64* map, const long w, const u64 map_words, const u32 twin)
-{
-    const u64 m = (w >= 0 && (u64)w < map_words) ? map[w] : 0UL;
-    if (!twin) return m;
-    const u64 below = (w - 1 >= 0 && (u64)(w - 1) < map_words) ? (map[w - 1] >> 63) : 0UL;
-    return m | (m << 1) | below;
-}
-
-// Phase-A item width in 64-bit words (all word checkers; MUST match
-// gb::CHECK_PHASE_A_W64). v1.13.0: 14 (896 evens per item): the mod-30
-// checker spilled ~26 registers at 16 (12: spill-free, -1.0% total; 14 spills
-// ~12 but -0.28% / -0.22% more on long / long-end; 8: +0.3%, 10: +0.04%).
-#define A_W64 12               // 14 -> 12 after C30_ROT (spill-free, +0.2%); 8/10/14/16 windows removed
-/// Phase A of the two-phase checker (first cand_cap candidates).
-/// @pre    as check_numbers; with twin = 1, gb_primes lists lower twin members.
-/// @post   checked[] holds the partial result; every unresolved valid even is
-///         in pending (count may exceed pending_cap: host fails closed).
-__kernel void check_phase_a(
-        __global const u64* restrict prime_map,
-        __global u64* restrict checked,
-        __global const u16* restrict gb_primes,
-        const u32 gb_count,
-        __global u32* restrict pending,
-        __global u32* restrict pending_count,
-        const u64 q_first,
-        const u64 q_odds,
-        const u64 seg_start,
-        const u64 seg_evens,
-        const u32 cand_cap,
-        const u32 pending_cap,
-        const u32 twin)                     // 1: twin checker (see tw32 / tw64)
-{
-    const u64 word_idx = (u64)get_global_id(0) * A_W64;
-    const bool live = word_idx * 64UL < seg_evens;   // no early return: subgroup ops below
-    const u64 map_words = (q_odds + 63UL) >> 6;
-    const u32 n_cand = min(gb_count, cand_cap);
-
-    u64 valid[A_W64];
-    u32 acc[2 * A_W64];
-    #pragma unroll
-    for (u32 k = 0; k < A_W64; ++k) {
-        const u64 wi = word_idx + k;
-        const u64 ev = (wi * 64UL < seg_evens) ? min((u64)64, seg_evens - wi * 64UL) : 0UL;
-        valid[k] = (ev >= 64UL) ? ~0UL : ((1UL << ev) - 1UL);
-        acc[2 * k]     = ~(u32)valid[k];
-        acc[2 * k + 1] = ~(u32)(valid[k] >> 32);
-    }
-
-    const long Tbase = (long)seg_start - (long)q_first;
-    const u32 pmax = (gb_count > 0) ? gb_primes[gb_count - 1] : 3u;
-    const bool fast = (Tbase - (long)pmax) >= 0 && Tbase < (1L << 30);   // uniform
-    if (live && fast) {
-        const __global u32* map32 = (const __global u32*)prime_map;
-        const u64 map32_last = 2UL * map_words - 1UL;
-        const int tb = (int)Tbase;
-        int tw = ((tb - 3) >> 1) >> 5;           // max over candidates (p >= 3)
-        u64 wb = 2UL * word_idx + (u64)tw;
-        u32 m[2 * A_W64 + 1];
-        #pragma unroll
-        for (u32 i = 0; i <= 2 * A_W64; ++i) m[i] = tw32(map32, min(wb + i, map32_last), twin);
-        // Candidates are processed in runs that share one word offset
-        // tw = T >> 5 (T descends with p, so each run is contiguous): the
-        // window is slid once per run in the outer loop and stays FIXED in
-        // registers inside the run. The single-loop form carried the 9
-        // window registers through every iteration and compiled to ~75
-        // register moves per candidate. The funnel is branch-free:
-        // (m >> r) | ((m' << (31 - r)) << 1) equals the 32-bit window at bit
-        // offset r for every r in [0, 31] (r = 0 gives m exactly), so no
-        // per-word select for the r == 0 case either.
-        u32 j = 0;
-        int T = (tb - (int)gb_primes[0]) >> 1;
-        bool done = false;
-        while (j < n_cand && !done) {
-            const int twj = T >> 5;
-            while (tw > twj) {                   // uniform: slide window down
-                --tw; --wb;
-                #pragma unroll
-                for (u32 i = 2 * A_W64; i > 0; --i) m[i] = m[i - 1];
-                m[0] = tw32(map32, wb, twin);
-            }
-            // run: every candidate with this word offset
-            do {
-                const u32 r = (u32)T & 31u;
-                const u32 l = 31u - r;
-                if (gb_primes[j] != 2) {
-                    #pragma unroll
-                    for (u32 i = 0; i < 2 * A_W64; ++i)
-                        acc[i] |= (m[i] >> r) | ((m[i + 1] << l) << 1);
-                }
-                u32 all = acc[0];
-                #pragma unroll
-                for (u32 i = 1; i < 2 * A_W64; ++i) all &= acc[i];
-                if (all == ~0u) {
-                    done = true;
-                    break;
-                }
-                if (++j >= n_cand) break;
-                T = (tb - (int)gb_primes[j]) >> 1;
-            } while ((T >> 5) == twj);
-        }
-    } else if (live) {
-        u64 a64[A_W64];
-        #pragma unroll
-        for (u32 k = 0; k < A_W64; ++k) a64[k] = ~valid[k];
-        for (u32 j = 0; j < n_cand; ++j) {
-            const u32 p = gb_primes[j];
-            if (p == 2) continue;
-            const long T = ((long)seg_start - (long)p - (long)q_first) / 2;
-            #pragma unroll
-            for (u32 k = 0; k < A_W64; ++k) {
-                if (a64[k] == ~0UL) continue;
-                const long base = (long)((word_idx + k) * 64UL) + T;
-                const long w0   = base >> 6;
-                const u32  r    = (u32)(base & 63UL);
-                const u64 qw0 = tw64(prime_map, w0, map_words, twin);
-                const u64 qw1 = tw64(prime_map, w0 + 1, map_words, twin);
-                a64[k] |= r ? ((qw0 >> r) | (qw1 << (64UL - r))) : qw0;
-            }
-            u64 all64 = a64[0];
-            #pragma unroll
-            for (u32 k = 1; k < A_W64; ++k) all64 &= a64[k];
-            if (all64 == ~0UL) break;
-        }
-        #pragma unroll
-        for (u32 k = 0; k < A_W64; ++k) {
-            acc[2 * k] = (u32)a64[k];
-            acc[2 * k + 1] = (u32)(a64[k] >> 32);
-        }
-    }
-
-    // checked[] partial result + count of unresolved evens in this item.
-    u32 c = 0;
-    #pragma unroll
-    for (u32 k = 0; k < A_W64; ++k) {
-        if (!live || valid[k] == 0UL) continue;
-        const u64 a = ((u64)acc[2 * k] | ((u64)acc[2 * k + 1] << 32));
-        checked[word_idx + k] = a & valid[k];
-        c += (u32)popcount(~a & valid[k]);
-    }
-    // One atomic per subgroup reserves space for all of its misses.
-    const u32 off = sub_group_scan_exclusive_add(c);
-    const u32 tot = sub_group_reduce_add(c);
-    u32 base = 0;
-    if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
-    base = sub_group_broadcast(base, 0) + off;
-    if (c) {
-        #pragma unroll
-        for (u32 k = 0; k < A_W64; ++k) {
-            if (valid[k] == 0UL) continue;
-            const u64 a = ((u64)acc[2 * k] | ((u64)acc[2 * k + 1] << 32));
-            u64 miss = ~a & valid[k];
-            while (miss) {
-                const u32 b = (u32)ctz(miss);
-                miss &= miss - 1UL;
-                if (base < pending_cap) pending[base] = (u32)((word_idx + k) * 64UL + b);
-                ++base;
-            }
-        }
-    }
-}
-
+// Phase-A item width in 64-bit words (MUST match gb::CHECK_PHASE_A_W64).
+// v1.13.0: 14 (896 evens per item): the mod-30 checker spilled ~26 registers
+// at 16 (12: spill-free, -1.0% total; 14 spills ~12 but -0.28% / -0.22% more
+// on long / long-end; 8: +0.3%, 10: +0.04%).
+#define A_W64 12               // 14 -> 12 after C30_ROT (spill-free, +0.2%)
 #ifndef PROBE_BATCH
 #define PROBE_BATCH 4            // v1.13.0 (mod-30 phase B): 4 -0.1% vs 8; 16 +0.15%
 #endif
-/// Phase B: candidates [cand_cap, gb_count) per pending even.
-/// @post   each pending even gets its checked[] bit or a leftover entry.
-__kernel void check_phase_b(
-        __global const u64* restrict prime_map,
-        __global u64* restrict checked,
-        __global const u16* restrict gb_primes,
-        const u32 gb_count,
-        __global const u32* restrict pending,
-        __global const u32* restrict pending_count,
-        __global u32* restrict leftovers,
-        __global u32* restrict leftover_count,
-        const u64 q_first,
-        const u64 q_odds,
-        const u64 seg_start,
-        const u32 cand_cap,
-        const u32 pending_cap,
-        __global u64* restrict ridge,                 // Goldbach ridge appends
-        const u32 ridge_thresh)                       // record p >= this; ~0u = off
-{
-    const __global u32* map32 = (const __global u32*)prime_map;
-    const u32 n = min(*pending_count, pending_cap);
-    const u32 j0 = min(gb_count, cand_cap);
-    const long Tbase = (long)seg_start - (long)q_first;
-    for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
-        const u32 e = pending[i];                // segment-local even index
-        bool ok = false;
-        u32 rp = 0u;                             // smallest witness p (ridge)
-        // Probes are independent, so they are issued PROBE_BATCH at a time
-        // (latency-bound: one dependent load chain per lane otherwise).
-        for (u32 j = j0; j < gb_count && !ok; j += PROBE_BATCH) {
-            u32 hit = 0u;
-            #pragma unroll
-            for (u32 u = 0; u < PROBE_BATCH; ++u) {
-                if (j + u >= gb_count) break;
-                const long p = gb_primes[j + u];
-                if (p == 2) continue;
-                const long qb = (long)e + ((Tbase - p) >> 1);   // q bit (Tbase - p even)
-                if (qb < 0 || (u64)qb >= q_odds) continue;
-                hit |= ((map32[qb >> 5] >> (qb & 31)) & 1u) << u;   // bit u = this probe
-            }
-            ok = hit != 0u;
-            if (ok) rp = (u32)gb_primes[j + (u32)ctz(hit)];
-        }
-        if (ok) {
-            if (rp >= ridge_thresh) {            // ascending list: first hit = ridge
-                const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
-                if (slot < RIDGE_CAP) {
-                    ridge[1 + 2u * slot] = seg_start + 2UL * (u64)e;
-                    ridge[2 + 2u * slot] = rp;
-                }
-            }
-            atomic_or((volatile __global u32*)checked + (e >> 5), 1u << (e & 31u));
-        } else {
-            const u32 slot = atom_inc(leftover_count);
-            if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
-        }
-    }
-}
-
-// ============================================================================
-// Class-split checker (v1.11.0): split_map + check_split_a + check_split_b.
-//
-// Why: every q = n - p divisible by 3 is composite (q > 3), and q = n - p is
-// divisible by 3 exactly when n = p (mod 3). The twin checker tests all
-// 1024 evens of an item against every candidate, so for the evens with
-// n = 1 or 2 (mod 3) — the hard ones, which set the item's funnel count —
-// only ONE of a twin funnel's two tests can ever succeed. Here the evens are
-// grouped by n mod 3 and the map by q mod 6, so every test of a funnel is
-// useful:
-//   n = 0 (mod 3): candidates p = 1 (mod 6), q = 5 (mod 6)   (S5, list L1)
-//   n = 2 (mod 3): candidates p = 1 (mod 6), q = 1 (mod 6)   (S1, list L1)
-//   n = 1 (mod 3): candidates p = 5 (mod 6), q = 5 (mod 6)   (S5, list L5)
-// In the split maps S1 / S5 (bit t <-> the t-th odd q of that residue class
-// mod 6, i.e. dense bit 3t + phi), consecutive bits are q and q + 6, and a
-// class's evens are n, n + 6, ...: the same shifted-bitset funnel applies.
-// A funnel ORs several map shifts (pattern mask, bit d <-> q - 6d, i.e.
-// candidate p + 6d), so one funnel tests e.g. p, p + 6, p + 12 when all three
-// are prime (sexy-prime triplets, then pairs): measured on real maps near
-// 4e18, 35 such funnels leave 0.1% of the evens pending vs 100 twin funnels.
-// Every set bit is still a genuine witness (the OR of map bits of q - 6d
-// with every p + 6d prime <= MAX_GB_PRIME). Phase B probes, per class, the
-// candidates phase A did not test — useful residues first, then the
-// futile ones (they can only hit q = 3, i.e. at the bottom of the range, or
-// on synthetic test maps), so the final checked set and leftover set are
-// exactly those of a per-even scan over all candidates.
-// ============================================================================
-
-// Bits 0, 3, 6, ..., 30 of x packed into bits 0..10.
-inline u32 cmp3(u32 x)
-{
-    x &= 0x49249249u;
-    x = (x | (x >> 2))  & 0xC30C30C3u;
-    x = (x | (x >> 4))  & 0x0F00F00Fu;
-    x = (x | (x >> 8))  & 0xFF0000FFu;
-    x = (x | (x >> 16)) & 0x7FFu;
-    return x;
-}
-// Bits phi, phi + 3, ..., phi + 93 of the 128-bit x0..x3 (phi < 3).
-inline u32 split_word(const u32 x0, const u32 x1, const u32 x2, const u32 x3, const u32 phi)
-{
-    const u32 l = 31u - phi;                        // funnel, exact for phi = 0
-    const u32 y0 = (x0 >> phi) | ((x1 << l) << 1);
-    const u32 y1 = (x1 >> phi) | ((x2 << l) << 1);
-    const u32 y2 = (x2 >> phi) | ((x3 << l) << 1);
-    return cmp3(y0) | (cmp3(y1 >> 1) << 11) | (cmp3(y2 >> 2) << 22);
-}
-
-// S1[s] / S5[s] = dense bits 96 s + phi1 / phi5 at stride 3 (bits past the
-// map are 0; the map's own tail past q_odds is 0). Memory-bound (0.049 ms per
-// segment; a 4-words-per-lane vload4/vstore4 form measured 0.048).
-/// @pre    phi1, phi5 < 3; s_words * 3 covers the map.
-/// @post   s1[s] / s5[s] = split words of the dense map (0 past its end).
-__kernel void split_map(__global const u32* restrict map32, const u32 map32_words,
-                        __global u32* restrict s1, __global u32* restrict s5,
-                        const u32 s_words, const u32 phi1, const u32 phi5)
-{
-    const u32 s = get_global_id(0);
-    if (s >= s_words) return;
-    const u32 w = 3u * s;
-    const u32 x0 = (w      < map32_words) ? map32[w]      : 0u;
-    const u32 x1 = (w + 1u < map32_words) ? map32[w + 1u] : 0u;
-    const u32 x2 = (w + 2u < map32_words) ? map32[w + 2u] : 0u;
-    const u32 x3 = (w + 3u < map32_words) ? map32[w + 3u] : 0u;
-    s1[s] = split_word(x0, x1, x2, x3, phi1);
-    s5[s] = split_word(x0, x1, x2, x3, phi5);
-}
-
-// merge30 (cm = 2): the checker's S1 / S5 (bit t <-> q = Q + 6t, Q the first
-// q >= q_first of that class mod 6) from the mod-30 class arrays. Of the five
-// residues Q + 6j (j = t mod 5) four are coprime to 30 (class kmap nibble j)
-// and one is divisible by 5 (nibble 15: bit 0); Q + 6j is the first q of its
-// class, so S bit 5i + j = bit i of class array kmap(j).
-/// @pre    kmap1 / kmap5 nibble tables from the host (15 = divisible by 5).
-/// @post   s1 / s5 hold the mod-6 split maps rebuilt from the mod-30 arrays,
-///         with q = 5 restored at bit q5_t of S5.
-__kernel void merge30(__global const u32* restrict cmap32, const u32 cw32,
-                      __global u32* restrict s1, __global u32* restrict s5,
-                      const u32 s_words, const u32 kmap1, const u32 kmap5,
-                      const u32 q5_t)                  // S5 bit of q = 5 (prime, not stored), ~0: none
-{
-    // One lane = 5 output words (160 bits = S bits t = 160 L + 5i + j,
-    // i < 32): exactly the aligned word L of each of the four class arrays
-    // (bit i -> bit 5i + j). The stride-5 spread of a nibble is carry-free:
-    // ((x & 15) * 0x1111) & 0x8421 puts bit b at 5b.
-    const u32 per = (s_words + 4u) / 5u;               // lanes per S array
-    const u32 gid = get_global_id(0);
-    const u32 which = gid >= per ? 1u : 0u;
-    const u32 L = gid - which * per;
-    if (L >= per) return;
-    const u32 kmap = which ? kmap5 : kmap1;
-    u32 o[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-    #pragma unroll
-    for (u32 j = 0; j < 5u; ++j) {
-        const u32 k = (kmap >> (4u * j)) & 15u;
-        if (k == 15u) continue;                        // residue divisible by 5
-        const u32 x = (L < cw32) ? cmap32[(u64)k * cw32 + L] : 0u;
-        #pragma unroll
-        for (u32 n = 0; n < 8u; ++n) {
-            const u32 piece = (((x >> (4u * n)) & 15u) * 0x1111u) & 0x8421u;   // 16 bits
-            const u32 pos = 20u * n + j;
-            const u32 lo = pos >> 5, sh = pos & 31u;
-            o[lo] |= piece << sh;
-            if (sh > 16u) o[lo + 1u] |= piece >> (32u - sh);
-        }
-    }
-    __global u32* out = which ? s5 : s1;
-    const u32 w0 = 5u * L;
-    if (which && q5_t / 160u == L) o[(q5_t % 160u) >> 5] |= 1u << (q5_t & 31u);
-    #pragma unroll
-    for (u32 q = 0; q < 5u; ++q)
-        if (w0 + q < s_words) out[w0 + q] = o[q];
-}
-
-#define SPLIT_MAXD 2             // largest pattern shift (units of 6; host-checked)
-// Pattern OR of split-map word a (b = the word below it): bit j = OR over
-// d in mask of S bit 32 w + j - d (bit 0 of mask = d 0 is always set).
-/// @pre    bit 0 of mask set; shifts d <= SPLIT_MAXD < 32.
-inline u32 split_orp(const u32 a, const u32 b, const u32 mask)
-{
-    u32 v = a;
-    #pragma unroll
-    for (u32 d = 1; d <= SPLIT_MAXD; ++d)
-        if ((mask >> d) & 1u) v |= (a << d) | (b >> (32u - d));
-    return v;
-}
 /// @return S[w] when 0 <= w < n, else 0.
 inline u32 split_ld(const __global u32* S, const int w, const u32 n)
 {
     return ((u32)w < n) ? S[w] : 0u;                      // w < 0 wraps: out of range
-}
-
-// Phase A. One work-item = 1024 evens of ONE class (n mod 3 = c), the
-// evens e = e0_c + 3k, k in [1024 blk, +1024). Work-items are laid out
-// class-major with items_pad (a multiple of the work-group size) per class,
-// so every subgroup has one class, one candidate list and one uniform
-// funnel offset. meta (host-built, per list L1 at 0 and L5 at 16):
-//   [n_stages, (begin, end, mask) x n_stages] indexes into cands.
-// Funnel for candidate p: S bit U + k with U = (v_c - p) / 6 (exact; v_c =
-// Tbase + 2 (e0_c - phi) >= p + 6 * max shift, host-checked).
-/// @pre    plan from make_split_plan; v_c - p divisible by 6 for every
-///         candidate (host split_segment ok); items_pad multiple of the WG size.
-/// @post   as check_phase_a, per class (pending holds segment even indices).
-__kernel void check_split_a(
-        __global const u32* restrict s1,
-        __global const u32* restrict s5,
-        const u32 s_words,
-        __global u64* restrict checked,         // class c at c * chk_stride words
-        const u32 chk_stride,
-        __global const u16* restrict cands,
-        __global const u32* restrict meta,
-        __global u32* restrict pending,
-        __global u32* restrict pending_count,
-        const u32 pending_cap,
-        const u32 items_pad,
-        const u32 ec0, const u32 ec1, const u32 ec2,   // evens per class
-        const u32 e00, const u32 e01, const u32 e02,   // first even index per class
-        const int v0, const int v1, const int v2,
-        const u32 write_checked)                       // 0 in production (nothing reads it;
-                                                       // the 15.6 MB/segment store cost ~1%)
-{
-    const u32 gid = get_global_id(0);
-    const u32 c = gid / items_pad;                     // uniform per work-group
-    const u32 blk = gid - c * items_pad;
-    const u32 ec = (c == 0) ? ec0 : (c == 1) ? ec1 : ec2;
-    const u32 e0 = (c == 0) ? e00 : (c == 1) ? e01 : e02;
-    const int vc = (c == 0) ? v0 : (c == 1) ? v1 : v2;
-    const __global u32* S = (c == 2) ? s1 : s5;
-    const u32 mo = (c == 1) ? 16u : 0u;                // L5 for n = 1 (mod 3)
-    const u32 k0 = blk * (A_W64 * 64u);
-    const bool live = c < 3u && k0 < ec;               // no early return: subgroup ops below
-
-    u32 acc[2 * A_W64];
-    #pragma unroll
-    for (u32 i = 0; i < 2 * A_W64; ++i) {
-        const u32 kb = k0 + 32u * i;
-        const u32 n = (live && kb < ec) ? min(32u, ec - kb) : 0u;
-        acc[i] = (n >= 32u) ? 0u : ~((1u << n) - 1u);  // invalid bits count as resolved
-    }
-
-    if (live) {
-        const u32 ns = meta[mo];
-        bool done = false;
-        for (u32 st = 0; st < ns && !done; ++st) {
-            u32 j = meta[mo + 1u + 3u * st];
-            const u32 je = meta[mo + 2u + 3u * st];
-            const u32 mask = meta[mo + 3u + 3u * st];
-            if (j >= je) continue;
-            int U = (vc - (int)cands[j]) / 6;        // exact (host): may be < 0 at the range bottom
-            int tw = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);   // floor(U / 32)
-            int wb = (int)(k0 >> 5) + tw;
-            u32 m[2 * A_W64 + 1];
-            #pragma unroll
-            for (u32 i = 0; i <= 2 * A_W64; ++i) m[i] = split_ld(S, wb + i, s_words);
-            // Raw words below the window, loaded two slides ahead: in the
-            // sparse pattern lists nearly every funnel slides the window, and
-            // a load issued at the slide itself stalls the next funnel.
-            u32 r1 = split_ld(S, wb - 1, s_words);
-            u32 r2 = split_ld(S, wb - 2, s_words);
-            u32 r3 = split_ld(S, wb - 3, s_words);
-            u32 r4 = split_ld(S, wb - 4, s_words);
-            if (mask != 1u) {                          // uniform; in place, top down
-                #pragma unroll
-                for (u32 i = 2 * A_W64; i > 0; --i) m[i] = split_orp(m[i], m[i - 1], mask);
-                m[0] = split_orp(m[0], r1, mask);
-            }
-            // One flat loop over the stage's candidates (a nested slide loop
-            // compiled to ~100 register moves per slide): the window slides
-            // by one word in place (33 moves, next raw words preloaded), or
-            // is reloaded when the offset jumps further.
-            for (;;) {
-                const int twj = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);
-                if (tw - twj == 1) {                   // uniform
-                    tw = twj; --wb;
-                    #pragma unroll
-                    for (u32 i = 2 * A_W64; i > 0; --i) m[i] = m[i - 1];
-                    m[0] = split_orp(r1, r2, mask);
-                    r1 = r2; r2 = r3; r3 = r4;
-                    r4 = split_ld(S, wb - 4, s_words);
-                } else if (tw - twj == 2) {            // sparse lists: two words at once
-                    tw = twj; wb -= 2;
-                    #pragma unroll
-                    for (u32 i = 2 * A_W64; i > 1; --i) m[i] = m[i - 2];
-                    m[1] = split_orp(r1, r2, mask);
-                    m[0] = split_orp(r2, r3, mask);
-                    r1 = r3; r2 = r4;
-                    r3 = split_ld(S, wb - 3, s_words);
-                    r4 = split_ld(S, wb - 4, s_words);
-                } else if (tw != twj) {
-                    wb -= tw - twj; tw = twj;
-                    #pragma unroll
-                    for (u32 i = 0; i <= 2 * A_W64; ++i) m[i] = split_ld(S, wb + i, s_words);
-                    r1 = split_ld(S, wb - 1, s_words);
-                    r2 = split_ld(S, wb - 2, s_words);
-                    r3 = split_ld(S, wb - 3, s_words);
-                    r4 = split_ld(S, wb - 4, s_words);
-                    if (mask != 1u) {
-                        #pragma unroll
-                        for (u32 i = 2 * A_W64; i > 0; --i) m[i] = split_orp(m[i], m[i - 1], mask);
-                        m[0] = split_orp(m[0], r1, mask);
-                    }
-                }
-                const u32 r = (u32)U & 31u;
-                const u32 l = 31u - r;
-                #pragma unroll
-                for (u32 i = 0; i < 2 * A_W64; ++i)
-                    acc[i] |= (m[i] >> r) | ((m[i + 1] << l) << 1);
-                if (++j >= je) break;
-                U = (vc - (int)cands[j]) / 6;
-            }
-        }
-    }
-
-    u32 cnt = 0;
-    #pragma unroll
-    for (u32 i = 0; i < A_W64; ++i) {
-        const u32 kb = k0 + 64u * i;
-        if (!live || kb >= ec) continue;
-        const u64 a = (u64)acc[2 * i] | ((u64)acc[2 * i + 1] << 32);
-        const u32 n = min(64u, ec - kb);
-        const u64 valid = (n >= 64u) ? ~0UL : ((1UL << n) - 1UL);
-        if (write_checked) checked[(u64)c * chk_stride + (kb >> 6)] = a & valid;
-        cnt += (u32)popcount(~a & valid);
-    }
-    const u32 off = sub_group_scan_exclusive_add(cnt);
-    const u32 tot = sub_group_reduce_add(cnt);
-    u32 base = 0;
-    if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
-    base = sub_group_broadcast(base, 0) + off;
-    if (cnt) {
-        #pragma unroll
-        for (u32 i = 0; i < A_W64; ++i) {
-            const u32 kb = k0 + 64u * i;
-            if (kb >= ec) continue;
-            const u64 a = (u64)acc[2 * i] | ((u64)acc[2 * i + 1] << 32);
-            const u32 n = min(64u, ec - kb);
-            u64 miss = ~a & ((n >= 64u) ? ~0UL : ((1UL << n) - 1UL));
-            while (miss) {
-                const u32 b = (u32)ctz(miss);
-                miss &= miss - 1UL;
-                if (base < pending_cap) pending[base] = e0 + 3u * (kb + b);
-                ++base;
-            }
-        }
-    }
-}
-
-// Phase B of the class-split checker: one lane per pending even, probing its
-// class's rest list (rest + roff_c, rcnt_c entries) on the dense map; sets
-// the even's bit in the class-layout checked[] or reports a leftover.
-/// @post   each pending even gets its class-layout checked[] bit
-///         (write_checked) or a leftover entry.
-__kernel void check_split_b(
-        __global const u64* restrict prime_map,
-        __global u64* restrict checked,
-        const u32 chk_stride,
-        __global const u16* restrict rest,
-        const u32 roff0, const u32 roff1, const u32 roff2,
-        const u32 rcnt0, const u32 rcnt1, const u32 rcnt2,
-        __global const u32* restrict pending,
-        __global const u32* restrict pending_count,
-        __global u32* restrict leftovers,
-        __global u32* restrict leftover_count,
-        const u64 q_first,
-        const u64 q_odds,
-        const u64 seg_start,
-        const u32 pending_cap,
-        const u32 e00, const u32 e01, const u32 e02,
-        const u32 write_checked,
-        const u32 cm, const u32 phi1, const u32 phi5, const u32 off5,   // class mode
-        __global u64* restrict ridge,                 // Goldbach ridge appends
-        const u32 ridge_thresh)                       // record p >= this; ~0u = off
-{
-    const __global u32* map32 = (const __global u32*)prime_map;
-    const u32 n = min(*pending_count, pending_cap);
-    const long Tbase = (long)seg_start - (long)q_first;
-    const u32 sm3 = (u32)(seg_start % 3UL);
-    for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
-        const u32 e = pending[i];                      // segment-local even index
-        const u32 c = (sm3 + 2u * (e % 3u)) % 3u;      // n mod 3
-        const u32 ro = (c == 0) ? roff0 : (c == 1) ? roff1 : roff2;
-        const u32 rc = (c == 0) ? rcnt0 : (c == 1) ? rcnt1 : rcnt2;
-        const u32 e0 = (c == 0) ? e00 : (c == 1) ? e01 : e02;
-        bool ok = false;
-        u32 rp = 0u;                                   // smallest witness p (ridge)
-        for (u32 j = 0; j < rc && !ok; j += PROBE_BATCH) {
-            u32 hit = 0u;
-            #pragma unroll
-            for (u32 u = 0; u < PROBE_BATCH; ++u) {
-                if (j + u >= rc) break;
-                const long p = rest[ro + j + u];
-                const long qb = (long)e + ((Tbase - p) >> 1);
-                if (qb < 0 || (u64)qb >= q_odds) continue;
-                u32 ad = (u32)qb;
-                if (cm == 2u) {                          // mod-30 class map
-                    const cmap g = {cm, phi1, phi5, off5};
-                    const u32 t = ad / 15u, k = c30_class(ad - 15u * t, g);
-                    if (k == 15u) {                      // q divisible by 3 or 5: not stored
-                        const u64 q = q_first + 2UL * (u64)qb;
-                        hit |= ((q == 3UL || q == 5UL) ? 1u : 0u) << u;
-                        continue;
-                    }
-                    ad = k * off5 + t;
-                } else if (cm) {                         // class map (see map_clear)
-                    const u32 t = ad / 3u, ph = ad - 3u * t;
-                    if (ph == phi1) ad = t;
-                    else if (ph == phi5) ad = off5 + t;
-                    else { hit |= ((q_first + 2UL * (u64)qb == 3UL) ? 1u : 0u) << u; continue; }
-                }
-                hit |= ((map32[ad >> 5] >> (ad & 31u)) & 1u) << u;
-            }
-            ok = hit != 0u;
-            if (ok) rp = (u32)rest[ro + j + (u32)ctz(hit)];
-        }
-        if (ok) {
-            if (rp >= ridge_thresh) {                // useful residues first, so
-                const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
-                if (slot < RIDGE_CAP) {              // exact for n > MAX_GB_PRIME + 5
-                    ridge[1 + 2u * slot] = seg_start + 2UL * (u64)e;
-                    ridge[2 + 2u * slot] = rp;
-                }
-            }
-            if (!write_checked) continue;
-            const u32 k = (e - e0) / 3u;
-            atomic_or((volatile __global u32*)(checked + (u64)c * chk_stride) + (k >> 5),
-                      1u << (k & 31u));
-        } else {
-            const u32 slot = atom_inc(leftover_count);
-            if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
-        }
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2748,7 +1578,9 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 ///         a witness pair) — its checked[] bit is set when write_checked —
 ///         and otherwise e is appended to pending (atomic counter; entries
 ///         beyond pending_cap are counted but not stored: the host fails
-///         closed). The map is unchanged.
+///         closed). acct[0] += the evens it resolved (positive coverage: the
+///         host requires acct[0] + pending_count == seg_evens). The map is
+///         unchanged.
 __kernel void check30_a(
         __global const u32* restrict cmap32,     // 8 class arrays of cw32 u32 words
         const u32 cw32,
@@ -2764,7 +1596,8 @@ __kernel void check30_a(
         const u32 sm30,                          // seg_start mod 30
         const int tb,                            // seg_start - q_first
         const u32 phik,                          // dense phase of class k, nibble k
-        const u32 write_checked)
+        const u32 write_checked,
+        __global u32* restrict acct)             // [0] += evens resolved here
 {
     // class-interleaved groups: group g takes class g % 15 of block group
     // g / 15, so concurrently running groups read nearby map windows
@@ -2861,6 +1694,12 @@ __kernel void check30_a(
     cnt = 2u * A_W64 * 32u - cnt;
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
+    // positive coverage: the sub-group's lanes hold consecutive items of one
+    // class, so its valid evens are min(ec - k0 of lane 0, its width)
+    // (clamped at 0); resolved = valid - misses
+    const u32 k0s = k0 - get_sub_group_local_id() * (A_W64 * 64u);
+    const u32 vtot = (cr < 15u && k0s < ec) ? min(ec - k0s, get_sub_group_size() * (A_W64 * 64u)) : 0u;
+    if (get_sub_group_local_id() == 0 && vtot > tot) atomic_add(acct, vtot - tot);
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
@@ -2892,7 +1731,9 @@ __kernel void check30_a(
 ///         thresholds a ridge append / hist_p / first_p entry with the first
 ///         (smallest) such p. Otherwise e is appended to leftovers (counted
 ///         past MAX_LEFTOVERS: the host fails closed) for the exact CPU
-///         fallback. The map and pending are unchanged.
+///         fallback. acct[1] += the pending evens it resolved (the host
+///         requires acct[1] + leftover_count == pending_count). The map and
+///         pending are unchanged.
 __kernel void check30_b(
         __global const u64* restrict prime_map,
         __global u64* restrict checked,
@@ -2914,13 +1755,15 @@ __kernel void check30_b(
         __global u32* restrict hist_p,                // tail p(n) counts by p >> 1
         __global u32* restrict first_p,               // tail first even index by p >> 1
         __global const u32* restrict want_p,          // first_p bins still wanted
-        const u32 tail_t)                             // record p(n) >= this; ~0u = off
+        const u32 tail_t,                             // record p(n) >= this; ~0u = off
+        __global u32* restrict acct)                  // [1] += pending evens resolved here
 {
     const __global u32* map32 = (const __global u32*)prime_map;
     const cmap g = {2u, phi1, phi5, off5};
     const u32 n = min(*pending_count, pending_cap);
     const long Tbase = (long)seg_start - (long)q_first;
     const u32 sm30 = (u32)(seg_start % 30UL);
+    u32 nres = 0u;                                     // evens this lane resolved
     for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
         const u32 e = pending[i];                      // segment-local even index
         const u32 cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
@@ -2949,6 +1792,7 @@ __kernel void check30_b(
             if (ok) rp = (u32)rest[ro + j + (u32)ctz(hit)];
         }
         if (ok) {
+            ++nres;
             if (rp >= ridge_thresh) {                // useful residues first, so
                 const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
                 if (slot < RIDGE_CAP) {              // exact for n > MAX_GB_PRIME + 5
@@ -2970,6 +1814,8 @@ __kernel void check30_b(
             if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
         }
     }
+    const u32 rs = sub_group_reduce_add(nres);         // every lane has left the loop
+    if (get_sub_group_local_id() == 0 && rs) atomic_add(acct + 1, rs);
 }
 
 // ----------------------------------------------------------------------------
@@ -3598,7 +2444,7 @@ XS_KERNEL(check30_xs4, 4u, XS_W4)
 XS_KERNEL(check30_xs3, 3u, XS_W3)
 
 // ----------------------------------------------------------------------------
-// Hit lists for the bucketed primes (GB_HITLIST, replaces the bucket ring).
+// Hit lists for the largest primes (v2.3; replaced the bucket ring, removed in v2.6).
 // The bucket re-files every hit (8 B read + 8 B write + the wheel residue
 // recomputed from (off, p): two 60 KB table gathers) at ~140 ps per hit,
 // while a mark itself costs ~15 ps. Here each prime is touched once per batch
@@ -3617,6 +2463,15 @@ XS_KERNEL(check30_xs3, 3u, XS_W3)
 // ALL large primes.
 // ----------------------------------------------------------------------------
 #define HL_MAX_K 128
+// Device error flags of the hit lists (host: bkt_err, fails closed).
+#define BKT_ERR_ENTRY     1u    // a list entry outside its segment
+#define BKT_ERR_OVERFLOW  2u    // a region's capacity exceeded
+ulong __builtin_IB_lsc_load_global_ulong(__global ulong* base, int immElemOff, enum LSC_LDCC cacheOpt);
+/// Loads two list entries, bypassing L3 (the lists are streamed once).
+inline u64 bkt_load(const __global u64* p)
+{
+    return __builtin_IB_lsc_load_global_ulong((__global u64*)p, 0, (enum LSC_LDCC)LDCC_L1S_L3UC);
+}
 // q_odds of batch segment j (only the batch's last may be the run's short tail).
 #define HL_QO(j) (((j) == nseg - 1u) ? q_odds_tail : q_odds_full)
 /// Harvests the hits of primes [a, b) for segments [k0, k0 + nseg) of the batch.
