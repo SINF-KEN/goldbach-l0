@@ -1131,8 +1131,10 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         // Bucket only primes above max(q_odds_full, GB_BUCKET_MINP): below
         // ~9 x q_odds_full a prime's per-segment packed setup (~22 ps) is
         // cheaper than filing its ~q_odds/p entries (~200 ps each).
-        const uint64_t factor = midwin_on ? BUCKET_MIN_P_FACTOR_MIDWIN : BUCKET_MIN_P_FACTOR;
-        uint64_t minp = env::u64("GB_BUCKET_MINP", factor * q_odds_full);
+        const uint64_t minp_default = midwin_on
+            ? q_odds_full * BUCKET_MIN_P_FACTOR_MIDWIN_NUM / BUCKET_MIN_P_FACTOR_MIDWIN_DEN
+            : BUCKET_MIN_P_FACTOR * q_odds_full;
+        uint64_t minp = env::u64("GB_BUCKET_MINP", minp_default);
         minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
                                                  sieve_primes + sieve_count,
