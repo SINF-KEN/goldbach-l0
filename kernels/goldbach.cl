@@ -2264,7 +2264,9 @@ __kernel void make_prime_map(
                                             // (own_end == sieve_split disables it)
         __global const u64* restrict group_masks, // fused mask stage: per-group tables,
         __global const u32* restrict group_desc,  // (offset, period) per group
-        const u32 n_groups,                 // 0 = per-prime mask loop (stage 3a)
+        const u32 n_groups_xp,              // n_groups | xp << 8: groups (0 = per-prime mask
+                                            // loop, stage 3a); xp primes after the mask primes
+                                            // folded into them (mod-30 class map, GB_MASK_XP)
         // class mode (v1.11.0; cm = 0: dense map): tiles [0, tpc) build M1,
         // [tpc, 2 tpc) build M5 (at word tpc * TILE_WORDS); per class the host
         // tables are laid out back to back: fb_global at fb_stride, group
@@ -2276,6 +2278,7 @@ __kernel void make_prime_map(
                                                // canonical group tables (null: 0)
 {
     const u32 me   = get_local_id(0);
+    const u32 n_groups = n_groups_xp & 0xFFu;
     // ~1 for CLR_MASK_R, opaque to the compiler (q_odds < 2^32: the shift is
     // 0): a literal is re-materialized by two scalar movs in every mark loop
     // iteration (the rol takes no immediate); a register holds it once
@@ -2405,8 +2408,10 @@ __kernel void make_prime_map(
         // atomic OR: the medium stage's atomic ANDs on the
         // same word may already be running (they never clear q = p itself,
         // and OR / AND of different bits commute).
-        if (tile_id == 0 && q_first <= (u64)MASK_MAX_P) {
-            for (u32 j = 0; j < mask_count; ++j) {
+        // (and the folded primes, < 256: host caps them at 8)
+        if (tile_id == 0 && q_first <= 4UL * MASK_MAX_P) {
+            const u32 xr = (n_groups > 0) ? n_groups_xp >> 8 : 0u;
+            for (u32 j = 0; j < mask_count + xr; ++j) {
                 const u64 p = sieve_primes[j];
                 if (p < q_first) continue;         // q = p lies before the segment
                 u64 bit = (p - q_first) >> 1;      // global bit of q = p
@@ -2432,7 +2437,10 @@ __kernel void make_prime_map(
     // Primes [0, mask_count) were already applied by the mask path (stage 3a);
     // sieve_primes is ascending, so they are exactly the first mask_count.
     // Primes [sieve_split, sieve_count) are handled by sieve_large_primes.
-    const u32 j_begin = (mask_count > 0) ? mask_count : 0;
+    // the fused groups may also clear the next xp primes (host GB_MASK_XP:
+    // 67, 71, ...); the owned walk starts after them
+    const u32 xp = (n_groups > 0) ? n_groups_xp >> 8 : 0u;
+    const u32 j_begin = (mask_count > 0) ? mask_count + xp : 0;
 
     if (use_table) {
         // ---- table path -----------------------------------------------------

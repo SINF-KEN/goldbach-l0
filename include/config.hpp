@@ -182,6 +182,8 @@ inline constexpr uint64_t MIDWIN_P2_DEFAULT = 2500000;
 inline constexpr uint32_t MOD_FF_MIN_P = 4096;
 inline constexpr uint32_t MIDWIN_SPLIT = 1500;
 inline constexpr uint32_t MIDWIN_KB = 128;
+// make_prime_map: owned primes folded into the class-map mask groups (GB_MASK_XP)
+inline constexpr uint32_t MASK_XP_DEFAULT = 4;
 inline constexpr uint32_t MIDWIN_WG = 1024;
 
 // Small-prime mask sieve bound (must match MASK_MAX_P in kernels/goldbach.cl):

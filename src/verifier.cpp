@@ -476,6 +476,7 @@ private:
     bool use_table = false;
     uint32_t use_table_u32 = 0;
     uint32_t mask_period = 0;        // GB_MASK_PERIOD
+    uint32_t mask_xp = 0;            // GB_MASK_XP: owned primes folded into the mask groups
     uint32_t mask_groups_n = 0;      // fused mask groups (0: per-prime mask loop)
     size_t mask_group_words = 0;
     uint32_t* d_group_desc = nullptr;
@@ -952,15 +953,23 @@ void DenseRun::size_buffers() {
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
     mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
+    // 2026-11-18: the first MASK_XP owned primes (67, 71, 73, 79) are folded
+    // into the mod-30 class map's canonical mask groups, each into the group
+    // of smallest period (tables 75 KB -> 1.9 MB, no extra loads): the owned
+    // walk loses its densest primes. Bench +0.6% (long, long-end, 1e14);
+    // 3 and 5 measured slightly less, a new group of their own worse.
+    mask_xp = (class_mode && c30 && mask_count > 0)
+        ? std::min<uint32_t>(env::u32("GB_MASK_XP", MASK_XP_DEFAULT, 0, 8), own_end - mask_count) : 0u;
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
         mask_groups0 = class_mode   // sizes and descriptors (class maps: canonical grouping)
-            ? small_prime_group_masks_canonical(sieve_primes, mask_count, c30 ? 15u : 3u, mask_period)
+            ? small_prime_group_masks_canonical(sieve_primes, mask_count, c30 ? 15u : 3u, mask_period, mask_xp)
             : small_prime_group_masks(sieve_primes, mask_count, 3, mask_period);
     mask_groups_n = (mask_groups_on && mask_groups0.count() <= 8)
                                  ? mask_groups0.count() : 0u;
     mask_group_words = mask_groups0.words.size();
     d_group_desc = nullptr;
+    if (mask_groups_n == 0) mask_xp = 0;   // per-prime mask path: the owned walk takes them
     if (mask_groups_n > 0) {
         d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared(mask_groups0.desc.size() * 4));
         std::memcpy(d_group_desc, mask_groups0.desc.data(), mask_groups0.desc.size() * 4);
@@ -996,7 +1005,7 @@ void DenseRun::allocate_slot_buffers() {
         b.group_y[s] = static_cast<uint32_t*>(ctx.alloc_shared(8uz * MAX_MASK_GROUPS_HOST * 4));
         if (class_mode && mask_groups_n > 0) {   // canonical group tables: segment-independent
             const SmallPrimeGroups cg = small_prime_group_masks_canonical(
-                sieve_primes, mask_count, c30 ? 15u : 3u, mask_period);
+                sieve_primes, mask_count, c30 ? 15u : 3u, mask_period, mask_xp);
             if (cg.words.size() != mask_group_words)
                 throw std::runtime_error("class masks: canonical group layout mismatch");
             std::memcpy(b.group_masks[s], cg.words.data(), cg.words.size() * 8);
@@ -1769,7 +1778,7 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
                     // canonical tables (uploaded once): per class only the
                     // word offset of each group (primes.cpp)
                     const std::vector<uint32_t> ys = small_prime_group_offsets(
-                        sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period);
+                        sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period, mask_xp);
                     if (ys.size() != mask_groups_n)
                         throw std::runtime_error("class masks: group layout mismatch");
                     std::memcpy(b.group_y[sg.slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
@@ -1821,7 +1830,8 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     k_sieve.set_arg(15, sizeof(own_end),       &own_end);
     k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
     k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
-    k_sieve.set_arg(18, sizeof(mask_groups_n), &mask_groups_n);
+    const uint32_t groups_xp = mask_groups_n | mask_xp << 8;   // make_prime_map: n_groups_xp
+    k_sieve.set_arg(18, sizeof(groups_xp), &groups_xp);
     k_sieve.set_arg(19, 4, &cm_u32);
     k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
     k_sieve.set_arg(21, 4, &sg.phis);
