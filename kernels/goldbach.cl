@@ -574,6 +574,9 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef HL_END
 #define HL_END 1
 #endif
+#ifndef HL_FLAT
+#define HL_FLAT 1                // hl_harvest_mt: one loop over hits and words
+#endif
 #ifndef HL_APPLY_LAST
 #define HL_APPLY_LAST 1          // fused apply after the packed primes
 #endif
@@ -6582,6 +6585,59 @@ __kernel void hl_harvest_mt(
         const float pf = (float)p, xof = (float)xo;
         const u32 xlo = (u32)xo;
 #endif
+#if HL_FLAT
+        // one loop over the prime's hits and words (r7): an iteration takes
+        // one bit and, after a word's last bit, loads the next word, so the
+        // SIMD iterates max over lanes of sum max(hits, 1) per word instead
+        // of sum over words of the max popcount (~12 -> ~17.5 hits per
+        // iteration of 32 lanes, simulated)
+        if (wi < wx) {
+            u32 word = mt[wi] & (0xFFFFFFFFu << (w0 & 31u));
+            if (wi + 1u == wx) word &= mlast;
+            u32 kk = wi / 180u;
+            u32 dmb = (kk - kb) * 30030u - r0;
+            u32 lb = (wi - kk * 180u) * 32u;
+            for (;;) {
+                if (word) {
+                    const u32 bt = 31u - clz(word & (0u - word));
+                    word &= word - 1u;
+                    const u32 dm = dmb + lm[lb + bt];
+#if HL_FX
+                    // x = xo + p h < 2^35: j from a float estimate (abs error of
+                    // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                    // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                    const u32 h = dm >> 1;
+                    u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                    int o = (int)(xlo + p * h - j * delta);
+#else
+                    const u64 x = xo + (u64)p * (dm >> 1);
+                    u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
+                    int o = (int)((u32)x - j * delta);
+#endif
+                    while (o < 0) { o += (int)delta; --j; }
+                    while (o >= (int)delta) { o -= (int)delta; ++j; }
+                    const u32 off = (u32)o;
+                    if (j < nseg && off < HL_QO(j)) {
+                        const u32 idx = atomic_inc(&lpos[j]);
+                        if (idx < capg) lists[((size_t)j * ngrp + grp) * capg + idx] = off;
+                    }
+                    if (j >= 1u && j - 1u < nseg && off + delta < HL_QO(j - 1u)) {
+                        const u32 idx = atomic_inc(&lpos[j - 1u]);
+                        if (idx < capg) lists[((size_t)(j - 1u) * ngrp + grp) * capg + idx] = off + delta;
+                    }
+                }
+                if (!word) {
+                    if (++wi >= wx) break;
+                    word = mt[wi];
+                    if (wi + 1u == wx) word &= mlast;
+                    kk = wi / 180u;
+                    dmb = (kk - kb) * 30030u - r0;
+                    lb = (wi - kk * 180u) * 32u;
+                }
+            }
+        }
+    }
+#else
         u32 smask = 0xFFFFFFFFu << (w0 & 31u);
         for (; wi < wx; ++wi) {
             u32 word = mt[wi] & smask;
@@ -6620,6 +6676,7 @@ __kernel void hl_harvest_mt(
             }
         }
     }
+#endif
 #else
         u32 wi = kr * 180u + (w0 >> 5);
         u32 word = (wi < mt_words) ? mt[wi] & (0xFFFFFFFFu << (w0 & 31u)) : 0u;
