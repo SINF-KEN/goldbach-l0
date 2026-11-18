@@ -1098,8 +1098,12 @@ __kernel void make_prime_map(
     //   -> global word = (cls * tpc + tile_id) * TILE_WORDS + w
     // Bits beyond q_odds (last tile tail) are masked to 0 so the map is exact.
     __global u64* dst = prime_map + ((u64)cls * tpc + tile_id) * TILE_WORDS;
+    // Coalesced: word i * WG_SIZE + me (2026-11-18, sieve -1.5 ms per 1e11).
+    // Any thread may read any SLM word once every atomic is done: after the
+    // medium stage's barrier, or this one when that stage does not run.
+    if (!(own_end < sieve_split)) barrier(CLK_LOCAL_MEM_FENCE);   // uniform
     for (u32 i = 0; i < WORDS_PER_THREAD; ++i) {
-        const u32 w = my_word0 + i;
+        const u32 w = i * WG_SIZE + me;
         u64 v = tile[w];
         const u64 bit0 = tile_bit0 + (u64)w * 64UL;
         if (bit0 + 64UL > n_valid) {
