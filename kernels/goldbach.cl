@@ -2686,6 +2686,7 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
     else if ((mask) == 31u) C30_ORW1(31u); \
     else if ((mask) == 7u) C30_ORW1(7u); \
     else if ((mask) == 3u) C30_ORW1(3u); \
+    else if ((mask) == 5u) C30_ORW1(5u); \
     else C30_ORW1(mask); } while (0)
 
 // Phase A. One work-item = 64 * A_W64 evens of one class; items_pad items per
