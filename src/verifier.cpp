@@ -321,6 +321,7 @@ struct RunSetup {
 
     // ---- resolve_range ----------------------------------------------------
     uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS
+    uint32_t c30_b_groups = 0;       // GB_C30_BGROUPS (mod-30 phase B)
     // GB_C30_LATE (default on): count30 after the checker instead of beside
     // phase A, so it runs beside phase B and the next segment's tile sieve
     bool c30_late = env::onoff("GB_C30_LATE", true);
@@ -622,6 +623,7 @@ void RunSetup::resolve_range() {
     // refuses 0, which would skip phase B (pending evens never checked) or the
     // hit-list / bucket marks (composites left "prime") and still PASS.
     phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK_PHASE_B_GROUPS);
+    c30_b_groups = env_grid("GB_C30_BGROUPS", CHECK30_B_GROUPS);
     stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
     bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
     stats.limit = limit;
@@ -2652,8 +2654,8 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
     k_cb->set_arg(22, 4, &tail_t);
-    if (preb) k_cb->launch_overlap(ctx.list(), phase_b_groups, ev.check[sg.slot]);
-    else k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+    if (preb) k_cb->launch_overlap(ctx.list(), c30_b_groups, ev.check[sg.slot]);
+    else k_cb->launch(ctx.list(), c30_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
 /// Step 5d: the class-split checker, [split_map / merge30 ->] check_split_a
