@@ -3932,6 +3932,12 @@ __kernel void check_phase_a(
     }
 }
 
+// CB_FLAT (2026-11-18, r6b): flattened check30_b probe loop (lanes refill
+// themselves per even) on a small grid (CHECK30_B_GROUPS = 40, beside the
+// next tile sieve): period 1.662 -> 1.634 ms per segment at 4e18
+#ifndef CB_FLAT
+#define CB_FLAT 1
+#endif
 #ifndef PROBE_BATCH
 #define PROBE_BATCH 4            // v1.13.0 (mod-30 phase B): 4 -0.1% vs 8; 16 +0.15%
 #endif
@@ -4467,6 +4473,33 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 #ifndef CA_SG
 #define CA_SG 16
 #endif
+#ifndef CA_PAIR
+#define CA_PAIR 0
+#endif
+#ifndef ABL_WIN
+#define ABL_WIN 0
+#endif
+#ifndef CA_ONEWIN
+#define CA_ONEWIN 0
+#endif
+#ifndef ABL_LD
+#define ABL_LD 0
+#endif
+#ifndef ABL_CAND
+#define ABL_CAND 0
+#endif
+#ifndef ABL_MASK1
+#define ABL_MASK1 0
+#endif
+#ifndef ABL_ONEF
+#define ABL_ONEF 0
+#endif
+#ifndef CA_PRO
+#define CA_PRO 0
+#endif
+#ifndef ABL_FUN
+#define ABL_FUN 0
+#endif
 #if CA_SG
 __attribute__((intel_reqd_sub_group_size(CA_SG)))
 #endif
@@ -4500,11 +4533,21 @@ __kernel void check30_a(
     const bool live = cr < 15u && k0 < ec;             // no early return: subgroup ops below
 
     u32 acc[2 * A_W64];
+#if CA_PRO
+    // full items (all but the last item of a class): every bit valid, no
+    // per-word clamp (the general init below is ~10 ALU ops per word)
+    if (live && k0 + 64u * A_W64 <= ec) {
+        #pragma unroll
+        for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] = 0u;
+    } else
+#endif
+    {
     #pragma unroll
     for (u32 i = 0; i < 2 * A_W64; ++i) {
         const u32 kb = k0 + 32u * i;
         const u32 n = (live && kb < ec) ? min(32u, ec - kb) : 0u;
         acc[i] = (n >= 32u) ? 0u : ~((1u << n) - 1u);  // invalid bits count as resolved
+    }
     }
 
     if (live) {
@@ -4514,7 +4557,7 @@ __kernel void check30_a(
             const u32 sm = meta[mo + 2u + 2u * st];
             u32 j = be & 0xFFFFu;
             const u32 je = be >> 16;
-            const u32 s = sm & 0xFFu, mask = sm >> 8;
+            const u32 s = sm & 0xFFu, mask = ABL_MASK1 ? 1u : sm >> 8;
             const u32 k = W30_IDX[(r + 30u - s) % 30u];  // q class (host: a unit)
             const int vk = tb + 2 * (int)e0 - 2 * (int)((phik >> (4u * k)) & 15u);
             const __global u32* S = cmap32 + (u64)k * cw32;
@@ -4524,11 +4567,23 @@ __kernel void check30_a(
             const int U0 = (vk - (int)s) / 30;         // exact: vk = s (mod 30)
             int U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
             int tw = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);   // floor(U / 32)
+#if ABL_WIN
+            int wb = (int)((k0 >> 5) & (ABL_WIN - 1)) + 8 + tw;
+#else
             int wb = (int)(k0 >> 5) + tw;
+#endif
             u32 m[2 * A_W64 + 1];
             u32 r1, r2, r3, r4;
+#if CA_ONEWIN
+            // one window-load site (the reload branch below): forced by a
+            // fake previous word 2 above (halves the kernel's code size)
+            tw += 2; wb += 2;
+#elif ABL_LD
+            { const u32 z_ = ~((u32)wb & 0x80000000u); for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = z_ >> (i_ & 1u); r1 = r2 = r3 = r4 = z_; }
+#else
             C30_WIN(S, wb, cw32);
             C30_ORWIN(mask);
+#endif
             for (;;) {
                 const int twj = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);
                 if (tw - twj == 1) {                   // uniform
@@ -4540,9 +4595,39 @@ __kernel void check30_a(
                     r4 = split_ld(S, wb - 4, cw32);
                 } else if (tw != twj) {
                     wb -= tw - twj; tw = twj;
+#if ABL_LD
+                    { const u32 z_ = ~((u32)wb & 0x80000000u); for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = z_ >> (i_ & 1u); r1 = r2 = r3 = r4 = z_; }
+#else
                     C30_WIN(S, wb, cw32);
+#endif
                     C30_ORWIN(mask);
                 }
+#if CA_PAIR
+                // paired funnels (CA_PAIR): the next candidate in the same
+                // window word shares the window; one 3-input OR merges both
+                // funnels into acc (5 instead of 6 ALU ops per word)
+                if (j + 1u < je) {
+                    const int U2 = U0 - (int)(((u32)cands[j + 1u] * 34953u) >> 20);
+                    const int tw2 = (U2 >= 0) ? (U2 >> 5) : -((31 - U2) >> 5);
+                    if (tw2 == tw) {
+                        const u32 rr1 = (u32)U & 31u, rr2 = (u32)U2 & 31u;
+                        const u32 rl1 = 32u - rr1, rl2 = 32u - rr2;
+                        const u32 hm1 = 0xFFFFFFFFu >> rr1, hm2 = 0xFFFFFFFFu >> rr2;
+                        u32 rn1 = rotate(m[0], rl1), rn2 = rotate(m[0], rl2);
+                        #pragma unroll
+                        for (u32 i = 0; i < 2 * A_W64; ++i) {
+                            const u32 rc1 = rn1, rc2 = rn2;
+                            rn1 = rotate(m[i + 1], rl1);
+                            rn2 = rotate(m[i + 1], rl2);
+                            acc[i] |= bitselect(rn1, rc1, hm1) | bitselect(rn2, rc2, hm2);
+                        }
+                        j += 2u;
+                        if (j >= je) break;
+                        U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+                        continue;
+                    }
+                }
+#endif
                 const u32 rr = (u32)U & 31u;
                 // funnel by rotates: R = m rotated right by rr; the low
                 // 32 - rr bits of R[i] are m[i] >> rr, the high rr bits of
@@ -4550,6 +4635,23 @@ __kernel void check30_a(
                 // exact for rr = 0 too (hm = ~0) without a shift by 32.
                 const u32 rl = 32u - rr;                // rotate(x, 32) == x
                 const u32 hm = 0xFFFFFFFFu >> rr;
+#if ABL_FUN == 1
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= m[i] >> rr;
+#elif ABL_FUN == 2
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= rotate(m[i], rl);
+#elif ABL_FUN == 3
+                u32 rn = rotate(m[0], rl), rn2 = rotate(m[0], rl ^ 1u);
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) {
+                    const u32 rc = rn, rc2 = rn2;
+                    rn = rotate(m[i + 1], rl);
+                    rn2 = rotate(m[i + 1], rl ^ 1u);
+                    acc[i] |= bitselect(rn, rc, hm);
+                    acc[i] |= bitselect(rn2, rc2, hm ^ (hm >> 1));
+                }
+#else
                 u32 rn = rotate(m[0], rl);
                 #pragma unroll
                 for (u32 i = 0; i < 2 * A_W64; ++i) {
@@ -4557,8 +4659,16 @@ __kernel void check30_a(
                     rn = rotate(m[i + 1], rl);
                     acc[i] |= bitselect(rn, rc, hm);
                 }
+#endif
                 if (++j >= je) break;
+#if ABL_ONEF
+                break;
+#endif
+#if ABL_CAND
+                U = U0 - (int)((j * 7u) & 63u);
+#else
                 U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+#endif
             }
         }
     }
@@ -4642,6 +4752,71 @@ __kernel void check30_b(
     const u32 n = min(*pending_count, pending_cap);
     const long Tbase = (long)seg_start - (long)q_first;
     const u32 sm30 = (u32)(seg_start % 30UL);
+#if CB_FLAT
+    // Flattened probe loop (CB_FLAT): each lane runs one probe batch per
+    // iteration and refills itself with the next pending even as soon as
+    // its current one is resolved or exhausted, so a subgroup no longer
+    // waits for its slowest lane per even (the probes per even are
+    // geometric: mean ~3 batches, max over a subgroup ~10).
+    u32 i = get_global_id(0);
+    u32 e = 0u, cr = 0u, ro = 0u, rc = 0u, j = 0u;
+    bool have = false;
+    for (;;) {
+        if (!have) {
+            if (i >= n) break;
+            e = pending[i];
+            i += get_global_size(0);
+            cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
+            ro = rtab[cr]; rc = rtab[15u + cr]; j = 0u;
+            have = true;
+        }
+        u32 hit = 0u;
+        #pragma unroll
+        for (u32 u = 0; u < PROBE_BATCH; ++u) {
+            if (j + u >= rc) break;
+            const long p = rest[ro + j + u];
+            const long qb = (long)e + ((Tbase - p) >> 1);
+            if (qb < 0 || (u64)qb >= q_odds) continue;
+            const u32 ad0 = (u32)qb;
+            const u32 t = ad0 / 15u, k = c30_class(ad0 - 15u * t, g);
+            if (k == 15u) {                          // q divisible by 3 or 5: not stored
+                const u64 q = q_first + 2UL * (u64)qb;
+                hit |= ((q == 3UL || q == 5UL) ? 1u : 0u) << u;
+                continue;
+            }
+            const u32 ad = k * off5 + t;
+            hit |= ((map32[ad >> 5] >> (ad & 31u)) & 1u) << u;
+        }
+        if (hit) {
+            const u32 rp = (u32)rest[ro + j + (u32)ctz(hit)];
+            have = false;
+            if (rp >= ridge_thresh) {
+                const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
+                if (slot < RIDGE_CAP) {
+                    ridge[1 + 2u * slot] = seg_start + 2UL * (u64)e;
+                    ridge[2 + 2u * slot] = rp;
+                }
+            }
+            if (rp >= tail_t) {
+                atomic_add(hist_p + (rp >> 1), 1u);
+                if ((want_p[rp >> 6] >> ((rp >> 1) & 31u)) & 1u) atomic_min(first_p + (rp >> 1), e);
+            }
+            if (write_checked) {
+                const u32 e0 = ((2u * cr + 30u - sm30) % 30u) >> 1;
+                const u32 k = (e - e0) / 15u;
+                atomic_or((volatile __global u32*)(checked + (u64)cr * chk_stride) + (k >> 5),
+                          1u << (k & 31u));
+            }
+        } else {
+            j += PROBE_BATCH;
+            if (j >= rc) {
+                have = false;
+                const u32 slot = atom_inc(leftover_count);
+                if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
+            }
+        }
+    }
+#else
     for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
         const u32 e = pending[i];                      // segment-local even index
         const u32 cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
@@ -4691,6 +4866,7 @@ __kernel void check30_b(
             if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
         }
     }
+#endif
 }
 
 // ----------------------------------------------------------------------------

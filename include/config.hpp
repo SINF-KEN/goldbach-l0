@@ -119,6 +119,11 @@ inline constexpr uint64_t HL_MT_MINP_DEN = 20;
 // the rotate funnel (12 spill-free; +0.18% / +0.20% long / long-end).
 inline constexpr uint32_t CHECK_PHASE_A_W64    = 12;
 inline constexpr uint32_t CHECK_PHASE_B_GROUPS = 640;
+// Mod-30 phase B (check30_b, flattened probe loop CB_FLAT): a small grid that
+// runs beside the next segment's tile sieve instead of filling the GPU
+// (2026-11-18 r6b, 4e18 per segment: 640 groups 1.662 ms, 60 1.644, 40 1.634,
+// 30 1.644, 20 1.650; GB_C30_BGROUPS overrides).
+inline constexpr uint32_t CHECK30_B_GROUPS = 40;
 // Twin checker (v1.10.0): phase A funnels over the lower members of twin
 // pairs (two candidates per funnel, kernels/goldbach.cl tw32), then phase B
 // probes the candidates those pairs did not cover (GB_TWIN_CAP overrides;
