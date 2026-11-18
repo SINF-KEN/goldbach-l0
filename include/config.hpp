@@ -162,6 +162,9 @@ inline constexpr uint32_t MED_MIN_P = 256;
 // 253.0 (512) / 261.8 (640) ms — fewer, longer class tiles favour the
 // thread-owned walk for a few more primes.
 inline constexpr uint32_t MED_MIN_P_CLASS = 512;
+// With the mid-prime windows (medium primes up to the 1500th prime only,
+// load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
+inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
 // Mid-prime SLM windows (verifier.cpp, kernels/goldbach.cl mid_setup /
 // mid_window, HISTORY.md §9.2x): default prime bound (GB_MIDWIN overrides,
 // 0 = off), the auto split while the pass is on, the window in KB of SLM

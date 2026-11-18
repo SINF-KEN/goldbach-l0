@@ -674,6 +674,10 @@ inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
 // 0 that thread had 1.6-1.8x the mean. The first MED_SPLITN primes are two
 // items each (one per tile half) and the rows alternate direction (snake):
 // max / mean 1.15. 0 = one item per prime, rows in order.
+// Fused mask stage in the coalesced word order (2026-11-18, +0.1%)
+#ifndef MASK_COAL
+#define MASK_COAL 1
+#endif
 #ifndef MED_SPLITN
 #define MED_SPLITN 128
 #endif
@@ -793,14 +797,27 @@ __kernel void make_prime_map(
         // word index mod the product of its primes) and stored ONCE. The
         // per-prime path costs a global load plus an SLM read-modify-write
         // per prime (17) per word; this costs n_groups (7) loads per word.
+#if MASK_COAL
+        // Coalesced: word i * WG_SIZE + me (the barrier below orders these
+        // plain stores before every owner's walk), so a sub-group reads
+        // consecutive table entries instead of entries 8 words apart.
+        const u32 x = (u32)(tile_bit0 >> 6) + me;          // global word index < 2^32
+#else
         const u32 x = (u32)((tile_bit0 >> 6) + my_word0);  // global word index < 2^32
+#endif
         u32 ph[MAX_MASK_GROUPS], per[MAX_MASK_GROUPS], off[MAX_MASK_GROUPS];
+#if MASK_COAL
+        u32 stp[MAX_MASK_GROUPS];
+#endif
         #pragma unroll
         for (u32 g = 0; g < MAX_MASK_GROUPS; ++g) {
             if (g < n_groups) {
                 off[g] = group_desc[2 * g];
                 per[g] = group_desc[2 * g + 1];
                 ph[g] = x % per[g];
+#if MASK_COAL
+                stp[g] = (u32)WG_SIZE % per[g];
+#endif
                 if (group_y) {                  // canonical table: read word (x - Y) mod P
                     const u32 y = group_y[cls * MAX_MASK_GROUPS + g];
                     ph[g] = (ph[g] + per[g] - y) % per[g];
@@ -813,10 +830,19 @@ __kernel void make_prime_map(
             for (u32 g = 0; g < MAX_MASK_GROUPS; ++g) {
                 if (g < n_groups) {
                     v &= group_masks[off[g] + ph[g]];
+#if MASK_COAL
+                    ph[g] += stp[g];
+                    ph[g] -= (ph[g] >= per[g]) ? per[g] : 0u;
+#else
                     ph[g] = (ph[g] + 1u == per[g]) ? 0u : ph[g] + 1u;
+#endif
                 }
             }
+#if MASK_COAL
+            tile[i * WG_SIZE + me] = v;
+#else
             tile[my_word0 + i] = v;
+#endif
         }
     } else
     for (u32 i = 0; i < WORDS_PER_THREAD; ++i)

@@ -859,7 +859,7 @@ void DenseRun::set_group_sizes() {
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    const uint32_t med_min_p = env::u32("GB_MED_P", class_mode ? MED_MIN_P_CLASS : MED_MIN_P);
+    const uint32_t med_min_p = env::u32("GB_MED_P", !class_mode ? MED_MIN_P : midwin_pre ? MED_MIN_P_MIDWIN : MED_MIN_P_CLASS);
     own_end = std::clamp<uint32_t>(uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_split, med_min_p) -
         sieve_primes), mask_count, sieve_split);
