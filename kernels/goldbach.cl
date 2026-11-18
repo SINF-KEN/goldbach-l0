@@ -575,8 +575,8 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 #define MED_W7_MAXP 8192u
 #endif
 __constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
-inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0, const u32 qc7, const u32 s7)
+inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
+                          const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 nbits)
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
@@ -603,18 +603,18 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
     // setup and the 7-candidate tail cost more than the marks they skip
     // (low heights, split 36000: sieve +55 ms per 1e11 at 1e14).
     if (p == 7u || p > (u32)MED_W7_MAXP) {
-        for (; bit < (u32)TILE_BITS; bit += p)
+        for (; bit < nbits; bit += p)
             atomic_and(&t32[bit >> 5], CLR_MASK(bit));
         return;
     }
-    if (bit < (u32)TILE_BITS) {
+    if (bit < nbits) {
         const u32 q0 = (qc7 + s7 * (tile_bit0 + bit)) % 7u;      // class bits < 2^24
         const u32 k7 = ((7u - q0) * INV7[(s7 * p) % 7u]) % 7u;
         const u32 p6 = 6u * p, p7 = 7u * p;
         u32 o[6];
         #pragma unroll
         for (u32 t = 0; t < 6u; ++t) o[t] = (t + (t >= k7 ? 1u : 0u)) * p;
-        for (; bit + p6 < (u32)TILE_BITS; bit += p7) {
+        for (; bit + p6 < nbits; bit += p7) {
             #pragma unroll
             for (u32 t = 0; t < 6u; ++t) {
                 const u32 b = bit + o[t];
@@ -623,10 +623,16 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
         }
         for (u32 d = 0; d < 7u; ++d) {
             const u32 b = bit + d * p;
-            if (b >= (u32)TILE_BITS) break;
+            if (b >= nbits) break;
             if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK(b));
         }
     }
+}
+
+inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
+                          const u32 tile_bit0, const u32 qc7, const u32 s7)
+{
+    med_prime_f32n(t32, fb, p, tile_bit0, qc7, s7, (u32)TILE_BITS);
 }
 
 // One prime of the thread-owned walk (table path) in 32-bit / float
@@ -662,6 +668,15 @@ inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
 // Medium-stage load batch (v1.10.0). sieve_s per 2e10 window: unbatched
 // 0.0824, 2 -> 0.0775, 4 -> 0.0745, 8 -> 0.0728 (+3.6% total), 12 ties,
 // 16 spills (-3.7%); a two-stage pipeline on top measured no better.
+// Medium-stage load balance (2026-11-18): the medium primes are dealt to
+// the threads in rows of WG_SIZE, and the barrier after the stage waits for
+// the thread with the most marks: with p = 521 (215 marks per tile) in row
+// 0 that thread had 1.6-1.8x the mean. The first MED_SPLITN primes are two
+// items each (one per tile half) and the rows alternate direction (snake):
+// max / mean 1.15. 0 = one item per prime, rows in order.
+#ifndef MED_SPLITN
+#define MED_SPLITN 128
+#endif
 #ifndef MED_BATCH
 #define MED_BATCH 8
 #endif
@@ -1084,6 +1099,51 @@ __kernel void make_prime_map(
             sieve_primes[sieve_split - 1u] < (1u << 23)) {   // uniform (med_prime_f32 PRE)
             __global const u32* fb32 = (__global const u32*)fb_global;   // low words
             const u32 tb = (u32)tile_bit0;
+#if MED_SPLITN
+            // (only for short medium ranges, as the mid-window split's 1500:
+            // with many rows the imbalance is small and the index ALU costs,
+            // -1..-2% at split 36000)
+            if (sieve_split - own_end <= 16u * WG_SIZE)
+            // Items: the halves of the first m2 medium primes (most marks;
+            // one item per tile half), then one per remaining prime. Rows
+            // of WG_SIZE items alternate direction (a snake); MED_BATCH rows
+            // per load batch.
+            {
+                const u32 m2 = min((u32)MED_SPLITN, sieve_split - own_end);
+                const u32 nit = sieve_split - own_end + m2;
+                const u32 nrow = (nit + WG_SIZE - 1u) / WG_SIZE;
+                const u32 meo = WG_SIZE - 1u - me;
+                u32 r = 0;
+                for (; r + MED_BATCH <= nrow; r += MED_BATCH) {
+                    u32 fbv[MED_BATCH], pv[MED_BATCH], hv[MED_BATCH];
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 it = (r + u) * WG_SIZE + (((r + u) & 1u) ? meo : me);
+                        const u32 jj = own_end + ((it < 2u * m2) ? (it >> 1) : it - m2);
+                        hv[u] = (it < 2u * m2) ? (1u + (it & 1u)) : 0u;
+                        const bool ok = it < nit;
+                        fbv[u] = ok ? fb32[2u * jj] : 0xFFFFFFFFu;
+                        pv[u] = ok ? sieve_primes[jj] : 0u;
+                    }
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 h = (hv[u] == 2u) ? (u32)TILE_BITS / 2u : 0u;
+                        med_prime_f32n(t32 + (h >> 5), fbv[u], pv[u], tb + h, qc7v, s7v,
+                                       hv[u] ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                    }
+                }
+                for (; r < nrow; ++r) {
+                    const u32 it = r * WG_SIZE + ((r & 1u) ? meo : me);
+                    if (it >= nit) continue;
+                    const u32 jj = own_end + ((it < 2u * m2) ? (it >> 1) : it - m2);
+                    const u32 hs = (it < 2u * m2) ? (1u + (it & 1u)) : 0u;
+                    const u32 h = (hs == 2u) ? (u32)TILE_BITS / 2u : 0u;
+                    med_prime_f32n(t32 + (h >> 5), fb32[2u * jj], sieve_primes[jj], tb + h, qc7v, s7v,
+                                   hs ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                }
+                j = sieve_split;
+            }
+#endif
             for (; j + (MED_BATCH - 1) * WG_SIZE < sieve_split; j += MED_BATCH * WG_SIZE) {
                 u32 fbv[MED_BATCH], pv[MED_BATCH];
                 #pragma unroll
