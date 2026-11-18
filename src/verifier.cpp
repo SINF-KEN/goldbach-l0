@@ -324,6 +324,13 @@ struct RunSetup {
     // GB_C30_LATE (default on): count30 after the checker instead of beside
     // phase A, so it runs beside phase B and the next segment's tile sieve
     bool c30_late = env::onoff("GB_C30_LATE", true);
+    // GB_C30_PREB (default on, with GB_C30_LATE): count30 is launched after
+    // phase A's barrier BEFORE phase B, so its work-groups take their thread
+    // slots first and it ends earlier inside the next tile sieve (2026-11-18:
+    // tile kernel 0.567 -> 0.495 ms per segment, phase B 0.062 -> 0.121,
+    // gpu -0.9%)
+    bool c30_preb = env::onoff("GB_C30_PREB", true);
+    bool c30_done = false;           // this segment's count30 is already enqueued
     // GB_ML_OVERLAP (default on): no barrier between mid_window (atomic AND
     // store, MIDW_ANDST 2) and the packed large kernel, which then starts
     // beside the window pass's tail (+0.5%)
@@ -2422,7 +2429,8 @@ void DenseRun::enqueue_check(Segment& sg) {
     // ~1.5x as much). It only reads this slot's finished map (the barrier
     // before phase A follows the marks); the next mid_window barrier and the
     // host's wait on its event (collection) order everything after it.
-    if (stats_on && c30_late) enqueue_count30(sg, sampled);
+    if (stats_on && c30_late && !c30_done) enqueue_count30(sg, sampled);
+    c30_done = false;
     sg.enq_s = seconds_since(sg.t_enq);
     sg.launch_s = seconds_since(sg.t_launch0);
     sg.l3_s = seconds_since(sg.t_launch0);
@@ -2521,6 +2529,8 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
         else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
     }
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const bool preb = stats_on && c30_late && c30_preb;
+    if (preb) { enqueue_count30(sg, true); c30_done = true; }   // before phase B: see GB_C30_PREB
     k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
     k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
@@ -2540,7 +2550,9 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
     k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
     k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
-    k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
+    // (with count30 first, the barrier above already orders it after the variants)
+    if (preb) k_cxb->launch_overlap(ctx.list(), stats_b_groups, ev.check[sg.slot]);
+    else k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
 /// Step 5c: the mod-30 checker, check30_a -> barrier -> check30_b.
@@ -2569,6 +2581,10 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     // read the finished map; the barrier above follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    // GB_C30_PREB: count30 (reads the finished map only) between the barrier
+    // and phase B, both without a further barrier
+    const bool preb = stats_on && c30_late && c30_preb;
+    if (preb) { enqueue_count30(sg, false); c30_done = true; }
     k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
     k_cb->set_arg(2, 4, &chk_stride30);
@@ -2592,7 +2608,8 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_cb->set_arg(20, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
     k_cb->set_arg(22, 4, &tail_t);
-    k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+    if (preb) k_cb->launch_overlap(ctx.list(), phase_b_groups, ev.check[sg.slot]);
+    else k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
 /// Step 5d: the class-split checker, [split_map / merge30 ->] check_split_a
