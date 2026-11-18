@@ -267,6 +267,8 @@ inline u64 first_odd_multiple(const u64 p, const u64 q_first)
 // AND mask clearing bit (b mod 32) of a u32 word: ~(1 << (b & 31)) is and +
 // shl + not; rotate(~1, b) is one native rol (the count is taken mod 32).
 #define CLR_MASK(b) rotate(0xFFFFFFFEu, (u32)(b))
+// the same with ~1 in a register C1 (the hot loops: see make_prime_map's c1v)
+#define CLR_MASK_R(C1, b) rotate((C1), (u32)(b))
 typedef struct { u32 cm, phi1, phi5, off5; } cmap;
 // LSC cache-control operands of the IGC load / store builtins (IGC enum
 // values: LDCC 1 = L1UC_L3UC, 2 = L1UC_L3C, 5 = L1S_L3UC).
@@ -2079,7 +2081,8 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 #endif
 __constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
 inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 nbits)
+                          const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 nbits,
+                          const u32 c1)
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
@@ -2107,7 +2110,7 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
     // (low heights, split 36000: sieve +55 ms per 1e11 at 1e14).
     if (p == 7u || p > (u32)MED_W7_MAXP) {
         for (; bit < nbits; bit += p)
-            atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+            atomic_and(&t32[bit >> 5], CLR_MASK_R(c1, bit));
         return;
     }
     if (bit < nbits) {
@@ -2121,21 +2124,21 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
             #pragma unroll
             for (u32 t = 0; t < 6u; ++t) {
                 const u32 b = bit + o[t];
-                atomic_and(&t32[b >> 5], CLR_MASK(b));
+                atomic_and(&t32[b >> 5], CLR_MASK_R(c1, b));
             }
         }
         for (u32 d = 0; d < 7u; ++d) {
             const u32 b = bit + d * p;
             if (b >= nbits) break;
-            if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK(b));
+            if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK_R(c1, b));
         }
     }
 }
 
 inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0, const u32 qc7, const u32 s7)
+                          const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 c1)
 {
-    med_prime_f32n(t32, fb, p, tile_bit0, qc7, s7, (u32)TILE_BITS);
+    med_prime_f32n(t32, fb, p, tile_bit0, qc7, s7, (u32)TILE_BITS, c1);
 }
 
 // One prime of the thread-owned walk (table path) in 32-bit / float
@@ -2148,7 +2151,7 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
 ///         ANDs. make_prime_map depends on the atomics: no barrier separates
 ///         them from the medium stage.
 inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
-                          const u32 b0, const u32 b1)
+                          const u32 b0, const u32 b1, const u32 c1)
 {
     if (tf == 0xffffffffu) return;
     u32 bit = tf;
@@ -2165,7 +2168,7 @@ inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
     // A posted (non-returning) SLM atomic costs less than the load + store of
     // a plain RMW, although the thread owns the word (sieve -22 ms per 1e11).
     for (; bit < b1; bit += p)
-        atomic_and((volatile __local u32*)&t32[bit >> 5], CLR_MASK(bit));
+        atomic_and((volatile __local u32*)&t32[bit >> 5], CLR_MASK_R(c1, bit));
 }
 
 // Medium-stage load batch (v1.10.0). sieve_s per 2e10 window: unbatched
@@ -2273,6 +2276,11 @@ __kernel void make_prime_map(
                                                // canonical group tables (null: 0)
 {
     const u32 me   = get_local_id(0);
+    // ~1 for CLR_MASK_R, opaque to the compiler (q_odds < 2^32: the shift is
+    // 0): a literal is re-materialized by two scalar movs in every mark loop
+    // iteration (the rol takes no immediate); a register holds it once
+    // (2026-11-18: tile -0.4%, mid_window -2%)
+    const u32 c1v = 0xFFFFFFFEu ^ (u32)(q_odds >> 40);
     // cm 1: 2 classes (phis = phi1 | phi5 << 8); cm 2: 8 classes mod 30
     // (phis = 8 nibbles, phi_k = dense bit phase mod 15 of class k)
     const u32 cls = cm ? get_group_id(0) / tpc : 0u;
@@ -2466,18 +2474,18 @@ __kernel void make_prime_map(
                 }
                 #pragma unroll
                 for (u32 u = 0; u < TABLE_BATCH; ++u)     // consume current
-                    own_prime_f32(t32o, tfa[u], pva[u], b0, b1);
+                    own_prime_f32(t32o, tfa[u], pva[u], b0, b1, c1v);
                 #pragma unroll
                 for (u32 u = 0; u < TABLE_BATCH; ++u) { tfa[u] = tfb[u]; pva[u] = pvb[u]; }
             }
             if (preloaded) {
                 #pragma unroll
                 for (u32 u = 0; u < TABLE_BATCH; ++u)
-                    if (j + u < own_end) own_prime_f32(t32o, tfa[u], pva[u], b0, b1);
+                    if (j + u < own_end) own_prime_f32(t32o, tfa[u], pva[u], b0, b1, c1v);
                 j += TABLE_BATCH;
             }
             for (; j < own_end; ++j)
-                own_prime_f32(t32o, tile_first[trow + j], sieve_primes[j], b0, b1);
+                own_prime_f32(t32o, tile_first[trow + j], sieve_primes[j], b0, b1, c1v);
         } else
         {
         u32 j = j_begin;
@@ -2658,7 +2666,7 @@ __kernel void make_prime_map(
                     for (u32 u = 0; u < MED_BATCH; ++u) {
                         const u32 h = (hv[u] == 2u) ? (u32)TILE_BITS / 2u : 0u;
                         med_prime_f32n(t32 + (h >> 5), fbv[u], pv[u], tb + h, qc7v, s7v,
-                                       hv[u] ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                                       hv[u] ? (u32)TILE_BITS / 2u : (u32)TILE_BITS, c1v);
                     }
                 }
                 for (; r < nrow; ++r) {
@@ -2668,7 +2676,7 @@ __kernel void make_prime_map(
                     const u32 hs = (it < 2u * m2) ? (1u + (it & 1u)) : 0u;
                     const u32 h = (hs == 2u) ? (u32)TILE_BITS / 2u : 0u;
                     med_prime_f32n(t32 + (h >> 5), fb32[2u * jj], sieve_primes[jj], tb + h, qc7v, s7v,
-                                   hs ? (u32)TILE_BITS / 2u : (u32)TILE_BITS);
+                                   hs ? (u32)TILE_BITS / 2u : (u32)TILE_BITS, c1v);
                 }
                 j = sieve_split;
             }
@@ -2682,10 +2690,10 @@ __kernel void make_prime_map(
                 }
                 #pragma unroll
                 for (u32 u = 0; u < MED_BATCH; ++u)
-                    med_prime_f32(t32, fbv[u], pv[u], tb, qc7v, s7v);
+                    med_prime_f32(t32, fbv[u], pv[u], tb, qc7v, s7v, c1v);
             }
             for (; j < sieve_split; j += WG_SIZE)
-                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb, qc7v, s7v);
+                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb, qc7v, s7v, c1v);
         }
         if (cm) {                                       // class map: no wheel (uniform)
             for (; j + (MED_BATCH - 1) * WG_SIZE < sieve_split; j += MED_BATCH * WG_SIZE) {
@@ -5521,7 +5529,7 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
         u32 bit_ = (BIT);                                                          \
         MIDW_SKIP_INIT(bit_, P, WS)                                                \
         for (; bit_ < (WB); bit_ += (P)) {                                         \
-            if (MIDW_SKIP_TEST) atomic_and(&(V)[bit_ >> 5], CLR_MASK(bit_));       \
+            if (MIDW_SKIP_TEST) atomic_and(&(V)[bit_ >> 5], CLR_MASK_R(c1v, bit_)); \
             MIDW_SKIP_STEP                                                         \
         }                                                                          \
     }
@@ -5569,6 +5577,7 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     const u32 ph = (phis >> (4u * cls)) & 15u;
     const u32 nc = (q_odds > (u64)ph) ? (u32)((q_odds - ph + 14UL) / 15UL) : 0u;
     const u32 ws = w * win_bits;
+    const u32 c1v = 0xFFFFFFFEu ^ (u32)(q_odds >> 40);   // opaque ~1 (make_prime_map)
 #if MIDW_SKIP
     // class bit g has q = Q + 30 g, Q = q_first + 2 ph (the window's class):
     // q = 0 (mod m) iff g = z_m = -Q / 30 (mod m)
