@@ -565,6 +565,24 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef MQ_MAXP
 #define MQ_MAXP 60000000u
 #endif
+#ifndef MQ_V4
+#define MQ_V4 1
+#endif
+#ifndef MQ_RKT
+#define MQ_RKT 1
+#endif
+#ifndef MQ_HOIST
+#define MQ_HOIST 1
+#endif
+#ifndef HL_RKT
+#define HL_RKT 1
+#endif
+#ifndef HL_FX
+#define HL_FX 1
+#endif
+#ifndef HL_END
+#define HL_END 1
+#endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
 // < 130M 299.5, < 100M 294.7, < 80M 292.5, < 60M 290.7, < 40M 291.5).
@@ -574,7 +592,7 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #define SKR_R 215441u            // 17 * 19 * 23 * 29
 #define SKR_H 0x8208200u         // top bit of each field
 #define SKR_L 0x0410410u         // low bit of each field
-__constant uint WHL_SF[5760] = {
+__constant uint WHL_SF[5768] = {
     0x0410418u, 0x4514401u, 0x4D30022u, 0x5C01063u, 0x00628C1u, 0x08830E3u, 0x20E4832u, 0x3120C71u, 0x3941492u, 0x48124D3u, 0x6073C23u, 0x04D0881u,
     0x0CF10A3u, 0x2552902u, 0x3423831u, 0x3C44053u, 0x54A0CB2u, 0x64E1CF3u, 0x0943444u, 0x28508C2u, 0x3891901u, 0x40B2012u, 0x50F3051u, 0x5913872u,
     0x69548B7u, 0x2CC3482u, 0x3D044C3u, 0x5561011u, 0x5C11835u, 0x10B40D1u, 0x18D48F3u, 0x3131443u, 0x4822CA2u, 0x5863CE3u, 0x70C0833u, 0x1522091u,
@@ -1054,7 +1072,8 @@ __constant uint WHL_SF[5760] = {
     0x1844051u, 0x2064873u, 0x38C14D2u, 0x4902401u, 0x5122C22u, 0x6163C66u, 0x1CB2016u, 0x4C004D1u, 0x5420CF2u, 0x6461C21u, 0x6C82445u, 0x21200E1u,
     0x2940903u, 0x4032053u, 0x58938B2u, 0x68D48F3u, 0x0D31443u, 0x2422CA1u, 0x2C434C5u, 0x54E1051u, 0x5D01873u, 0x01630D2u, 0x1034007u, 0x4912CE2u,
     0x5953C11u, 0x6004432u, 0x7040871u, 0x0461092u, 0x14A20D4u, 0x3524043u, 0x4C10CA2u, 0x5C51CE3u, 0x00B3431u, 0x08D3C52u, 0x1910093u, 0x30018F1u,
-    0x3822003u, 0x5083863u, 0x68E04C2u, 0x0521501u, 0x0D41C12u, 0x1C12C53u, 0x34744B1u, 0x3C900D3u, 0x54F1822u, 0x6532861u, 0x6D53088u, 0x38E2471u
+    0x3822003u, 0x5083863u, 0x68E04C2u, 0x0521501u, 0x0D41C12u, 0x1C12C53u, 0x34744B1u, 0x3C900D3u, 0x54F1822u, 0x6532861u, 0x6D53088u, 0x38E2471u,
+    0x0410418u, 0x4514401u, 0x4D30022u, 0x5C01063u, 0x00628C1u, 0x08830E3u, 0x20E4832u, 0x3120C71u   // padding: entries 0..7 again (MQ_V4 loads up to 8 at w <= 5759)
 };
 // SKR_MR[o_i + (p mod r_i) r_i + (q mod r_i)] = q p^-1 mod r_i (the multiplier m of q = p m)
 __constant uchar SKR_MR[2020] = {
@@ -1190,7 +1209,7 @@ inline void mark_multiples_skr(volatile __global u64* prime_map, const u64 bit0,
 #endif
 #define SKR2_H 0x8102040u
 #define SKR2_L 0x0204081u
-__constant uint WHL_SF2[5760] = {
+__constant uint WHL_SF2[5768] = {
     0x0204081u, 0x2244891u, 0x264C993u, 0x2E5CB97u, 0x3A74E9Du, 0x3E7CF80u, 0x4A94006u, 0x520020Au, 0x000830Cu, 0x0818510u,
     0x1430816u, 0x2048B1Cu, 0x2450C1Eu, 0x3068F05u, 0x3879109u, 0x3C8120Bu, 0x4898291u, 0x5004495u, 0x061C79Bu, 0x163CB84u,
     0x1E4CD88u, 0x2254E8Au, 0x2A6508Eu, 0x2E6D190u, 0x367C114u, 0x5210803u, 0x0420A07u, 0x1038D0Du, 0x1440E0Fu, 0x2868099u,
@@ -1766,7 +1785,8 @@ __constant uint WHL_SF2[5760] = {
     0x446858Bu, 0x4C7878Fu, 0x5080891u, 0x0E04D9Bu, 0x120CE9Du, 0x1E25184u, 0x2A3C20Au, 0x324C40Eu, 0x3E64714u, 0x4A7CA1Au,
     0x4E84B1Cu, 0x0C09007u, 0x1011109u, 0x1C2818Fu, 0x2438393u, 0x4070A82u, 0x4880C86u, 0x4C88D88u, 0x5498F8Cu, 0x02A108Eu,
     0x0A0C012u, 0x1A2C41Au, 0x2644701u, 0x2E54905u, 0x3A6CC0Bu, 0x3E74D0Du, 0x4684F11u, 0x529D217u, 0x0000099u, 0x0C18380u,
-    0x1830686u, 0x204088Au, 0x244898Cu, 0x2C58B90u, 0x3870E96u, 0x3C78F98u, 0x489001Eu, 0x50A0203u, 0x5404305u, 0x1E44B15u
+    0x1830686u, 0x204088Au, 0x244898Cu, 0x2C58B90u, 0x3870E96u, 0x3C78F98u, 0x489001Eu, 0x50A0203u, 0x5404305u, 0x1E44B15u,
+    0x0204081u, 0x2244891u, 0x264C993u, 0x2E5CB97u, 0x3A74E9Du, 0x3E7CF80u, 0x4A94006u, 0x520020Au   // padding: entries 0..7 again (MQ_V4 loads up to 8 at w <= 5759)
 };
 __constant uchar SKR_MR2[5860] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
@@ -1938,6 +1958,91 @@ inline u32 skr2_wrap(const u32 T)
 #undef SKR_W
     return o;
 }
+// MQ_RK[b] = (bitmap, rank) of the odd residues r = 2 j + 1 mod 30030,
+// j in [32 b, 32 b + 32): bit j - 32 b set iff r is coprime to 30030; rank =
+// count of coprime odd residues below 2 (32 b) + 1 (= WHL_IDX of the first
+// one). Block 469 has bits only for j < 15015.
+__constant uint2 MQ_RK[470] = {
+    (uint2)(0x64B4CB01u, 0u), (uint2)(0x816D129Au, 13u), (uint2)(0x864A4C32u, 26u), (uint2)(0x2196820Du, 38u), (uint2)(0x5A0534C9u, 49u), (uint2)(0xA4996122u, 62u),
+    (uint2)(0x2D86114Cu, 74u), (uint2)(0x4A6882D1u, 86u), (uint2)(0x324A41B0u, 98u), (uint2)(0x0C349961u, 109u), (uint2)(0xD225264Bu, 121u), (uint2)(0x148A6894u, 135u),
+    (uint2)(0x6D30C225u, 146u), (uint2)(0x4B40B618u, 159u), (uint2)(0x12D108A6u, 171u), (uint2)(0x65A4C929u, 182u), (uint2)(0x914C30D8u, 196u), (uint2)(0xA2134496u, 208u),
+    (uint2)(0x49164229u, 220u), (uint2)(0xD82194CBu, 231u), (uint2)(0x84982D32u, 245u), (uint2)(0x28245B44u, 257u), (uint2)(0x83689683u, 268u), (uint2)(0x225865B0u, 281u),
+    (uint2)(0x48B2894Du, 293u), (uint2)(0x91252659u, 306u), (uint2)(0x34C36186u, 319u), (uint2)(0x69129A64u, 332u), (uint2)(0x5A0CB210u, 345u), (uint2)(0x96430DA4u, 356u),
+    (uint2)(0x2414C869u, 369u), (uint2)(0x896522D2u, 380u), (uint2)(0x821B4CA4u, 393u), (uint2)(0x4192D305u, 405u), (uint2)(0xCA45B00Au, 417u), (uint2)(0x16996922u, 429u),
+    (uint2)(0x24A6520Cu, 442u), (uint2)(0x0B6894D3u, 453u), (uint2)(0x30D26194u, 467u), (uint2)(0x4CB6102Cu, 479u), (uint2)(0xD1298648u, 491u), (uint2)(0xA4CB0912u, 503u),
+    (uint2)(0x64309A65u, 515u), (uint2)(0x534C1689u, 528u), (uint2)(0x86522D82u, 541u), (uint2)(0x61B4C909u, 553u), (uint2)(0x99283250u, 566u), (uint2)(0xA45340A6u, 577u),
+    (uint2)(0x2984912Cu, 589u), (uint2)(0x5A45B0C3u, 600u), (uint2)(0x36894512u, 614u), (uint2)(0x2D264948u, 626u), (uint2)(0xCA618693u, 638u), (uint2)(0x109A04B4u, 652u),
+    (uint2)(0x48A2116Du, 662u), (uint2)(0xC30CA658u, 674u), (uint2)(0x24C96896u, 687u), (uint2)(0x45225A21u, 700u), (uint2)(0x1B04B499u, 711u), (uint2)(0x12C22D86u, 724u),
+    (uint2)(0x45144A69u, 736u), (uint2)(0x992932CAu, 748u), (uint2)(0xA65B0434u, 762u), (uint2)(0x6890D301u, 775u), (uint2)(0xD0658483u, 786u), (uint2)(0xB2106D22u, 798u),
+    (uint2)(0x21A64B4Cu, 810u), (uint2)(0xCB291611u, 823u), (uint2)(0x10DA2524u, 836u), (uint2)(0x0C96986Cu, 847u), (uint2)(0x422D2053u, 860u), (uint2)(0xB48B4996u, 871u),
+    (uint2)(0x0D32D060u, 886u), (uint2)(0x5B44A299u, 897u), (uint2)(0x96910CA0u, 911u), (uint2)(0x64B08361u, 922u), (uint2)(0x0949324Au, 934u), (uint2)(0x24584896u, 945u),
+    (uint2)(0x6184D32Du, 956u), (uint2)(0x9A60944Au, 970u), (uint2)(0xB2816C12u, 982u), (uint2)(0x05A6184Cu, 994u), (uint2)(0xC94992C3u, 1005u), (uint2)(0x229A2530u, 1019u),
+    (uint2)(0x4C348965u, 1030u), (uint2)(0xD22C8613u, 1043u), (uint2)(0xB44A2992u, 1056u), (uint2)(0x29304A45u, 1069u), (uint2)(0x520C3699u, 1080u), (uint2)(0x04D12586u, 1093u),
+    (uint2)(0x45908B68u, 1104u), (uint2)(0x18653292u, 1116u), (uint2)(0x224B4CB6u, 1128u), (uint2)(0x2906D129u, 1142u), (uint2)(0xD225A4C8u, 1154u), (uint2)(0x96196C30u, 1167u),
+    (uint2)(0x2CA25348u, 1180u), (uint2)(0xC9099452u, 1192u), (uint2)(0x12D861A4u, 1204u), (uint2)(0x4426990Du, 1216u), (uint2)(0x832CA40Bu, 1228u), (uint2)(0x90C36116u, 1240u),
+    (uint2)(0x0D325A45u, 1252u), (uint2)(0x5948A489u, 1265u), (uint2)(0x86D32926u, 1277u), (uint2)(0x60B4C360u, 1291u), (uint2)(0x916D0218u, 1303u), (uint2)(0xA65A0CB0u, 1314u),
+    (uint2)(0x69968205u, 1327u), (uint2)(0xCA2534C9u, 1339u), (uint2)(0xB4986502u, 1353u), (uint2)(0x0D841B04u, 1365u), (uint2)(0x4A699253u, 1375u), (uint2)(0x32C044A4u, 1389u),
+    (uint2)(0x0C269169u, 1399u), (uint2)(0x5301A25Bu, 1411u), (uint2)(0x948B6094u, 1424u), (uint2)(0x6D32C225u, 1436u), (uint2)(0x4A4C9618u, 1450u), (uint2)(0x14C12926u, 1462u),
+    (uint2)(0x61A40B29u, 1473u), (uint2)(0x914C30DAu, 1485u), (uint2)(0xA2514C92u, 1498u), (uint2)(0x4992502Du, 1510u), (uint2)(0x9860B4C3u, 1522u), (uint2)(0x26092932u, 1535u),
+    (uint2)(0x2C845B44u, 1546u), (uint2)(0xC2299692u, 1558u), (uint2)(0x325A6590u, 1571u), (uint2)(0x48B68949u, 1584u), (uint2)(0xD1252611u, 1597u), (uint2)(0xB0CB4186u, 1609u),
+    (uint2)(0x65029A44u, 1622u), (uint2)(0x424CB291u, 1633u), (uint2)(0x96C30C26u, 1645u), (uint2)(0x25344869u, 1658u), (uint2)(0x192520DAu, 1670u), (uint2)(0x861A48B4u, 1682u),
+    (uint2)(0x6912D32Cu, 1694u), (uint2)(0x8A45A448u, 1708u), (uint2)(0x36994132u, 1719u), (uint2)(0x25A21B04u, 1732u), (uint2)(0x896804C3u, 1743u), (uint2)(0x32D26594u, 1754u),
+    (uint2)(0x48B4182Cu, 1768u), (uint2)(0xD129A64Bu, 1779u), (uint2)(0xA4C32814u, 1794u), (uint2)(0x6C00D865u, 1805u), (uint2)(0x434C1299u, 1817u), (uint2)(0x961225A2u, 1829u),
+    (uint2)(0x4134CB41u, 1841u), (uint2)(0x982D12D8u, 1853u), (uint2)(0xA45904A6u, 1866u), (uint2)(0x6896132Cu, 1878u), (uint2)(0x5260B0C3u, 1891u), (uint2)(0xA4894D32u, 1903u),
+    (uint2)(0x0D225908u, 1916u), (uint2)(0x8B6186D2u, 1926u), (uint2)(0x128A6434u, 1940u), (uint2)(0x4492916Du, 1951u), (uint2)(0xC30DA65Au, 1964u), (uint2)(0x24496990u, 1979u),
+    (uint2)(0x6422D821u, 1990u), (uint2)(0x194CB491u, 2001u), (uint2)(0x92532986u, 2014u), (uint2)(0x05B44A49u, 2027u), (uint2)(0x8869328Au, 2039u), (uint2)(0x065B0C16u, 2051u),
+    (uint2)(0x2894C225u, 2063u), (uint2)(0x5265948Bu, 2074u), (uint2)(0xB2184932u, 2088u), (uint2)(0x29A6434Cu, 2100u), (uint2)(0xC32906D1u, 2113u), (uint2)(0x30DA44A0u, 2126u),
+    (uint2)(0x4C961960u, 2137u), (uint2)(0x522D2043u, 2149u), (uint2)(0x94CA4996u, 2160u), (uint2)(0x2D30D821u, 2174u), (uint2)(0x1B40A609u, 2186u), (uint2)(0x969324A4u, 2197u),
+    (uint2)(0x65A0C149u, 2210u), (uint2)(0x894D225Au, 2222u), (uint2)(0x261140B6u, 2235u), (uint2)(0x6106C32Cu, 2246u), (uint2)(0x9A64944Bu, 2258u), (uint2)(0xB0912D10u, 2272u),
+    (uint2)(0x09865A4Cu, 2283u), (uint2)(0xC16816C3u, 2295u), (uint2)(0x22982534u, 2308u), (uint2)(0x4CB09965u, 2319u), (uint2)(0x9325821Bu, 2333u), (uint2)(0x34486982u, 2346u),
+    (uint2)(0x6812C245u, 2357u), (uint2)(0x5B083698u, 2368u), (uint2)(0x945325A4u, 2381u), (uint2)(0x64948B28u, 2394u), (uint2)(0x186D12D2u, 2406u), (uint2)(0xA24B4C26u, 2419u),
+    (uint2)(0x21169109u, 2432u), (uint2)(0xCA45A48Bu, 2442u), (uint2)(0x86996C30u, 2456u), (uint2)(0x2DA2504Cu, 2469u), (uint2)(0x4B489452u, 2481u), (uint2)(0x325861B4u, 2493u),
+    (uint2)(0x04A4912Cu, 2506u), (uint2)(0x922CA459u, 2516u), (uint2)(0x30C34992u, 2529u), (uint2)(0x4D320A65u, 2541u), (uint2)(0x59403689u, 2554u), (uint2)(0x82D20D06u, 2566u),
+    (uint2)(0x64A4CB21u, 2577u), (uint2)(0x91691218u, 2590u), (uint2)(0xA6524CB2u, 2601u), (uint2)(0x69864109u, 2615u), (uint2)(0xDA0530C9u, 2626u), (uint2)(0x94986522u, 2639u),
+    (uint2)(0x2D060B4Cu, 2651u), (uint2)(0x0A6992C3u, 2663u), (uint2)(0x30CA05B4u, 2676u), (uint2)(0x08321949u, 2688u), (uint2)(0xD124A65Bu, 2698u), (uint2)(0x84816894u, 2713u),
+    (uint2)(0x4932D264u, 2723u), (uint2)(0x0B44B618u, 2736u), (uint2)(0x16C129A4u, 2748u), (uint2)(0x6584CA29u, 2760u), (uint2)(0x892C30DAu, 2773u), (uint2)(0xA2134C94u, 2786u),
+    (uint2)(0x48965221u, 2798u), (uint2)(0xD861B0C3u, 2809u), (uint2)(0xA2992D22u, 2823u), (uint2)(0x24A45344u, 2836u), (uint2)(0x43699693u, 2847u), (uint2)(0x105A6530u, 2862u),
+    (uint2)(0x08B6880Du, 2873u), (uint2)(0x532D0458u, 2884u), (uint2)(0xB4CB6106u, 2896u), (uint2)(0x65129264u, 2910u), (uint2)(0x5A4CA291u, 2922u), (uint2)(0x86C30DA2u, 2935u),
+    (uint2)(0x25348961u, 2948u), (uint2)(0x996422C2u, 2960u), (uint2)(0x861A4894u, 2972u), (uint2)(0x2990D32Du, 2983u), (uint2)(0xCA41B44Au, 2997u), (uint2)(0x36916812u, 3010u),
+    (uint2)(0x25A6490Cu, 3022u), (uint2)(0x8B409093u, 3034u), (uint2)(0x32924594u, 3045u), (uint2)(0x4C26086Du, 3057u), (uint2)(0xD0298649u, 3069u), (uint2)(0xA4CB2816u, 3081u),
+    (uint2)(0x68305A61u, 3094u), (uint2)(0x530C9499u, 3106u), (uint2)(0x86502DA2u, 3119u), (uint2)(0x4130CB49u, 3131u), (uint2)(0x992532C8u, 3143u), (uint2)(0x244B44A6u, 3156u),
+    (uint2)(0x6992930Cu, 3168u), (uint2)(0x5825A0C2u, 3181u), (uint2)(0xB6014D30u, 3192u), (uint2)(0x28265948u, 3204u), (uint2)(0xC9618653u, 3215u), (uint2)(0x129A24A4u, 3229u),
+    (uint2)(0x4492904Du, 3240u), (uint2)(0xC30D261Au, 3251u), (uint2)(0x14896916u, 3264u), (uint2)(0x0522DA25u, 3276u), (uint2)(0x1B4CB099u, 3288u), (uint2)(0x92D12986u, 3302u),
+    (uint2)(0x44B44268u, 3315u), (uint2)(0x196922C8u, 3326u), (uint2)(0xA45B0C32u, 3338u), (uint2)(0x68949325u, 3351u), (uint2)(0xD265148Au, 3364u), (uint2)(0xB6086D12u, 3377u),
+    (uint2)(0x21A40B0Cu, 3390u), (uint2)(0xCB091651u, 3400u), (uint2)(0x20D264A0u, 3413u), (uint2)(0x4C86996Cu, 3423u), (uint2)(0x520CA253u, 3437u), (uint2)(0xB40B4196u, 3449u),
+    (uint2)(0x2D30C861u, 3462u), (uint2)(0x5A448699u, 3474u), (uint2)(0x14932C84u, 3487u), (uint2)(0x61B04369u, 3498u), (uint2)(0x8144321Au, 3511u), (uint2)(0x225948B6u, 3521u),
+    (uint2)(0x4182D32Du, 3534u), (uint2)(0x9264B4C9u, 3547u), (uint2)(0x32816C12u, 3561u), (uint2)(0x0D865A48u, 3572u), (uint2)(0xC92994C2u, 3584u), (uint2)(0x025A2534u, 3597u),
+    (uint2)(0x4C349961u, 3608u), (uint2)(0x912D8603u, 3621u), (uint2)(0xB04A6182u, 3633u), (uint2)(0x6132CA45u, 3644u), (uint2)(0x490C2699u, 3657u), (uint2)(0x94D32526u, 3669u),
+    (uint2)(0x21948A68u, 3683u), (uint2)(0x186D3052u, 3694u), (uint2)(0xA64B08B4u, 3706u), (uint2)(0x2916D028u, 3719u), (uint2)(0xCA6524C9u, 3730u), (uint2)(0x96994C30u, 3744u),
+    (uint2)(0x0DA21344u, 3757u), (uint2)(0xCB491242u, 3768u), (uint2)(0x32D86184u, 3780u), (uint2)(0x44A4912Du, 3792u), (uint2)(0x1328A45Bu, 3804u), (uint2)(0xB0C36896u, 3817u),
+    (uint2)(0x4D225825u, 3831u), (uint2)(0x59489288u, 3843u), (uint2)(0x86832526u, 3854u), (uint2)(0x64348B61u, 3866u), (uint2)(0x904D129Au, 3879u), (uint2)(0xA45A0CB2u, 3891u),
+    (uint2)(0x6996410Du, 3904u), (uint2)(0xD22434C1u, 3917u), (uint2)(0xA4196122u, 3929u), (uint2)(0x0D801B4Cu, 3940u), (uint2)(0x0A6192D3u, 3951u), (uint2)(0x32CA4594u, 3964u),
+    (uint2)(0x0C168969u, 3977u), (uint2)(0xD325A61Au, 3989u), (uint2)(0x900B4894u, 4004u), (uint2)(0x6C22D261u, 4014u), (uint2)(0x414CB610u, 4027u), (uint2)(0x12D128A6u, 4038u),
+    (uint2)(0x65A44B09u, 4050u), (uint2)(0x892C309Au, 4063u), (uint2)(0x82524C16u, 4075u), (uint2)(0x0916522Du, 4086u), (uint2)(0x1861B4CBu, 4098u), (uint2)(0xA6992132u, 4112u),
+    (uint2)(0x2CA05344u, 4125u), (uint2)(0xC1698691u, 4136u), (uint2)(0x325245B0u, 4149u), (uint2)(0x48B68944u, 4161u), (uint2)(0xD32D2649u, 4173u), (uint2)(0xB4CA2184u, 4188u),
+    (uint2)(0x6D109A24u, 4200u), (uint2)(0x4A483211u, 4212u), (uint2)(0x96830CA6u, 4222u), (uint2)(0x0524C961u, 4235u), (uint2)(0x994522DAu, 4246u), (uint2)(0x861944A4u, 4260u),
+    (uint2)(0x6812C32Du, 4271u), (uint2)(0x4A41944Au, 4284u), (uint2)(0x34992932u, 4295u), (uint2)(0x21A65B0Cu, 4308u), (uint2)(0x836894D2u, 4321u), (uint2)(0x22C06514u, 4334u),
+    (uint2)(0x44B2186Du, 4344u), (uint2)(0x9101A64Bu, 4357u), (uint2)(0x24CB2912u, 4369u), (uint2)(0x6C10D865u, 4381u), (uint2)(0x530C9690u, 4394u), (uint2)(0x965229A0u, 4406u),
+    (uint2)(0x20B4CB49u, 4418u), (uint2)(0x982D32D0u, 4431u), (uint2)(0x205B4486u, 4444u), (uint2)(0x6196830Cu, 4455u), (uint2)(0x4A65B083u, 4467u), (uint2)(0x92894D32u, 4480u),
+    (uint2)(0x2D265848u, 4493u), (uint2)(0x436184D1u, 4505u), (uint2)(0x129A60B4u, 4517u), (uint2)(0x4CB21168u, 4529u), (uint2)(0xC30DA458u, 4541u), (uint2)(0x14C84992u, 4554u),
+    (uint2)(0x65229A25u, 4565u), (uint2)(0x1B4C3489u, 4578u), (uint2)(0x92D22586u, 4591u), (uint2)(0x45B04A09u, 4604u), (uint2)(0x9969224Au, 4615u), (uint2)(0xA6530C36u, 4628u),
+    (uint2)(0x6884D124u, 4642u), (uint2)(0xD245900Bu, 4653u), (uint2)(0xB6182530u, 4665u), (uint2)(0x29064A4Cu, 4677u), (uint2)(0xCA2916D1u, 4688u), (uint2)(0x309A25A4u, 4702u),
+    (uint2)(0x48961964u, 4714u), (uint2)(0x522CA253u, 4726u), (uint2)(0xA4C94986u, 4739u), (uint2)(0x0C32D061u, 4752u), (uint2)(0x1B40A699u, 4763u), (uint2)(0x14832CA4u, 4776u),
+    (uint2)(0x6590C329u, 4787u), (uint2)(0x890D125Au, 4800u), (uint2)(0x26494834u, 4812u), (uint2)(0x60869329u, 4823u), (uint2)(0x9844B4C3u, 4835u), (uint2)(0xA2916D02u, 4848u),
+    (uint2)(0x05A6584Cu, 4860u), (uint2)(0xC9689683u, 4872u), (uint2)(0x025A2134u, 4886u), (uint2)(0x0CB49865u, 4896u), (uint2)(0x522D841Bu, 4909u), (uint2)(0x344A6992u, 4922u),
+    (uint2)(0x6932C244u, 4935u), (uint2)(0x5B042699u, 4947u), (uint2)(0x90D305A2u, 4960u), (uint2)(0x65848B60u, 4972u), (uint2)(0x106D32C0u, 4984u), (uint2)(0xA64A4C96u, 4995u),
+    (uint2)(0x29145129u, 5009u), (uint2)(0xDA21A44Bu, 5020u), (uint2)(0x96906C30u, 5034u), (uint2)(0x2D22514Cu, 5046u), (uint2)(0x8B499242u, 5058u), (uint2)(0x329861B4u, 5070u),
+    (uint2)(0x4422890Du, 5083u), (uint2)(0x902C845Bu, 5093u), (uint2)(0xB0C32996u, 5105u), (uint2)(0x49325A64u, 5119u), (uint2)(0x5148B609u, 5132u), (uint2)(0x86D12D24u, 5144u),
+    (uint2)(0x4490CA61u, 5157u), (uint2)(0x8165129Au, 5168u), (uint2)(0x260A4CB2u, 5180u), (uint2)(0x4996C305u, 5192u), (uint2)(0xDA2530C8u, 5205u), (uint2)(0xB4196520u, 5218u),
+    (uint2)(0x2C861348u, 5230u), (uint2)(0x486992D3u, 5241u), (uint2)(0x30CA45A4u, 5255u), (uint2)(0x04369909u, 5267u), (uint2)(0xC325861Au, 5278u), (uint2)(0x948B6814u, 5291u),
+    (uint2)(0x25329265u, 5303u), (uint2)(0x4B4CB418u, 5316u), (uint2)(0x06D129A2u, 5329u), (uint2)(0x65A4C128u, 5341u), (uint2)(0x996C20D0u, 5353u), (uint2)(0xA2534892u, 5365u),
+    (uint2)(0x09941225u, 5377u), (uint2)(0xD86134CBu, 5387u), (uint2)(0x26982D12u, 5402u), (uint2)(0x2CA44B04u, 5414u), (uint2)(0xC3619613u, 5425u), (uint2)(0x325244B0u, 5439u),
+    (uint2)(0x48A6894Du, 5450u), (uint2)(0xD30D2259u, 5463u), (uint2)(0xB48B6086u, 5477u), (uint2)(0x6D120A60u, 5490u), (uint2)(0x5A0C9091u, 5501u), (uint2)(0x94C20DA6u, 5512u),
+    (uint2)(0x21344969u, 5525u), (uint2)(0x916422CAu, 5537u), (uint2)(0x861944B4u, 5549u), (uint2)(0x4992D30Du, 5561u), (uint2)(0x8845A44Au, 5575u), (uint2)(0x36816932u, 5586u),
+    (uint2)(0x21865B0Cu, 5599u), (uint2)(0x8B289452u, 5611u), (uint2)(0x32522594u, 5623u), (uint2)(0x4C961869u, 5635u), (uint2)(0xC1292643u, 5648u), (uint2)(0xA08B2906u, 5660u),
+    (uint2)(0x4430DA45u, 5671u), (uint2)(0x434C9299u, 5683u), (uint2)(0x96502D22u, 5696u), (uint2)(0x20B4C249u, 5708u), (uint2)(0x192930D8u, 5719u), (uint2)(0xA45B40A6u, 5731u),
+    (uint2)(0x6996932Cu, 5744u), (uint2)(0x00000040u, 5759u),
+};
 /// mark_multiples_skr / _skr2 with the multiplier residues given (LARGE_MQ):
 /// m30 = m0 mod 30030, mr = m0 mod SKR_R, mr2 = m0 mod 31*37*41*43 of the
 /// odd multiple q = p m0 at bit0 — no WHL_INV gather, no inverse tables.
@@ -1949,6 +2054,35 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
     volatile __global u32* m32 = (volatile __global u32*)prime_map;
     u32 bit = bit0;
     if (bit >= n) return;
+#if MQ_RKT
+    // first multiplier coprime to 30030 from one (bitmap, rank) block (two
+    // when the next coprime residue lies in the following block): w = rank +
+    // popcount below it, instead of ~2.6 dependent WHL_IDX probes (round 6)
+    u32 w, k2;
+    {
+        const u32 j = m30 >> 1;                         // m30 odd: m30 = 2 j + 1
+        const uint2 e = MQ_RK[j >> 5];
+        const u32 bm = e.x & (0xFFFFFFFFu << (j & 31u));
+        u32 jj;
+        if (bm) {
+            const u32 b = ctz(bm);
+            jj = (j & ~31u) + b;
+            w = e.y + popcount(e.x & ((1u << b) - 1u));
+        } else {
+            const u32 nb = (j >> 5) + 1u;
+            const uint2 e2 = MQ_RK[(nb == 470u) ? 0u : nb];
+            const u32 b = ctz(e2.x);                    // every block has a coprime residue
+            jj = ((nb == 470u) ? 15015u : nb * 32u) + b;  // past 15014: wrapped to block 0
+            w = e2.y + popcount(e2.x & ((1u << b) - 1u));
+        }
+        const u32 dk = jj - j;                          // odd steps, <= 11
+        if (dk) {
+            if (n - bit <= p * dk) return;
+            bit += p * dk;
+        }
+        k2 = 2u * dk;
+    }
+#else
     u32 k2 = 0u;                                        // 2 * probes
     while (WHL_IDX[m30] == WHL_MISS) {
         if (n - bit <= p) return;
@@ -1957,7 +2091,33 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         m30 += 2u; if (m30 >= WHEEL_W) m30 -= WHEEL_W;
     }
     u32 w = WHL_IDX[m30];
+#endif
     mr += k2; mr -= (mr >= SKR_R) ? SKR_R : 0u;
+#if MQ_HOIST && MQ_V4 == 1
+    // the first 4 entries feed both the residue targets and the first visits
+    uint4 ev = vload4(0, WHL_SF + w);
+    uint4 fv = (uint4)(0u);
+    if (use2) fv = vload4(0, WHL_SF2 + w);
+    u32 T = 0x7DF7DF0u;                                  // no field can match (e < 32)
+    if (use1) {
+        const u32 e0 = ev.x >> 4;
+        T = 0u;
+#define MQ_F(i, r) { const u32 a = mr % r; const u32 x = (e0 >> (6u * i)) & 63u; \
+        T |= ((x >= a) ? x - a : x + r - a) << (4u + 6u * i); }
+        MQ_F(0u, 17u) MQ_F(1u, 19u) MQ_F(2u, 23u) MQ_F(3u, 29u)
+#undef MQ_F
+    }
+    u32 T2 = 0x7EFDFBFu;                                 // no field can match (e2 < 64)
+    if (use2) {
+        mr2 += k2; mr2 -= (mr2 >= 2022161u) ? 2022161u : 0u;
+        const u32 f0 = fv.x;
+        T2 = 0u;
+#define MQ_F(i, r) { const u32 a = mr2 % r; const u32 x = (f0 >> (7u * i)) & 127u; \
+        T2 |= ((x >= a) ? x - a : x + r - a) << (7u * i); }
+        MQ_F(0u, 31u) MQ_F(1u, 37u) MQ_F(2u, 41u) MQ_F(3u, 43u)
+#undef MQ_F
+    }
+#else
     u32 T = 0x7DF7DF0u;                                  // no field can match (e < 32)
     if (use1) {
         const u32 e0 = WHL_SF[w] >> 4;
@@ -1977,6 +2137,41 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         MQ_F(0u, 31u) MQ_F(1u, 37u) MQ_F(2u, 41u) MQ_F(3u, 43u)
 #undef MQ_F
     }
+#endif
+#if MQ_V4
+    // Four wheel entries per table load (round 6): the per-visit gathers of
+    // WHL_SF / WHL_SF2 (each lane its own w, ~one cache line per lane per
+    // message) bounded the loop; one d32x4 load per lane feeds 4 visits (the
+    // tables carry entries 0..3 again at 5760..5763, so a load at w <= 5759
+    // never runs off; the wrap still happens at the visit that reaches WHL_N).
+#define MQ_VISIT(E, F) { \
+        if (((((E ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H && \
+            (!use2 || ((((F ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H)) \
+            map_clear_chk(m32, bit, g); \
+        const u32 step = p * (E & 15u); \
+        if (n - bit <= step) break; \
+        bit += step; \
+        if (++w == WHL_N) { w = 0u; if (use1) T = skr_wrap(T); if (use2) T2 = skr2_wrap(T2); } }
+    for (;;) {
+#if MQ_V4 == 2
+        const uint8 ev = vload8(0, WHL_SF + w);
+        uint8 fv = (uint8)(0u);
+        if (use2) fv = vload8(0, WHL_SF2 + w);
+        MQ_VISIT(ev.s0, fv.s0) MQ_VISIT(ev.s1, fv.s1) MQ_VISIT(ev.s2, fv.s2) MQ_VISIT(ev.s3, fv.s3)
+        MQ_VISIT(ev.s4, fv.s4) MQ_VISIT(ev.s5, fv.s5) MQ_VISIT(ev.s6, fv.s6) MQ_VISIT(ev.s7, fv.s7)
+#elif MQ_HOIST
+        MQ_VISIT(ev.x, fv.x) MQ_VISIT(ev.y, fv.y) MQ_VISIT(ev.z, fv.z) MQ_VISIT(ev.w, fv.w)
+        ev = vload4(0, WHL_SF + w);
+        if (use2) fv = vload4(0, WHL_SF2 + w);
+#else
+        const uint4 ev = vload4(0, WHL_SF + w);
+        uint4 fv = (uint4)(0u);
+        if (use2) fv = vload4(0, WHL_SF2 + w);
+        MQ_VISIT(ev.x, fv.x) MQ_VISIT(ev.y, fv.y) MQ_VISIT(ev.z, fv.z) MQ_VISIT(ev.w, fv.w)
+#endif
+    }
+#undef MQ_VISIT
+#else
     for (;;) {
         const u32 e = WHL_SF[w];
         if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H &&
@@ -1987,6 +2182,7 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         bit += (u32)step;
         if (++w == WHL_N) { w = 0u; if (use1) T = skr_wrap(T); if (use2) T2 = skr2_wrap(T2); }
     }
+#endif
 }
 
 /// mark_multiples_skr with the second residue set too.
@@ -3187,7 +3383,19 @@ __kernel void prep_large_fb(
 // v1.13.0: 14 (896 evens per item): the mod-30 checker spilled ~26 registers
 // at 16 (12: spill-free, -1.0% total; 14 spills ~12 but -0.28% / -0.22% more
 // on long / long-end; 8: +0.3%, 10: +0.04%).
+#ifndef A_W64
 #define A_W64 12               // 14 -> 12 after C30_ROT (spill-free, +0.2%)
+#endif
+
+// CB_FLAT (2026-11-18, r6b): flattened check30_b probe loop (lanes refill
+// themselves per even) on a small grid (CHECK30_B_GROUPS = 40, beside the
+// next tile sieve): period 1.662 -> 1.634 ms per segment at 4e18
+#ifndef ABL_BSKIP
+#define ABL_BSKIP 0
+#endif
+#ifndef CB_FLAT
+#define CB_FLAT 1
+#endif
 #ifndef PROBE_BATCH
 #define PROBE_BATCH 4            // v1.13.0 (mod-30 phase B): 4 -0.1% vs 8; 16 +0.15%
 #endif
@@ -3221,6 +3429,22 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 // Vector loads (5 x vload8 from wb-4, one LSC message each) instead of 37
 // scalar loads: every lane reads its own lines, so each scalar SIMD load
 // touched 16 cache lines and window reloads were L1-throughput-bound.
+#if A_W64 != 12
+// generic width (experiments): 2 A_W64 + 5 words from wb - 4
+#define C30_WIN(S, wb, n) do { \
+    if ((wb) >= 4 && (wb) + 2 * A_W64 + 4 <= (int)(n)) { \
+        const __global u32* P_ = (S) + ((wb) - 4); \
+        u32 t_[((2 * A_W64 + 5) + 7) / 8 * 8]; \
+        _Pragma("unroll") for (u32 c_ = 0; c_ < (2 * A_W64 + 5) / 8; ++c_) vstore8(vload8(c_, P_), c_, t_); \
+        _Pragma("unroll") for (u32 c_ = (2 * A_W64 + 5) / 8 * 8; c_ < 2 * A_W64 + 5; ++c_) t_[c_] = P_[c_]; \
+        r4 = t_[0]; r3 = t_[1]; r2 = t_[2]; r1 = t_[3]; \
+        _Pragma("unroll") for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = t_[4 + i_]; \
+    } else { \
+        _Pragma("unroll") for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = split_ld((S), (wb) + i_, (n)); \
+        r1 = split_ld((S), (wb) - 1, (n)); r2 = split_ld((S), (wb) - 2, (n)); \
+        r3 = split_ld((S), (wb) - 3, (n)); r4 = split_ld((S), (wb) - 4, (n)); \
+    } } while (0)
+#else
 #define C30_WIN(S, wb, n) do { \
     if ((wb) >= 4 && (wb) + 28 <= (int)(n)) { \
         const __global u32* P_ = (S) + ((wb) - 4); \
@@ -3259,6 +3483,7 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
         r1 = split_ld((S), (wb) - 1, (n)); r2 = split_ld((S), (wb) - 2, (n)); \
         r3 = split_ld((S), (wb) - 3, (n)); r4 = split_ld((S), (wb) - 4, (n)); \
     } } while (0)
+#endif
 
 // Pattern OR of the whole window, in place top down; specialized for the
 // contiguous masks the plans use (a runtime-mask loop costs every shift).
@@ -3299,6 +3524,42 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
 #ifndef CA_SG
 #define CA_SG 16
 #endif
+// CA_PAIR (2026-11-18 r6b): two candidates of the same window word per
+// iteration, merged by one 3-input OR (phase A 0.267 -> 0.263 ms per segment,
+// +0.28% both bench windows); 2 = also pair across a one-word step (slower)
+#ifndef CA_PAIR
+#define CA_PAIR 1
+#endif
+#ifndef ABL_WIN
+#define ABL_WIN 0
+#endif
+#ifndef CA_ONEWIN
+#define CA_ONEWIN 0
+#endif
+#ifndef ABL_LD
+#define ABL_LD 0
+#endif
+#ifndef ABL_CAND
+#define ABL_CAND 0
+#endif
+#ifndef ABL_MASK1
+#define ABL_MASK1 0
+#endif
+#ifndef ABL_ONEF
+#define ABL_ONEF 0
+#endif
+#ifndef CA_SHF
+#define CA_SHF 0
+#endif
+#ifndef ABL_NOPEND
+#define ABL_NOPEND 0
+#endif
+#ifndef CA_PRO
+#define CA_PRO 0
+#endif
+#ifndef ABL_FUN
+#define ABL_FUN 0
+#endif
 #if CA_SG
 __attribute__((intel_reqd_sub_group_size(CA_SG)))
 #endif
@@ -3333,11 +3594,21 @@ __kernel void check30_a(
     const bool live = cr < 15u && k0 < ec;             // no early return: subgroup ops below
 
     u32 acc[2 * A_W64];
+#if CA_PRO
+    // full items (all but the last item of a class): every bit valid, no
+    // per-word clamp (the general init below is ~10 ALU ops per word)
+    if (live && k0 + 64u * A_W64 <= ec) {
+        #pragma unroll
+        for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] = 0u;
+    } else
+#endif
+    {
     #pragma unroll
     for (u32 i = 0; i < 2 * A_W64; ++i) {
         const u32 kb = k0 + 32u * i;
         const u32 n = (live && kb < ec) ? min(32u, ec - kb) : 0u;
         acc[i] = (n >= 32u) ? 0u : ~((1u << n) - 1u);  // invalid bits count as resolved
+    }
     }
 
     if (live) {
@@ -3347,7 +3618,7 @@ __kernel void check30_a(
             const u32 sm = meta[mo + 2u + 2u * st];
             u32 j = be & 0xFFFFu;
             const u32 je = be >> 16;
-            const u32 s = sm & 0xFFu, mask = sm >> 8;
+            const u32 s = sm & 0xFFu, mask = ABL_MASK1 ? 1u : sm >> 8;
             const u32 k = W30_IDX[(r + 30u - s) % 30u];  // q class (host: a unit)
             const int vk = tb + 2 * (int)e0 - 2 * (int)((phik >> (4u * k)) & 15u);
             const __global u32* S = cmap32 + (u64)k * cw32;
@@ -3357,11 +3628,23 @@ __kernel void check30_a(
             const int U0 = (vk - (int)s) / 30;         // exact: vk = s (mod 30)
             int U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
             int tw = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);   // floor(U / 32)
+#if ABL_WIN
+            int wb = (int)((k0 >> 5) & (ABL_WIN - 1)) + 8 + tw;
+#else
             int wb = (int)(k0 >> 5) + tw;
+#endif
             u32 m[2 * A_W64 + 1];
             u32 r1, r2, r3, r4;
+#if CA_ONEWIN
+            // one window-load site (the reload branch below): forced by a
+            // fake previous word 2 above (halves the kernel's code size)
+            tw += 2; wb += 2;
+#elif ABL_LD
+            { const u32 z_ = ~((u32)wb & 0x80000000u); for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = z_ >> (i_ & 1u); r1 = r2 = r3 = r4 = z_; }
+#else
             C30_WIN(S, wb, cw32);
             C30_ORWIN(mask);
+#endif
             for (;;) {
                 const int twj = (U >= 0) ? (U >> 5) : -((31 - U) >> 5);
                 if (tw - twj == 1) {                   // uniform
@@ -3373,9 +3656,58 @@ __kernel void check30_a(
                     r4 = split_ld(S, wb - 4, cw32);
                 } else if (tw != twj) {
                     wb -= tw - twj; tw = twj;
+#if ABL_LD
+                    { const u32 z_ = ~((u32)wb & 0x80000000u); for (u32 i_ = 0; i_ <= 2 * A_W64; ++i_) m[i_] = z_ >> (i_ & 1u); r1 = r2 = r3 = r4 = z_; }
+#else
                     C30_WIN(S, wb, cw32);
+#endif
                     C30_ORWIN(mask);
                 }
+#if CA_PAIR
+                // paired funnels (CA_PAIR): the next candidate in the same
+                // window word shares the window; one 3-input OR merges both
+                // funnels into acc (5 instead of 6 ALU ops per word)
+                if (j + 1u < je) {
+                    const int U2 = U0 - (int)(((u32)cands[j + 1u] * 34953u) >> 20);
+                    const int tw2 = (U2 >= 0) ? (U2 >> 5) : -((31 - U2) >> 5);
+                    if (tw2 == tw) {
+                        const u32 rr1 = (u32)U & 31u, rr2 = (u32)U2 & 31u;
+                        const u32 rl1 = 32u - rr1, rl2 = 32u - rr2;
+                        const u32 hm1 = 0xFFFFFFFFu >> rr1, hm2 = 0xFFFFFFFFu >> rr2;
+                        u32 rn1 = rotate(m[0], rl1), rn2 = rotate(m[0], rl2);
+                        #pragma unroll
+                        for (u32 i = 0; i < 2 * A_W64; ++i) {
+                            const u32 rc1 = rn1, rc2 = rn2;
+                            rn1 = rotate(m[i + 1], rl1);
+                            rn2 = rotate(m[i + 1], rl2);
+                            acc[i] |= bitselect(rn1, rc1, hm1) | bitselect(rn2, rc2, hm2);
+                        }
+                        j += 2u;
+                        if (j >= je) break;
+                        U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+                        continue;
+                    }
+#if CA_PAIR >= 2
+                    if (tw2 == tw - 1) {                 // second one word lower: m[-1] = r1
+                        const u32 rr1 = (u32)U & 31u, rr2 = (u32)U2 & 31u;
+                        const u32 rl1 = 32u - rr1, rl2 = 32u - rr2;
+                        const u32 hm1 = 0xFFFFFFFFu >> rr1, hm2 = 0xFFFFFFFFu >> rr2;
+                        u32 rn1 = rotate(m[0], rl1), rn2 = rotate(c30_orp(r1, r2, mask), rl2);
+                        #pragma unroll
+                        for (u32 i = 0; i < 2 * A_W64; ++i) {
+                            const u32 rc1 = rn1, rc2 = rn2;
+                            rn1 = rotate(m[i + 1], rl1);
+                            rn2 = rotate(m[i], rl2);
+                            acc[i] |= bitselect(rn1, rc1, hm1) | bitselect(rn2, rc2, hm2);
+                        }
+                        j += 2u;
+                        if (j >= je) break;
+                        U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+                        continue;
+                    }
+#endif
+                }
+#endif
                 const u32 rr = (u32)U & 31u;
                 // funnel by rotates: R = m rotated right by rr; the low
                 // 32 - rr bits of R[i] are m[i] >> rr, the high rr bits of
@@ -3383,6 +3715,33 @@ __kernel void check30_a(
                 // exact for rr = 0 too (hm = ~0) without a shift by 32.
                 const u32 rl = 32u - rr;                // rotate(x, 32) == x
                 const u32 hm = 0xFFFFFFFFu >> rr;
+#if ABL_FUN == 1
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= m[i] >> rr;
+#elif ABL_FUN == 2
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= rotate(m[i], rl);
+#elif ABL_FUN == 3
+                u32 rn = rotate(m[0], rl), rn2 = rotate(m[0], rl ^ 1u);
+                #pragma unroll
+                for (u32 i = 0; i < 2 * A_W64; ++i) {
+                    const u32 rc = rn, rc2 = rn2;
+                    rn = rotate(m[i + 1], rl);
+                    rn2 = rotate(m[i + 1], rl ^ 1u);
+                    acc[i] |= bitselect(rn, rc, hm);
+                    acc[i] |= bitselect(rn2, rc2, hm ^ (hm >> 1));
+                }
+#elif CA_SHF
+                // shift funnel (CA_SHF): rotates issue at ~half the rate
+                // of shifts on Xe2; rr = 0 (no shift) as its own branch
+                if (CA_SHF == 1 && rr == 0u) {                        // xor form: no common OR to sink
+                    #pragma unroll
+                    for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] ^= m[i] & ~acc[i];
+                } else {
+                    #pragma unroll
+                    for (u32 i = 0; i < 2 * A_W64; ++i) acc[i] |= (m[i] >> rr) | (m[i + 1] << rl);
+                }
+#else
                 u32 rn = rotate(m[0], rl);
                 #pragma unroll
                 for (u32 i = 0; i < 2 * A_W64; ++i) {
@@ -3390,8 +3749,16 @@ __kernel void check30_a(
                     rn = rotate(m[i + 1], rl);
                     acc[i] |= bitselect(rn, rc, hm);
                 }
+#endif
                 if (++j >= je) break;
+#if ABL_ONEF
+                break;
+#endif
+#if ABL_CAND
+                U = U0 - (int)((j * 7u) & 63u);
+#else
                 U = U0 - (int)(((u32)cands[j] * 34953u) >> 20);
+#endif
             }
         }
     }
@@ -3424,7 +3791,7 @@ __kernel void check30_a(
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
-    if (cnt) {
+    if (cnt && !ABL_NOPEND) {
         #pragma unroll
         for (u32 i = 0; i < 2 * A_W64; ++i) {
             u32 miss = ~acc[i];
@@ -3485,6 +3852,75 @@ __kernel void check30_b(
     const long Tbase = (long)seg_start - (long)q_first;
     const u32 sm30 = (u32)(seg_start % 30UL);
     u32 nres = 0u;                                     // evens this lane resolved
+#if CB_FLAT
+    // Flattened probe loop (CB_FLAT): each lane runs one probe batch per
+    // iteration and refills itself with the next pending even as soon as
+    // its current one is resolved or exhausted, so a subgroup no longer
+    // waits for its slowest lane per even (the probes per even are
+    // geometric: mean ~3 batches, max over a subgroup ~10).
+#if ABL_BSKIP
+    if (n > 0u) return;
+#endif
+    u32 i = get_global_id(0);
+    u32 e = 0u, cr = 0u, ro = 0u, rc = 0u, j = 0u;
+    bool have = false;
+    for (;;) {
+        if (!have) {
+            if (i >= n) break;
+            e = pending[i];
+            i += get_global_size(0);
+            cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
+            ro = rtab[cr]; rc = rtab[15u + cr]; j = 0u;
+            have = true;
+        }
+        u32 hit = 0u;
+        #pragma unroll
+        for (u32 u = 0; u < PROBE_BATCH; ++u) {
+            if (j + u >= rc) break;
+            const long p = rest[ro + j + u];
+            const long qb = (long)e + ((Tbase - p) >> 1);
+            if (qb < 0 || (u64)qb >= q_odds) continue;
+            const u32 ad0 = (u32)qb;
+            const u32 t = ad0 / 15u, k = c30_class(ad0 - 15u * t, g);
+            if (k == 15u) {                          // q divisible by 3 or 5: not stored
+                const u64 q = q_first + 2UL * (u64)qb;
+                hit |= ((q == 3UL || q == 5UL) ? 1u : 0u) << u;
+                continue;
+            }
+            const u32 ad = k * off5 + t;
+            hit |= ((map32[ad >> 5] >> (ad & 31u)) & 1u) << u;
+        }
+        if (hit) {
+            const u32 rp = (u32)rest[ro + j + (u32)ctz(hit)];
+            have = false;
+            ++nres;
+            if (rp >= ridge_thresh) {
+                const u32 slot = atomic_add((volatile __global u32*)ridge, 1u);
+                if (slot < RIDGE_CAP) {
+                    ridge[1 + 2u * slot] = seg_start + 2UL * (u64)e;
+                    ridge[2 + 2u * slot] = rp;
+                }
+            }
+            if (rp >= tail_t) {
+                atomic_add(hist_p + (rp >> 1), 1u);
+                if ((want_p[rp >> 6] >> ((rp >> 1) & 31u)) & 1u) atomic_min(first_p + (rp >> 1), e);
+            }
+            if (write_checked) {
+                const u32 e0 = ((2u * cr + 30u - sm30) % 30u) >> 1;
+                const u32 k = (e - e0) / 15u;
+                atomic_or((volatile __global u32*)(checked + (u64)cr * chk_stride) + (k >> 5),
+                          1u << (k & 31u));
+            }
+        } else {
+            j += PROBE_BATCH;
+            if (j >= rc) {
+                have = false;
+                const u32 slot = atom_inc(leftover_count);
+                if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
+            }
+        }
+    }
+#else
     for (u32 i = get_global_id(0); i < n; i += get_global_size(0)) {
         const u32 e = pending[i];                      // segment-local even index
         const u32 cr = ((sm30 + 2u * (e % 15u)) % 30u) >> 1;
@@ -3535,6 +3971,7 @@ __kernel void check30_b(
             if (slot < MAX_LEFTOVERS) leftovers[slot] = e;
         }
     }
+#endif
     const u32 rs = sub_group_reduce_add(nres);         // every lane has left the loop
     if (get_sub_group_local_id() == 0 && rs) atomic_add(acct + 1, rs);
 }
@@ -4886,15 +5323,105 @@ __kernel void hl_harvest_mt(
         while ((u64)(nh + 1u) * p <= rem) ++nh;
         const u32 dmax = 2u * nh;
         // first coprime multiplier >= m0
-        u32 kr = k0 - k_lo, rr = r0;
+        u32 kr = k0 - k_lo;
+#if HL_RKT
+        // the first coprime residue >= r0 and its wheel index from one MQ_RK
+        // block (two when it lies in the next block; r0 odd: m0 is odd)
+        u32 w0;
+        {
+            const u32 jr = r0 >> 1;
+            const uint2 e = MQ_RK[jr >> 5];
+            const u32 bm = e.x & (0xFFFFFFFFu << (jr & 31u));
+            if (bm) {
+                const u32 b = ctz(bm);
+                w0 = e.y + popcount(e.x & ((1u << b) - 1u));
+            } else {
+                const u32 nb = (jr >> 5) + 1u;
+                const uint2 e2 = MQ_RK[(nb == 470u) ? 0u : nb];
+                const u32 b = ctz(e2.x);
+                w0 = e2.y + popcount(e2.x & ((1u << b) - 1u));
+                kr += (nb == 470u) ? 1u : 0u;           // wrapped past 30030
+            }
+        }
+        if (k0 < k_lo) { atomic_or(err, 32u); continue; }
+#else
+        u32 rr = r0;
         while (WHL_IDX[rr] == WHL_MISS) { rr += 2u; if (rr >= 30030u) { rr -= 30030u; ++kr; } }
         if (k0 < k_lo) { atomic_or(err, 32u); continue; }
         // table word / bit of that multiplier (bit index kr 5760 + w exceeds
         // 2^32 beyond m_lo + 2.2e10: word = kr 180 + w / 32, 5760 = 180 * 32)
         const u32 w0 = WHL_IDX[rr];
+#endif
+#if HL_END
+        // the walk's last table bit from the last multiplier m0 + dmax (its
+        // rank in MQ_RK): no per-hit window test, no per-word stop lookup
+        u32 wi = kr * 180u + (w0 >> 5);
+        const u32 kb = k0 - k_lo;
+        u32 wx, mlast;                                  // words [wi, wx), last word's mask
+        {
+            const u32 rend = r0 + dmax;                 // < 2^31 (dmax < 2 wend / p)
+            const u32 kq = rend / 30030u, re = rend - kq * 30030u;
+            const u32 ke = kb + kq;                     // block of m0 + dmax
+            u32 c = 0u;                                 // coprime residues in [0, re]
+            if (re) {
+                const u32 jr = (re - 1u) >> 1;
+                const uint2 e = MQ_RK[jr >> 5];
+                c = e.y + popcount(e.x & ((2u << (jr & 31u)) - 1u));
+            }
+            wx = c ? ke * 180u + ((c - 1u) >> 5) + 1u : ke * 180u;
+            mlast = c ? (2u << ((c - 1u) & 31u)) - 1u : 0xFFFFFFFFu;
+        }
+        if (wx > mt_words) { atomic_or(err, 32u); continue; }
+#if HL_FX
+        const float pf = (float)p, xof = (float)xo;
+        const u32 xlo = (u32)xo;
+#endif
+        u32 smask = 0xFFFFFFFFu << (w0 & 31u);
+        for (; wi < wx; ++wi) {
+            u32 word = mt[wi] & smask;
+            smask = 0xFFFFFFFFu;
+            if (wi + 1u == wx) word &= mlast;
+            const u32 kk = wi / 180u;
+            const u32 dmb = (kk - kb) * 30030u - r0;
+            const u32 lb = (wi - kk * 180u) * 32u;
+            while (word) {
+                const u32 bt = 31u - clz(word & (0u - word));
+                word &= word - 1u;
+                const u32 dm = dmb + lm[lb + bt];
+#if HL_FX
+                // x = xo + p h < 2^35: j from a float estimate (abs error of
+                // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                const u32 h = dm >> 1;
+                u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                int o = (int)(xlo + p * h - j * delta);
+#else
+                const u64 x = xo + (u64)p * (dm >> 1);
+                u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
+                int o = (int)((u32)x - j * delta);
+#endif
+                while (o < 0) { o += (int)delta; --j; }
+                while (o >= (int)delta) { o -= (int)delta; ++j; }
+                const u32 off = (u32)o;
+                if (j < nseg && off < HL_QO(j)) {
+                    const u32 idx = atomic_inc(&lpos[j]);
+                    if (idx < capg) lists[((size_t)j * ngrp + grp) * capg + idx] = off;
+                }
+                if (j >= 1u && j - 1u < nseg && off + delta < HL_QO(j - 1u)) {
+                    const u32 idx = atomic_inc(&lpos[j - 1u]);
+                    if (idx < capg) lists[((size_t)(j - 1u) * ngrp + grp) * capg + idx] = off + delta;
+                }
+            }
+        }
+    }
+#else
         u32 wi = kr * 180u + (w0 >> 5);
         u32 word = (wi < mt_words) ? mt[wi] & (0xFFFFFFFFu << (w0 & 31u)) : 0u;
         const u32 kb = k0 - k_lo;
+#if HL_FX
+        const float pf = (float)p, xof = (float)xo;
+        const u32 xlo = (u32)xo;
+#endif
         for (;;) {
             if (wi >= mt_words) { atomic_or(err, 32u); break; }
             bool done = false;
@@ -4904,9 +5431,18 @@ __kernel void hl_harvest_mt(
                 const u32 kk = wi / 180u;
                 const u32 dm = (kk - kb) * 30030u + lm[(wi - kk * 180u) * 32u + bt] - r0;
                 if (dm > dmax) { done = true; break; }
+#if HL_FX
+                // x = xo + p h < 2^35: j from a float estimate (abs error of
+                // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                const u32 h = dm >> 1;
+                u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                int o = (int)(xlo + p * h - j * delta);
+#else
                 const u64 x = xo + (u64)p * (dm >> 1);
                 u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
                 int o = (int)((u32)x - j * delta);
+#endif
                 while (o < 0) { o += (int)delta; --j; }
                 while (o >= (int)delta) { o -= (int)delta; ++j; }
                 const u32 off = (u32)o;
@@ -4929,6 +5465,7 @@ __kernel void hl_harvest_mt(
             word = (wi < mt_words) ? mt[wi] : 0u;
         }
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lid < nseg) {
         const u32 c = lpos[lid];

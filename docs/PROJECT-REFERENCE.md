@@ -129,7 +129,7 @@ Validators depend on the `kernels` target.
 | `MAX_GB_PRIME` | 9781 | largest candidate prime needed (published 4e18 verification); ~1,206 primes, u16 (2.4 KB) |
 | `LARGE_PACK_PPI` / `LARGE_PACK_GROUP` | 16 / 512 | sieve_large_packed: primes per work-item / per packing group (host); MUST match LARGE_PACK_PPI / LARGE_PACK_SG in goldbach.cl |
 | `LARGE_WG_SIZE` | 128 | large-kernel work-group size (`GB_LARGE_WG` overrides: a multiple of 32 in [32, 1024]) |
-| `CHECK_PHASE_B_GROUPS` | 640 | check30_b grid-stride work-groups (`GB_CHECK_BGROUPS` overrides) |
+| `CHECK30_B_GROUPS` | 40 | check30_b grid-stride work-groups (flattened probe loop beside the next tile sieve; `GB_CHECK_BGROUPS` overrides) |
 | `MED_MIN_P` | 512 | tile-kernel primes >= this (and < split) use the prime-parallel SLM-atomic stage 3m; `GB_MED_P=N` overrides |
 | `CHECK30_PLAN` (include/check30.hpp) | 15 classes x 3-4 segments | mod-30 checker (production since v1.13.0, [§9.2j](HISTORY.md#92j-v1130--round-6--745-long---735-long-end-mod-30-checker)): per n mod 30 the (candidate class s, pattern mask, funnels) segments of phase A; `GB_C30_PLAN` overrides |
 | `CHECK_PHASE_A_W64` | 12 | phase-A item width in 64-bit words (768 evens); MUST match A_W64 (14 until 2026-10-05, [§9.2p](HISTORY.md#92p-re-tunes-after-the-round-tile-sieve-profile-2026-10-05)) |
@@ -289,7 +289,7 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_MIDWIN=N` / `GB_MIDWIN_KB` / `GB_MIDWIN_WG` | mid-prime SLM window pass: primes [split, N) in windows of KB of SLM with work-groups of WG (defaults 2500000 / 128 / 1024; `GB_MIDWIN=0` off and the auto split back to 36000) ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)) |
-| `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 640; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
+| `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 40; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
 | removed in v2.6 | `GB_SPLIT`, `GB_SPLIT_CAP`, `GB_SPLIT_STAGES`, `GB_TWIN_CAP`, `GB_C30`, `GB_CLASSMAP`, `GB_HITLIST`, `GB_MASK_GROUPS`: their pipelines (twin / class-split checkers, dense / mod-6 maps, bucket ring) are gone; setting one is an error before any GPU work, never silently ignored |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
 | `ZET_ENABLE_METRICS=1` | driver-side metrics enablement (+ `sysctl dev.xe.observation_paranoid=0`, Metrics Library; see §14) |

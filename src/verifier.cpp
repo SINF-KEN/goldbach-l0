@@ -299,7 +299,7 @@ struct RunSetup {
     }
 
     // ---- resolve_range ----------------------------------------------------
-    uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS
+    uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS (check30_b grid)
     // GB_C30_LATE (default on): count30 after the checker instead of beside
     // phase A, so it runs beside phase B and the next segment's tile sieve
     bool c30_late = env::onoff("GB_C30_LATE", true);
@@ -582,7 +582,7 @@ void RunSetup::resolve_range() {
     // Grid-stride work-group counts, validated before any GPU work: env_grid
     // refuses 0, which would skip phase B (pending evens never checked) or the
     // hit-list / bucket marks (composites left "prime") and still PASS.
-    phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK_PHASE_B_GROUPS);
+    phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK30_B_GROUPS);
     stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
     bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
     stats.limit = limit;
