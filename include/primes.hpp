@@ -161,7 +161,7 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
 ///                  any class, e.g. 3 for the mod-6 map).
 /// @param extra    the next @p extra primes (sieve_primes[mask_count], ...,
 ///                  >= 64) are folded into the groups too, each into the
-///                  group of smallest period (make_prime_map: GB_MASK_XP).
+///                  group of smallest period (make_prime_map: MASK_XP_DEFAULT).
 /// @return canonical tables with the same grouping as small_prime_group_masks_from.
 SmallPrimeGroups small_prime_group_masks_canonical(const uint32_t* sieve_primes,
                                                    uint32_t mask_count, uint32_t skip_mod,

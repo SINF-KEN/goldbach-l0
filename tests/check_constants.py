@@ -112,6 +112,13 @@ def main():
         same(f"XS_W_HOST[{i}] / {v}", xw[i], gbl[v])
     mg = re.search(r"MAX_MASK_GROUPS_HOST\s*=\s*(\d+)", read("src/verifier.cpp"))
     same("MAX_MASK_GROUPS (verifier.cpp)", int(mg.group(1)), gbl["MAX_MASK_GROUPS"])
+    same("MT_CB_HOST / MT_CB", cfg["MT_CB_HOST"], gbl["MT_CB"])
+    # kernel-internal exactness preconditions (docs/EXACTNESS.md)
+    same("kernel MASK_MAX_P > 61 (17..43 skip, 17..61 presieve)", True, gbl["MASK_MAX_P"] > 61)
+    same("SKR2_MAXP <= SKR_MAXP (second residue set needs the first)", True,
+         gbl["SKR2_MAXP"] <= gbl["SKR_MAXP"])
+    same("SKR_R = 17 * 19 * 23 * 29", 17 * 19 * 23 * 29, gbl["SKR_R"])
+    same("host MOD_FF_MIN_P >= 512", True, cfg["MOD_FF_MIN_P"] >= 512)
     hk = re.search(r"HL_MAX_K_HOST\s*=\s*(\d+)", read("src/verifier.cpp"))
     same("HL_MAX_K_HOST (verifier.cpp) / HL_MAX_K", int(hk.group(1)), gbl["HL_MAX_K"])
 

@@ -39,7 +39,6 @@ double seconds_since(clock_::time_point t0) {
 //
 //   d_prime_map   : odd-prime bitset for the current q segment
 //                   bit i  <->  q = q_first + 2*i
-//   d_checked     : bit-packed verification state, bit i <-> even n index i
 //   d_gb_primes   : uint16 candidate primes p <= 9781 (uploaded once)
 //   d_sieve_primes: uint32 base primes (uploaded once)
 //   d_leftovers   : uint32 indices of unresolved even numbers
@@ -53,7 +52,6 @@ struct GpuBuffers {
     // Per-slot buffers: the segment pipeline alternates between slot 0 and
     // slot 1 so segment k's GPU work overlaps segment k-1's host work.
     uint64_t* prime_map[2]  = {};  // odd-prime bitset for the q segment
-    uint64_t* checked[2]    = {};  // bit i <-> even n index i
     uint64_t* first_bits[2] = {};  // per-prime first markable bit (segment-global)
     uint64_t* mask_table[2] = {};  // small-prime word masks (per segment: q_first-dependent)
     uint32_t* leftovers[2]  = {};  // compact exception list
@@ -95,7 +93,11 @@ struct GpuBuffers {
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
 inline constexpr uint32_t HL_MAX_K_HOST = 256;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
-inline constexpr uint32_t HL_HARVEST_WG = 1024; // hl_harvest work-group size (GB_HLH_WG)
+// hl_harvest work-group size (2026-11-18: the scattered list stores are L2
+// write-combined; a larger group fills its regions' lines faster, harvest
+// -6 ms per 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST work-items.
+inline constexpr uint32_t HL_HARVEST_WG = 1024;
+static_assert(HL_HARVEST_WG >= HL_MAX_K_HOST && HL_HARVEST_WG <= 1024, "hl_harvest: group size");
 // Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
 // harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
 // 2026-11-18 (r7): K up to 256 within the list budget below: a batch has a
@@ -308,20 +310,6 @@ struct RunSetup {
 
     // ---- resolve_range ----------------------------------------------------
     uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS (check30_b grid)
-    // GB_C30_LATE (default on): count30 after the checker instead of beside
-    // phase A, so it runs beside phase B and the next segment's tile sieve
-    bool c30_late = env::onoff("GB_C30_LATE", true);
-    // GB_C30_PREB (default on, with GB_C30_LATE): count30 is launched after
-    // phase A's barrier BEFORE phase B, so its work-groups take their thread
-    // slots first and it ends earlier inside the next tile sieve (2026-11-18:
-    // tile kernel 0.567 -> 0.495 ms per segment, phase B 0.062 -> 0.121,
-    // gpu -0.9%)
-    bool c30_preb = env::onoff("GB_C30_PREB", true);
-    bool c30_done = false;           // this segment's count30 is already enqueued
-    // GB_ML_OVERLAP (default on): no barrier between mid_window (atomic AND
-    // store, MIDW_ANDST 2) and the packed large kernel, which then starts
-    // beside the window pass's tail (+0.5%)
-    bool ml_overlap = env::onoff("GB_ML_OVERLAP", true);
     uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
     uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
     RunStats stats;
@@ -420,7 +408,11 @@ private:
     static constexpr uint32_t ncls_map = 8;
     const uint32_t cm_u32 = 2;       // kernel class-mode argument
     uint32_t a_w64 = 0;              // phase-A item width (CHECK_PHASE_A_W64)
-    const uint32_t write_checked = 0;   // checked[] is validation output (tools) only
+    // checked[] (bit per even) is validation output of the tools only: the
+    // verifier passes write_checked = 0 and no buffer (the kernels never
+    // touch it then; tools/debug_check_hi.cpp allocates its own)
+    const uint32_t write_checked = 0;
+    uint64_t* const no_checked = nullptr;
     Plan30 plan30;
     std::unique_ptr<Kernel> k_ca, k_cb;
 
@@ -449,14 +441,13 @@ private:
     // ---- size_buffers ---------------------------------------------------------
     GpuBuffers b;                    // every device / shared buffer (allocated below)
     uint64_t map_words = 0;          // prime map per slot (whole tiles)
-    uint32_t chk_stride30 = 0;       // mod-30 checker: words per class of checked[]
-    uint64_t chk_words = 0;          // checked[] per slot
+    uint32_t chk_stride30 = 0;       // mod-30 checker: words per class of checked[] (unused: no buffer)
     uint32_t pending_cap = 0;        // two-phase checker: pending list capacity
     uint64_t table_bytes = 0;        // per-tile first-mark table per slot
     bool use_table = false;
     uint32_t use_table_u32 = 0;
     uint32_t mask_period = 0;        // GB_MASK_PERIOD
-    uint32_t mask_xp = 0;            // GB_MASK_XP: owned primes folded into the mask groups
+    uint32_t mask_xp = 0;            // owned primes folded into the mask groups (MASK_XP_DEFAULT)
     uint32_t mask_groups_n = 0;      // fused mask groups (0: per-prime mask loop)
     size_t mask_group_words = 0;
     uint32_t* d_group_desc = nullptr;
@@ -581,6 +572,14 @@ void RunSetup::resolve_range() {
         if (env::present(gone))
             throw std::runtime_error(std::string(gone) + " was removed in v2.6 (the mod-30 map and "
                                      "checker with hit lists are the only pipeline)");
+    // The speed rounds' A/B switches (2026-11-19): refused too, so an A/B arm
+    // that sets one does not silently measure the default twice.
+    for (const char* gone : {"GB_C30_LATE", "GB_C30_PREB", "GB_ML_OVERLAP", "GB_HL_LAM2", "GB_HL_CAPG",
+                             "GB_HLH_WG", "GB_HL_UNCOMP", "GB_MT_UNCOMP", "GB_MASK_XP", "GB_MED_ITEMS",
+                             "GB_MINP_FLOOR", "GB_HL_FILLDBG"})
+        if (env::present(gone))
+            throw std::runtime_error(std::string(gone) + " was removed on 2026-11-19 (its default is "
+                                     "fixed; docs/HISTORY.md 9.2ac)");
     gb::require_supported_limit(limit);
     // The last even n is limit rounded down (as run_gpu_sparse does). An odd
     // limit left the segment and count30 ranges ending on an even q, so the
@@ -692,6 +691,8 @@ void RunSetup::load_base_primes() {
     // (HISTORY.md §9.2z): keep every prime below MOD_FF_MIN_P in the tile walk.
     sieve_split = std::max(sieve_split, std::min(sieve_count, uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_count, MOD_FF_MIN_P) - sieve_primes)));
+    if (sieve_split < sieve_count && sieve_primes[sieve_split] < MOD_FF_MIN_P)
+        throw std::runtime_error("split prime below MOD_FF_MIN_P (docs/EXACTNESS.md)");
     large_count = sieve_count - sieve_split;
 
     // Goldbach candidate primes: p <= 9781 (see config.hpp).
@@ -805,10 +806,11 @@ void DenseRun::set_group_sizes() {
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    // GB_MED_ITEMS (2026-11-18): with the mid windows the medium stage takes
+    // Medium items (2026-11-18): with the mid windows the medium stage takes
     // every tile prime after the mask groups (the owned walk goes) as items of
-    // about T marks (+0.6%; T 90..110 flat, 80 / 130 worse)
-    const uint32_t med_items_t = env::u32("GB_MED_ITEMS", midwin_pre ? MED_ITEMS_MIDWIN : 0u);
+    // about T marks (+0.6%; T 90..110 flat, 80 / 130 worse). Without them
+    // (low starts) the owned walk stays.
+    const uint32_t med_items_t = midwin_pre ? MED_ITEMS_MIDWIN : 0u;
     const uint32_t med_min_p = env::u32("GB_MED_P", midwin_pre ? (med_items_t ? MED_MIN_P_ITEMS : MED_MIN_P_MIDWIN)
                                                                : MED_MIN_P);
     own_end = std::clamp<uint32_t>(uint32_t(
@@ -816,8 +818,8 @@ void DenseRun::set_group_sizes() {
         sieve_primes), mask_count, sieve_split);
     module_seconds = seconds_since(t_module);
     init_mark("module");
-    // Medium items (GB_MED_ITEMS = marks per item, default MED_ITEMS_MIDWIN
-    // with the mid windows): every medium prime split into n = round(marks
+    // Medium items (MED_ITEMS_MIDWIN marks per item, with the mid windows):
+    // every medium prime split into n = round(marks
     // per tile / T) >= 1 equal tile word ranges, the items sorted by marks
     // (the lanes of a sub-group run equally long loops). Uploaded behind the
     // mask group descriptors (size_buffers).
@@ -873,10 +875,9 @@ void DenseRun::size_buffers() {
     const uint64_t tpc_max = (max_odds / 15 + 2 + BITS_PER_TILE - 1) / BITS_PER_TILE;
     const uint64_t map_tiles  = std::max(dense_tiles, ncls_map * tpc_max);
     map_words  = map_tiles * TILE_WORDS;
-    // checked[] (validation output only) holds the 15 even classes at
-    // chk_stride30 words each.
+    // checked[] (tools only) would hold the 15 even classes at chk_stride30
+    // words each; the kernels still take the stride.
     chk_stride30 = uint32_t((max_segment_evens / 15 + 1 + 63) / 64 + 1);
-    chk_words  = std::max<uint64_t>((max_segment_evens + 63) / 64, 15ull * chk_stride30);
     // Evens phase A leaves to phase B: ~0.045% of a segment at 4e18 (106K
     // of 233.75M), ~0.25% on a sampled segment (586K). Sized at 1/32 of the
     // segment (12x the sampled peak); the host fails closed if a segment
@@ -906,13 +907,13 @@ void DenseRun::size_buffers() {
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
     mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
-    // 2026-11-18: the first MASK_XP owned primes (67, 71, 73, 79) are folded
+    // 2026-11-18: the first MASK_XP_DEFAULT owned primes (67, 71, 73, 79) are folded
     // into the mod-30 class map's canonical mask groups, each into the group
     // of smallest period (tables 75 KB -> 1.9 MB, no extra loads): the owned
     // walk loses its densest primes. Bench +0.6% (long, long-end, 1e14);
     // 3 and 5 measured slightly less, a new group of their own worse.
     mask_xp = (mask_count > 0)
-        ? std::min<uint32_t>(env::u32("GB_MASK_XP", MASK_XP_DEFAULT, 0, 8), own_end - mask_count) : 0u;
+        ? std::min<uint32_t>(MASK_XP_DEFAULT, own_end - mask_count) : 0u;
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
         mask_groups0 = small_prime_group_masks_canonical(   // sizes and descriptors
@@ -940,7 +941,6 @@ void DenseRun::size_buffers() {
 void DenseRun::allocate_slot_buffers() {
     for (int s = 0; s < 2; ++s) {
         b.prime_map[s]  = static_cast<uint64_t*>(ctx.alloc_device(map_words * 8));
-        b.checked[s]    = static_cast<uint64_t*>(ctx.alloc_device(chk_words * 8));
         // (v2.6: the unused S1 / S5 split maps that were kept "for v1.12.0's
         // device-memory layout" are gone: 1e12 at 4e18, 6 ABBA rounds, 0.03%.)
         // per-class tables back to back
@@ -1107,11 +1107,12 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                 mt_p = hi;
             }
         }
-        mt_try = env::onoff("GB_HITLIST", true) && env::onoff("GB_HL_MT", true) &&
-                 mt_geometry(mt_p, m_lo_t, m_hi_t);
+        // GB_HL_MT=0: the old hit-list path (hl_harvest, primes > q_odds_full
+        // only), kept as a fallback
+        mt_try = env::onoff("GB_HL_MT", true) && mt_geometry(mt_p, m_lo_t, m_hi_t);
         uint64_t minp = mt_try ? mt_p : env::u64("GB_BUCKET_MINP", minp_default);
-        if (!mt_try && env::onoff("GB_MINP_FLOOR", true))
-            minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
+        if (!mt_try)   // hl_harvest files at most one hit per prime and segment
+            minp = std::max<uint64_t>(minp, q_odds_full);
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
                                                  sieve_primes + sieve_count,
                                                  uint32_t(std::min<uint64_t>(minp, UINT32_MAX))) -
@@ -1178,14 +1179,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                          hl_mt ? "on" : "off", (unsigned long long)m_lo, (unsigned long long)m_hi,
                          (unsigned long long)(k_hi - k_lo), sb, se);
     }
-    // With HL_MT the packed kernel waits for mid_window (barrier): it then
-    // shortens with every prime moved to the hit lists, while beside
-    // mid_window its span did not (2026-11-18: q_odds / 4 equal either way,
-    // 35M gpu -2 % only without the overlap). GB_ML_OVERLAP=1 forces it.
-    if (hl_mt && !env::present("GB_ML_OVERLAP")) ml_overlap = false;
-    // filed hits: prime m only, density 1 / (ln m_lo * 5760 / 30030) among the
-    // coprime multipliers (+5 %; a region overflow fails the run closed)
-    if (hl_mt && env::onoff("GB_HL_LAM2", true)) {
+    if (hl_mt) {
         // filed hits per segment: prime p files the prime m among its
         // q_odds / p odd multipliers, density 2 / ln m, m ~ q / p:
         // lam = int_lo^hi 2 q_odds / (p ln p ln(q_first0 / p)) dp (prime
@@ -1204,9 +1198,6 @@ void DenseRun::size_bucket_ring_and_hitlists() {
             sum += 2.0 * double(q_odds_full) / (u * (lq - u)) * h;
         }
         bucket_lam = sum + 1.0;
-    } else if (hl_mt) {
-        const double mlo = double(q_first0) / double(sieve_primes[sieve_count - 1]);
-        bucket_lam *= std::min(1.0, 1.05 / (std::log(mlo) * 5760.0 / 30030.0));
     }
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
@@ -1223,8 +1214,6 @@ void DenseRun::size_bucket_ring_and_hitlists() {
             }
             return lo;
         };
-        hl_capg = env::u32("GB_HL_CAPG", hl_capg, 64u, 1u << 20);
-        if (hl_capg & (hl_capg - 1)) throw std::runtime_error("GB_HL_CAPG: not a power of two");
         while (std::ceil(bucket_lam / mmax(hl_capg)) > 4096.0) hl_capg *= 2;
         hl_G = uint32_t(std::max(1.0, std::ceil(bucket_lam / mmax(hl_capg))));
     }
@@ -1235,6 +1224,10 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         const uint64_t budget = env::u64("GB_HL_LIST_MAX", HL_LIST_MAX_DEFAULT);
         while (hl_K > 1 && uint64_t(hl_K) * hl_G * hl_capg * 4 > budget) --hl_K;
     }
+    // K = 1 is the floor of both loops: fail closed rather than let a list
+    // offset wrap (never near: K = 1 is ~30 MB at 4e18)
+    if (hitlist && uint64_t(hl_K) * hl_G * hl_capg * 4 >= (uint64_t(1) << 32))
+        throw std::runtime_error("hit lists: one batch's lists exceed 4 GiB");
     // Segments of the run (the loop below: seg_start += segment_even until
     // seg_end == limit) and the last one's q_odds (the only short one).
     // hl_harvest's 32-bit walk: off + p (off < delta), off + delta and the
@@ -1308,8 +1301,8 @@ void DenseRun::allocate_large_prime_buffers() {
     d_hl_lists = nullptr;
     d_hl_counts = nullptr;
     if (hitlist) {
-        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4, 64,
-                                                              env::onoff("GB_HL_UNCOMP", false)));
+        // compressed (driver default): uncompressed lists measured +17 %
+        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4));
         d_hl_counts = static_cast<uint32_t*>(ctx.alloc_device(size_t(HL_MAX_K_HOST) * hl_G * 4));
     }
     if (hitlist) {
@@ -1322,10 +1315,7 @@ void DenseRun::allocate_large_prime_buffers() {
     if (hitlist) {
         k_hlh = std::make_unique<Kernel>(mod, hl_mt ? "hl_harvest_mt" : "hl_harvest");
         k_hla = std::make_unique<Kernel>(mod, hl_fuse ? "sieve_large_packed_hl" : "hl_apply");
-        // 1024 (2026-11-18): the scattered list stores are L2 write-combined;
-        // a larger group fills its regions' lines faster (harvest -6 ms per
-        // 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST work-items.
-        k_hlh->set_group_size(env::u32("GB_HLH_WG", HL_HARVEST_WG, HL_MAX_K_HOST, 1024u));
+        k_hlh->set_group_size(HL_HARVEST_WG);
         k_hla->set_group_size(hl_fuse ? large_wg : WG_SIZE);
     }
     init_mark("  kernel create");
@@ -1448,10 +1438,10 @@ void DenseRun::build_mtab() {
     Kernel kb(mod, "mt_build");
     kb.set_group_size(1024);
     const size_t words = size_t(mt_blocks) * 180;
-    // uncompressed (GB_MT_UNCOMP, default on; 2026-11-18 r7): the harvest's
-    // scattered word reads skip the compression metadata, harvest -3.4 %
-    // (the lists themselves stay compressed: uncompressed they are +17 %)
-    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4, 64, env::onoff("GB_MT_UNCOMP", true)));
+    // uncompressed (2026-11-18 r7): the harvest's scattered word reads skip
+    // the compression metadata, harvest -3.4 % (the lists themselves stay
+    // compressed: uncompressed they are +17 %)
+    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4, 64, true));
     kb.set_arg(0, sizeof(d_mtab), &d_mtab);
     kb.set_arg(1, sizeof(mt_blocks), &mt_blocks);
     kb.set_arg(2, sizeof(mt_k_lo), &mt_k_lo);
@@ -1479,7 +1469,7 @@ void DenseRun::build_mtab() {
     ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
     kb.set_arg(7, sizeof(d_pat), &d_pat);
     const auto t0 = clock_::now();
-    kb.launch(ctx.list(), (mt_blocks + 127) / 128);   // MT_CB (kernels/goldbach.cl)
+    kb.launch(ctx.list(), (mt_blocks + MT_CB_HOST - 1) / MT_CB_HOST);   // MT_CB blocks per group
     ctx.host_sync();
     Context::free_mem(ctx.context(), d_pat);
     if (verbose)
@@ -1931,8 +1921,8 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
 /// Step 4b' (mid windows, §9.2x): after a barrier (the tile kernel's stores
 /// and mid_setup complete), mid_window rebuilds each 128 KB window of the
 /// class map with the mid primes' marks and ANDs it into the map with
-/// atomics (MIDW_ANDST 2), so the packed kernel may run beside it
-/// (GB_ML_OVERLAP; else its barrier orders its atomics after them).
+/// 64-bit atomics, so the packed kernel may run beside it (without HL_MT;
+/// else its barrier orders its atomics after them).
 void DenseRun::enqueue_midwin(const Segment& sg) {
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     const uint32_t c5w32 = sg.c5w * 2u;
@@ -2029,12 +2019,16 @@ void DenseRun::enqueue_packed_large(const Segment& sg, uint32_t hl_jb) {
     // manifested as nondeterministic lost composite marks
     // (tools/debug_map.cpp: the map vs Miller-Rabin diff varied run
     // to run until the barrier was added).
-    // GB_ML_OVERLAP: mid_window ANDs its windows into the map atomically
-    // (MIDW_ANDST 2), so the packed kernel may run beside it: both only
-    // AND-clear bits with atomics. The barrier enqueue_midwin appends before
-    // mid_window already follows the tile sieve's stores, mid_setup and the
-    // hit-list harvest (enqueued before it), which is all this kernel needs.
-    const bool ml_ovl = ml_overlap && mid_n > 0;
+    // mid_window ANDs its windows into the map with atomics, so the packed
+    // kernel may run beside it: both only AND-clear bits. The barrier
+    // enqueue_midwin appends before mid_window already follows the tile
+    // sieve's stores, mid_setup and the hit-list harvest (enqueued before it),
+    // which is all this kernel needs. With HL_MT the packed kernel waits for
+    // mid_window instead (barrier): it then shortens with every prime moved
+    // to the hit lists, while beside mid_window its span did not (2026-11-18:
+    // 35M gpu -2 % only without the overlap); GB_HL_MT=0 keeps the overlap
+    // (+0.5 % on that path).
+    const bool ml_ovl = !hl_mt && mid_n > 0;
     if (!ml_ovl) ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     Kernel& kl = hl_fuse ? *k_hla : k_large;
     kl.set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
@@ -2145,17 +2139,10 @@ void DenseRun::enqueue_check(Segment& sg) {
     if (sampled) sampled_evens += sg.seg_evens;
     xs_used[sg.slot] = sampled;
     acct_slot[sg.slot] = !sampled;
-    if (stats_on && !c30_late) enqueue_count30(sg, sampled);
+    // count30 (statistics) is enqueued by the checker step, after phase A's
+    // barrier and before phase B: see enqueue_check30
     if (sampled) enqueue_check_sampled(sg, s30, ridge_thresh_u32);
     else enqueue_check30(sg, s30, ridge_thresh_u32);
-    // count30 late: after the checker, without a barrier, so it runs beside
-    // phase B and the next segment's tile sieve (an SLM-bound kernel that
-    // leaves issue slots free; beside phase A, which is ALU-bound, it cost
-    // ~1.5x as much). It only reads this slot's finished map (the barrier
-    // before phase A follows the marks); the next mid_window barrier and the
-    // host's wait on its event (collection) order everything after it.
-    if (stats_on && c30_late && !c30_done) enqueue_count30(sg, sampled);
-    c30_done = false;
     sg.enq_s = seconds_since(sg.t_enq);
     sg.launch_s = seconds_since(sg.t_launch0);
     sg.l3_s = seconds_since(sg.t_launch0);
@@ -2214,8 +2201,7 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     k_cnt->set_arg(10, 4, &cwalk);
     k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
     k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
-    if (c30_late) k_cnt->launch_overlap(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
-    else k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    k_cnt->launch_overlap(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
     split_used[sg.slot] = true;
 }
 
@@ -2255,8 +2241,7 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
         else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
     }
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-    const bool preb = stats_on && c30_late && c30_preb;
-    if (preb) { enqueue_count30(sg, true); c30_done = true; }   // before phase B: see GB_C30_PREB
+    enqueue_count30(sg, true);   // before phase B: see enqueue_check30 (sampled => stats_on)
     k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
     k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
@@ -2276,9 +2261,8 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
     k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
     k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
-    // (with count30 first, the barrier above already orders it after the variants)
-    if (preb) k_cxb->launch_overlap(ctx.list(), stats_b_groups, ev.check[sg.slot]);
-    else k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
+    // grid-stride; the barrier above already orders it after the variants
+    k_cxb->launch_overlap(ctx.list(), stats_b_groups, ev.check[sg.slot]);
 }
 
 /// Step 5c: the mod-30 checker, check30_a -> barrier -> check30_b.
@@ -2290,7 +2274,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     const uint32_t se32 = uint32_t(sg.seg_evens);
     k_ca->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_ca->set_arg(1, 4, &cw32);
-    k_ca->set_arg(2, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_ca->set_arg(2, sizeof(no_checked), &no_checked);
     k_ca->set_arg(3, 4, &chk_stride30);
     k_ca->set_arg(4, sizeof(b.c30_cands), &b.c30_cands);
     k_ca->set_arg(5, sizeof(b.c30_meta), &b.c30_meta);
@@ -2304,16 +2288,20 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_ca->set_arg(13, 4, &s30.phik);
     k_ca->set_arg(14, 4, &write_checked);
     k_ca->set_arg(15, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
-    // launch_overlap: phase A may run alongside count30 (GB_C30_LATE=0; both only
-    // read the finished map; the barrier above follows the marks)
+    // launch_overlap: phase A only reads the finished map (the barrier above
+    // follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
-    // GB_C30_PREB: count30 (reads the finished map only) between the barrier
-    // and phase B, both without a further barrier
-    const bool preb = stats_on && c30_late && c30_preb;
-    if (preb) { enqueue_count30(sg, false); c30_done = true; }
+    // count30 (statistics; reads the finished map only) between phase A's
+    // barrier and phase B, neither behind a further barrier: launched first,
+    // its work-groups take their thread slots first and it ends inside the
+    // next segment's tile sieve (2026-11-18: tile kernel 0.567 -> 0.495 ms per
+    // segment, gpu -0.9%; beside phase A, which is ALU-bound, it cost ~1.5x
+    // as much). The next mid_window barrier and the host's wait on its event
+    // (collection) order everything after it.
+    if (stats_on) enqueue_count30(sg, false);
     k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-    k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_cb->set_arg(1, sizeof(no_checked), &no_checked);
     k_cb->set_arg(2, 4, &chk_stride30);
     k_cb->set_arg(3, sizeof(b.c30_rest), &b.c30_rest);
     k_cb->set_arg(4, sizeof(b.c30_rtab), &b.c30_rtab);
@@ -2336,7 +2324,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
     k_cb->set_arg(22, 4, &tail_t);
     k_cb->set_arg(23, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
-    if (preb) k_cb->launch_overlap(ctx.list(), phase_b_groups, ev.check[sg.slot]);
+    if (stats_on) k_cb->launch_overlap(ctx.list(), phase_b_groups, ev.check[sg.slot]);
     else k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
@@ -2349,7 +2337,7 @@ void DenseRun::collect_previous_segment(Segment& sg) {
     const uint32_t prev = uint32_t((stats.segments - 1) & 1);
     const auto t_wait = clock_::now();
     ZE_CHECK(zeEventHostSynchronize(ev.check[prev], UINT64_MAX));
-    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[prev], UINT64_MAX));
+    if (stats_on) ZE_CHECK(zeEventHostSynchronize(ev.splitk[prev], UINT64_MAX));
     sg.wait_s = seconds_since(t_wait);
     const auto t_coll = clock_::now();
 
@@ -2402,22 +2390,9 @@ void DenseRun::end_iteration(const Segment& sg) {
 /// After the loop: collects the final segment (its record is seg_stat: it was
 /// never overwritten after its enqueue).
 void DenseRun::drain_final_segment() {
-    if (hitlist && env::onoff("GB_HL_FILLDBG", false)) {
-        ctx.host_sync();
-        std::vector<uint32_t> c(size_t(hl_K) * hl_G);
-        ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), c.data(), d_hl_counts, c.size() * 4, nullptr, 0, nullptr));
-        ctx.host_sync();
-        const uint32_t ns = uint32_t((run_segments - 1) % hl_K) + 1;
-        double sum = 0; uint32_t mx = 0, mn = ~0u;
-        std::vector<double> segsum(ns, 0.0);
-        for (uint32_t j = 0; j + 1 < ns; ++j) for (uint32_t g = 0; g < hl_G; ++g) {
-            const uint32_t v = c[size_t(j) * hl_G + g]; sum += v; mx = std::max(mx, v); mn = std::min(mn, v); segsum[j] += v; }
-        std::fprintf(stderr, "hl fill: %u segs, mean/region %.1f min %u max %u capg %u; per segment %.0f (lam est)\n",
-                     ns - 1, sum / double(ns - 1) / hl_G, mn, mx, hl_capg, sum / double(ns - 1));
-    }
     const uint32_t last = uint32_t((stats.segments - 1) & 1);
     ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
-    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[last], UINT64_MAX));
+    if (stats_on) ZE_CHECK(zeEventHostSynchronize(ev.splitk[last], UINT64_MAX));
     collect_slot(last, seg_stat);
 }
 
@@ -2594,7 +2569,6 @@ void DenseRun::release_device_objects() {
     // Free GPU memory.
     for (int s = 0; s < 2; ++s) {
         Context::free_mem(ctx.context(), b.prime_map[s]);
-        Context::free_mem(ctx.context(), b.checked[s]);
         Context::free_mem(ctx.context(), b.first_bits[s]);
         Context::free_mem(ctx.context(), b.mask_table[s]);
         if (b.group_masks[s]) Context::free_mem(ctx.context(), b.group_masks[s]);

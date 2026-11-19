@@ -50,7 +50,12 @@ namespace gb {
 // a payload hash ("GBP2"); the twin / class-split checkers, the dense / mod-6
 // maps and the bucket ring are removed (only A/B knobs reached them; those
 // knobs are refused). Results unchanged.
-inline constexpr const char* VERSION = "2.6.0";
+// v2.7.0 (speed rounds 2-7 + cleanup, 2026-11-18/19, HISTORY.md §9.2ab/ac):
+// prime-multiplier hit lists, the 17..43 mark skip, read-before-mark in the
+// packed kernel, the flattened phase B and the rest of the six rounds
+// (x1.72 / x1.74 vs v2.6.0 per 1e11, x1.89 per production slice vs v2.5.1);
+// the A/B switches they left are removed (refused). Results unchanged.
+inline constexpr const char* VERSION = "2.7.0";
 
 // ---- make_prime_map geometry --------------------------------------------
 // One work-group = one tile. SLM holds 64-bit words; one bit represents one
@@ -114,7 +119,7 @@ inline constexpr uint64_t HL_MT_MINP_DEN = 20;
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
 // the rotate funnel (12 spill-free; +0.18% / +0.20% long / long-end).
 inline constexpr uint32_t CHECK_PHASE_A_W64    = 12;
-// Mod-30 phase B (check30_b, flattened probe loop CB_FLAT): a small grid that
+// Mod-30 phase B (check30_b, flattened probe loop): a small grid that
 // runs beside the next segment's tile sieve instead of filling the GPU
 // (2026-11-18 r6b, 4e18 per segment: 640 groups 1.662 ms, 60 1.644, 40 1.634,
 // 30 1.644, 20 1.650; GB_CHECK_BGROUPS overrides).
@@ -153,8 +158,8 @@ inline constexpr uint32_t MED_MIN_P = 512;
 // With the mid-prime windows (medium primes up to the 1500th prime only,
 // load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
 inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
-// With the medium items (GB_MED_ITEMS, default MED_ITEMS_MIDWIN marks per item
-// with the mid windows) the medium stage starts right after the mask-group
+// With the medium items (MED_ITEMS_MIDWIN marks per item, with the mid
+// windows) the medium stage starts right after the mask-group
 // primes (67..79 are folded into the groups: the owned walk is empty).
 inline constexpr uint32_t MED_ITEMS_MIDWIN = 100;
 inline constexpr uint32_t MED_MIN_P_ITEMS = 80;
@@ -164,19 +169,32 @@ inline constexpr uint32_t MED_MIN_P_ITEMS = 80;
 // (MUST fit the device's per-work-group SLM) and its work-group size
 // (GB_MIDWIN_KB / GB_MIDWIN_WG override).
 inline constexpr uint64_t MIDWIN_P2_DEFAULT = 2500000;
-// Smallest prime the packed kernel's float-float remainder (mod_ff) may get:
-// it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split prime
-// is clamped to at least this (the tile kernel handles everything below).
+// Smallest prime the packed kernel's float-float remainder (mod_ff_q) may
+// get: it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split
+// prime is clamped to at least this (the tile kernel handles everything
+// below). docs/EXACTNESS.md.
 inline constexpr uint32_t MOD_FF_MIN_P = 4096;
 inline constexpr uint32_t MIDWIN_SPLIT = 1500;
 inline constexpr uint32_t MIDWIN_KB = 128;
-// make_prime_map: owned primes folded into the class-map mask groups (GB_MASK_XP)
+// make_prime_map: owned primes folded into the class-map mask groups (67, 71,
+// 73, 79; +0.6 %, 2026-11-18)
 inline constexpr uint32_t MASK_XP_DEFAULT = 4;
 inline constexpr uint32_t MIDWIN_WG = 1024;
 
 // Small-prime mask sieve bound (must match MASK_MAX_P in kernels/goldbach.cl):
 // primes below this use whole-word AND masks in make_prime_map stage 3a.
 inline constexpr uint32_t MASK_MAX_P = 64;
+// The large-prime fast paths drop marks that the mask stage already made
+// (docs/EXACTNESS.md): the packed kernel's and the harvest's skip of p m
+// with m divisible by 17..43, and mt_build's 17..61 presieve. Both need
+// every prime up to 61 inside the mask stage.
+static_assert(MASK_MAX_P > 61, "the 17..43 mark skip and the 17..61 presieve rely on the mask stage");
+// mod_ff_q is exact for p >= 512 (GPU self-test, HISTORY.md §9.2z); the
+// split clamp keeps a margin above that.
+static_assert(MOD_FF_MIN_P >= 512, "mod_ff_q is wrong below 512");
+// mt_build: table blocks (30030 numbers, 180 words) per work-group. MUST
+// match MT_CB in kernels/goldbach.cl (tests/check_constants.py).
+inline constexpr uint32_t MT_CB_HOST = 128;
 
 // ---- Defaults ------------------------------------------------------------
 inline constexpr uint64_t DEFAULT_LIMIT          = 100'000'000ULL;  // verify evens in [4, limit]

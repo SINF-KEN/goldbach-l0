@@ -312,7 +312,7 @@ std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
 
 // Folds the @p extra primes after the mask primes (sieve_primes[mask_count],
 // ...: 67, 71, ...) into the groups, each into the group of smallest period at
-// that point (2026-11-18 GB_MASK_XP: the fused mask stage clears them with no
+// that point (2026-11-18 MASK_XP_DEFAULT: the fused mask stage clears them with no
 // extra loads; the tile's owned walk starts after them).
 static void fold_extra_primes(std::vector<std::vector<uint32_t>>& groups, const uint32_t* sieve_primes,
                               uint32_t mask_count, uint32_t extra) {

@@ -92,10 +92,11 @@ only that no failure was reported.
 | leftover list not overflowed / valid | host throws if `count > MAX_LEFTOVERS` or any index `>= seg_evens` |
 | hit lists not overflowed | kernels set an error flag; host throws |
 | hit-list 32-bit walk | host throws unless `q_odds_full < 2 delta`, `2 delta < 2^32`, `delta + p_max < 2^32` |
-| `mod_ff` remainder fits int32 | proven bound `|q - floor(x/p)| <= (x/p) 2^-46 + 1`; CPU emulation of 1.4e7 (x, p) pairs: max \|r\| = 5.4e8 < 2^31; guarded fix-up loops make the result exact |
+| `mod_ff_q` remainder fits int32 | proven bound `|q - floor(x/p)| <= (x/p) 2^-46 + 1`; CPU emulation of 1.4e7 (x, p) pairs: max \|r\| = 5.4e8 < 2^31; guarded fix-up loops make the result exact |
 | float fast paths exact (`MED_F32`, `OWN_F32`, `OH_F32`) | uniform guards (`p < 2^23`, offsets `< 2^24` / `< 2^17`, `y < 2^32`); remainders stay below 2^24 so `fma` is exact |
 | `map_clear_w` marks only q coprime to 30 | every caller marks multiplier-wheel / CP15015-filtered q only |
 | tile stores before large-prime atomics | explicit barriers (an event wait alone was observed insufficient on this driver) |
+| the speed rounds' fast paths (prime-multiplier hit lists, the 17..43 mark skip, read-before-mark, `mod_ff_q` for p >= 512, the gap walk's block fallback, the hit-list budget) | [EXACTNESS.md](EXACTNESS.md): each rule with its condition, guard and failure mode |
 | statistics merged exactly once | state re-read under an exclusive lock at commit; a range overlapping covered ranges is not merged; a damaged, truncated or incompatible (`tail_t`) state is refused; the write is atomic and fsync'd before the run returns |
 | journal chain intact | `run_range.sh` and the CI follow PASS rows only if their own `start=` / `limit=` agree; malformed rows are ignored |
 

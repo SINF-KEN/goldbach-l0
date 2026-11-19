@@ -77,6 +77,15 @@ for knob in GB_SPLIT=0 GB_C30=0 GB_CLASSMAP=6 GB_HITLIST=0 GB_TWIN_CAP=10 GB_MAS
     else echo "  FAIL $knob: exit $rc: $(tail -1 <<<"$out")"; fail=1; fi
 done
 
+echo "the speed rounds' A/B switches removed on 2026-11-19 are refused -> exit 1"
+for knob in GB_C30_LATE=0 GB_C30_PREB=0 GB_ML_OVERLAP=1 GB_HL_LAM2=0 GB_HL_CAPG=64 GB_HLH_WG=256 \
+            GB_HL_UNCOMP=1 GB_MT_UNCOMP=0 GB_MASK_XP=0 GB_MED_ITEMS=0 GB_MINP_FLOOR=0 GB_HL_FILLDBG=1; do
+    out=$(env "$knob" "$BIN" --start 1000000 --limit 2000000 --csv 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && grep -q "removed on 2026-11-19" <<<"$out" && ! grep -q "result=PASS" <<<"$out"; then
+        echo "  ok   $knob refused"
+    else echo "  FAIL $knob: exit $rc: $(tail -1 <<<"$out")"; fail=1; fi
+done
+
 echo "valid spellings agree; CPU reference passes"
 a=$("$BIN" --cpu-check 200000 2>&1); ra=$?
 b=$("$BIN" --cpu-check 2e5 2>&1); rb=$?
