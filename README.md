@@ -35,10 +35,11 @@ v2.5.1; the release figure follows from its CI benchmark.
 | Document | Contents |
 |---|---|
 | [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 and v2.6.0 audits |
+| [docs/EXACTNESS.md](docs/EXACTNESS.md) | the rules the fast paths (prime-multiplier hit lists, the 17..43 mark skip, read-before-mark, mod_ff_q) rely on, where each is enforced and what breaks |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | hardware and software, build, tests, CI, the kernel shipping procedure, reproducibility, production operation |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | how performance is measured and compared; raw data in [bench/](bench/) |
 | [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, pipeline, kernels, host |
-| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2aa, numbered as before), the per-version performance record, the removed wheel path |
+| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2ac, numbered as before), the per-version performance record, the removed wheel path |
 | [docs/PIPELINE.md](docs/PIPELINE.md) | the production run as a diagram, from `run_range.sh` to the journal |
 | [ci/README.md](ci/README.md) | the local CI: release gating, production control |
 
