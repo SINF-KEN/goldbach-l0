@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -97,7 +98,7 @@ inline constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K 
 inline constexpr uint32_t HL_HARVEST_WG = 1024; // hl_harvest work-group size (GB_HLH_WG)
 // Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
 // harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
-inline constexpr uint32_t HL_K_DEFAULT = 64;
+inline constexpr uint32_t HL_K_DEFAULT = 128;
 static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
 /// Copies host data to a device buffer through a shared staging allocation.
@@ -357,6 +358,7 @@ private:
     void size_bucket_ring_and_hitlists();
     void allocate_large_prime_buffers();
     void upload_tables();
+    void build_mtab();
     void pack_stats_buffers();
     void create_events();
     void segment_loop();
@@ -437,6 +439,7 @@ private:
     bool use_table = false;
     uint32_t use_table_u32 = 0;
     uint32_t mask_period = 0;        // GB_MASK_PERIOD
+    uint32_t mask_xp = 0;            // GB_MASK_XP: owned primes folded into the mask groups
     uint32_t mask_groups_n = 0;      // fused mask groups (0: per-prime mask loop)
     size_t mask_group_words = 0;
     uint32_t* d_group_desc = nullptr;
@@ -462,6 +465,25 @@ private:
     uint32_t hl_K = 0;               // hit lists: segments per harvest
     uint32_t hl_G = 1, hl_capg = 64; // harvest regions, entries per region
     uint64_t run_segments = 0, run_last_q_odds = 0;  // hit lists: segments of the run
+    bool hl_mt = false;              // HL_MT: harvest files only hits p m with m prime
+    bool mt_try = false;             // ... planned (the hit-list threshold follows it)
+    /// HL_MT feasibility for hit-listed primes >= pmin: multipliers m of
+    /// every hit in [m_lo, m_hi]; needs p^3 > limit and p^2 > m_hi (a
+    /// composite m then has a factor < p), the table's sieving primes
+    /// (<= sqrt(m_hi)) far below m_lo, m_hi < 2^38 (hl_harvest_mt's
+    /// quotient words: hi < 64) and a table below 3.5 GiB.
+    bool mt_geometry(uint64_t pmin, uint64_t& m_lo, uint64_t& m_hi) const {
+        const uint64_t pmax = sieve_primes[sieve_count - 1];
+        m_lo = q_first0 / pmax;
+        m_hi = limit / pmin + 2;
+        const uint64_t s_max = uint64_t(std::sqrt(double(m_hi))) + 2;
+        return pmin > 1 && pmin * pmin > limit / pmin + 1 && pmin * pmin > m_hi &&
+               2 * s_max < m_lo && m_hi < (uint64_t(1) << 38) &&
+               (m_hi - m_lo) / 30030 * 720 < (uint64_t(7) << 29);   // table < 3.5 GiB (32-bit offsets)
+    }
+    uint32_t mt_k_lo = 0, mt_blocks = 0;   // multiplier table: blocks [k_lo, k_lo + blocks) of 30030
+    uint32_t mt_s_begin = 0, mt_s_end = 0; // its sieving primes (indices into sieve_primes)
+    uint32_t* d_mtab = nullptr;
     uint32_t packed_end = 0;         // packed kernel primes [sieve_split, packed_end)
 
     // ---- allocate_large_prime_buffers ---------------------------------------------
@@ -842,14 +864,22 @@ void DenseRun::size_buffers() {
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
     mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
+    // 2026-11-18: the first MASK_XP owned primes (67, 71, 73, 79) are folded
+    // into the mod-30 class map's canonical mask groups, each into the group
+    // of smallest period (tables 75 KB -> 1.9 MB, no extra loads): the owned
+    // walk loses its densest primes. Bench +0.6% (long, long-end, 1e14);
+    // 3 and 5 measured slightly less, a new group of their own worse.
+    mask_xp = (mask_count > 0)
+        ? std::min<uint32_t>(env::u32("GB_MASK_XP", MASK_XP_DEFAULT, 0, 8), own_end - mask_count) : 0u;
     SmallPrimeGroups mask_groups0;
     if (mask_groups_on)
         mask_groups0 = small_prime_group_masks_canonical(   // sizes and descriptors
-            sieve_primes, mask_count, 15u, mask_period);       // (canonical grouping)
+            sieve_primes, mask_count, 15u, mask_period, mask_xp);   // (canonical grouping)
     mask_groups_n = (mask_groups_on && mask_groups0.count() <= 8)
                                  ? mask_groups0.count() : 0u;
     mask_group_words = mask_groups0.words.size();
     d_group_desc = nullptr;
+    if (mask_groups_n == 0) mask_xp = 0;   // per-prime mask path: the owned walk takes them
     if (mask_groups_n > 0) {
         d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared(mask_groups0.desc.size() * 4));
         std::memcpy(d_group_desc, mask_groups0.desc.data(), mask_groups0.desc.size() * 4);
@@ -875,7 +905,7 @@ void DenseRun::allocate_slot_buffers() {
         b.group_y[s] = static_cast<uint32_t*>(ctx.alloc_shared(8uz * MAX_MASK_GROUPS_HOST * 4));
         if (mask_groups_n > 0) {   // canonical group tables: segment-independent
             const SmallPrimeGroups cg = small_prime_group_masks_canonical(
-                sieve_primes, mask_count, 15u, mask_period);
+                sieve_primes, mask_count, 15u, mask_period, mask_xp);
             if (cg.words.size() != mask_group_words)
                 throw std::runtime_error("class masks: canonical group layout mismatch");
             std::memcpy(b.group_masks[s], cg.words.data(), cg.words.size() * 8);
@@ -1002,8 +1032,29 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         const uint64_t minp_default = midwin_on
             ? q_odds_full * BUCKET_MIN_P_FACTOR_MIDWIN_NUM / BUCKET_MIN_P_FACTOR_MIDWIN_DEN
             : BUCKET_MIN_P_FACTOR * q_odds_full;
-        uint64_t minp = env::u64("GB_BUCKET_MINP", minp_default);
-        minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
+        // HL_MT (hl_harvest_mt files only hits with a prime multiplier) makes
+        // a hit-listed prime cheap enough to go down to HL_MT_MINP_NUM / _DEN
+        // x q_odds_full (multi-hit primes included; the harvest handles any
+        // number of hits per segment), when the multiplier table is feasible.
+        const uint64_t mt_minp = q_odds_full * HL_MT_MINP_NUM / HL_MT_MINP_DEN;
+        uint64_t m_lo_t = 0, m_hi_t = 0;
+        // the table limits (size, m < 2^38) raise the threshold where needed
+        uint64_t mt_p = std::max<uint64_t>(env::u64("GB_BUCKET_MINP", mt_minp), 1);
+        if (!mt_geometry(mt_p, m_lo_t, m_hi_t)) {
+            uint64_t lo = mt_p, hi = std::max<uint64_t>(mt_p, minp_default);
+            if (mt_geometry(hi, m_lo_t, m_hi_t)) {
+                while (hi - lo > 1) {
+                    const uint64_t mid = lo + (hi - lo) / 2;
+                    (mt_geometry(mid, m_lo_t, m_hi_t) ? hi : lo) = mid;
+                }
+                mt_p = hi;
+            }
+        }
+        mt_try = env::onoff("GB_HITLIST", true) && env::onoff("GB_HL_MT", true) &&
+                 mt_geometry(mt_p, m_lo_t, m_hi_t);
+        uint64_t minp = mt_try ? mt_p : env::u64("GB_BUCKET_MINP", minp_default);
+        if (!mt_try && env::onoff("GB_MINP_FLOOR", true))
+            minp = std::max<uint64_t>(minp, q_odds_full);   // correctness floor: <= 1 hit/segment
         bucket_begin = uint32_t(std::upper_bound(sieve_primes + sieve_split,
                                                  sieve_primes + sieve_count,
                                                  uint32_t(std::min<uint64_t>(minp, UINT32_MAX))) -
@@ -1037,6 +1088,50 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // < 2^32 and q_odds_full < 2 delta. GB_HITLIST_K sets the batch.
     hitlist = bucket_on;
     hl_K = env::u32("GB_HITLIST_K", HL_K_DEFAULT, 1u, HL_MAX_K_HOST);
+    // HL_MT (kernels/goldbach.cl hl_harvest_mt): the multipliers m of the
+    // hit-listed primes' hits lie in [q_first0 / pmax, limit / pmin]; a hit
+    // is filed only when m is prime. Needs every hit-listed p above the
+    // cube root (m < p^2: composite m has a factor < p) and the table's
+    // sieving primes (<= sqrt(m_hi)) on the device and below m_lo.
+    hl_mt = false;
+    if (hitlist && mt_try) {
+        const uint64_t pmin = sieve_primes[bucket_begin];
+        uint64_t m_lo = 0, m_hi = 0;
+        if (!mt_geometry(pmin, m_lo, m_hi))
+            throw std::runtime_error("hl_mt: multiplier table geometry");
+        const uint64_t k_lo = m_lo / 30030 > 0 ? m_lo / 30030 - 1 : 0;
+        const uint64_t k_hi = m_hi / 30030 + 2;
+        const uint64_t s_max = uint64_t(std::sqrt(double(m_hi))) + 2;
+        const uint32_t sb = uint32_t(std::lower_bound(sieve_primes, sieve_primes + sieve_count, 67u) -
+                                     sieve_primes);
+        const uint32_t se = uint32_t(std::upper_bound(sieve_primes, sieve_primes + sieve_count,
+                                                      uint32_t(std::min<uint64_t>(s_max, UINT32_MAX))) -
+                                     sieve_primes);
+        if (se < sieve_count && sieve_primes[se] > s_max - 2 && s_max < k_lo * 30030) {
+            hl_mt = true;
+            mt_k_lo = uint32_t(k_lo);
+            mt_blocks = uint32_t(k_hi - k_lo);
+            mt_s_begin = sb;
+            mt_s_end = se;
+        }
+        else
+            throw std::runtime_error("hl_mt: multiplier table sieving primes");
+        if (verbose)
+            std::fprintf(stderr, "hl_mt: %s m [%llu, %llu] blocks %llu sieve primes [%u, %u)\n",
+                         hl_mt ? "on" : "off", (unsigned long long)m_lo, (unsigned long long)m_hi,
+                         (unsigned long long)(k_hi - k_lo), sb, se);
+    }
+    // With HL_MT the packed kernel waits for mid_window (barrier): it then
+    // shortens with every prime moved to the hit lists, while beside
+    // mid_window its span did not (2026-11-18: q_odds / 4 equal either way,
+    // 35M gpu -2 % only without the overlap). GB_ML_OVERLAP=1 forces it.
+    if (hl_mt && !env::present("GB_ML_OVERLAP")) ml_overlap = false;
+    // filed hits: prime m only, density 1 / (ln m_lo * 5760 / 30030) among the
+    // coprime multipliers (+5 %; a region overflow fails the run closed)
+    if (hl_mt) {
+        const double mlo = double(q_first0) / double(sieve_primes[sieve_count - 1]);
+        bucket_lam *= std::min(1.0, 1.05 / (std::log(mlo) * 5760.0 / 30030.0));
+    }
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
     // mean m = lam / hl_G hits per region). Capacity m * 1.10 + 10 sqrt(m) +
@@ -1076,6 +1171,9 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         }
     }
     packed_end = bucket_on ? bucket_begin : sieve_count;
+    if (verbose && hitlist)
+        std::fprintf(stderr, "hit lists: primes >= %u, lam %.0f, K %u, groups %u x %u entries\n",
+                     sieve_primes[bucket_begin], bucket_lam, hl_K, hl_G, hl_capg);
     init_mark("bucket-geom+lambda");
 }
 
@@ -1138,7 +1236,7 @@ void DenseRun::allocate_large_prime_buffers() {
     // grid-stride work-groups of a separate hl_apply (when nothing is packed)
     bucket_groups = bucket_groups_env ? bucket_groups_env : 2 * BUCKET_GROUPS;
     if (hitlist) {
-        k_hlh = std::make_unique<Kernel>(mod, "hl_harvest");
+        k_hlh = std::make_unique<Kernel>(mod, hl_mt ? "hl_harvest_mt" : "hl_harvest");
         k_hla = std::make_unique<Kernel>(mod, hl_fuse ? "sieve_large_packed_hl" : "hl_apply");
         // 1024 (2026-11-18): the scattered list stores are L2 write-combined;
         // a larger group fills its regions' lines faster (harvest -6 ms per
@@ -1232,7 +1330,7 @@ void DenseRun::upload_tables() {
         if (bucket_verify) {
             copy_primes(0, sieve_count);
         } else {
-            copy_primes(0, mid_end);   // mid_end >= sieve_split
+            copy_primes(0, std::max(mid_end, hl_mt ? mt_s_end : 0u));   // mid_end >= sieve_split
             if (bucket_on) copy_primes(bucket_begin, sieve_count);
         }
         void* stage6 = d_large_bases ? stage_upload(ctx, packed.bases.data(),
@@ -1256,6 +1354,72 @@ void DenseRun::upload_tables() {
         if (stage7) Context::free_mem(ctx.context(), stage7);
         if (stage8) Context::free_mem(ctx.context(), stage8);
         if (stage9) Context::free_mem(ctx.context(), stage9);
+    }
+    if (hl_mt) build_mtab();
+}
+
+/// HL_MT: builds the multiplier primality table on the device (mt_build)
+/// and, with GB_MT_CHECK=N, checks N random table bits on the CPU.
+void DenseRun::build_mtab() {
+    Kernel kb(mod, "mt_build");
+    kb.set_group_size(1024);
+    const size_t words = size_t(mt_blocks) * 180;
+    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4));
+    kb.set_arg(0, sizeof(d_mtab), &d_mtab);
+    kb.set_arg(1, sizeof(mt_blocks), &mt_blocks);
+    kb.set_arg(2, sizeof(mt_k_lo), &mt_k_lo);
+    kb.set_arg(3, sizeof(b.sieve_primes), &b.sieve_primes);
+    kb.set_arg(4, sizeof(mt_s_begin), &mt_s_begin);
+    kb.set_arg(5, sizeof(mt_s_end), &mt_s_end);
+    const uint32_t n_small = uint32_t(std::lower_bound(sieve_primes + mt_s_begin, sieve_primes + mt_s_end,
+                                                       1024u) - (sieve_primes + mt_s_begin));
+    kb.set_arg(6, sizeof(n_small), &n_small);
+    // presieve patterns for 17..61 (kernels/goldbach.cl mt_build): prime s,
+    // row k mod s, 180 words: bit w set iff s does not divide 30030 k + M[w]
+    std::vector<uint32_t> M;
+    for (uint32_t m = 1; m < 30030; m += 2)
+        if (std::gcd(m, 30030u) == 1) M.push_back(m);
+    std::vector<uint32_t> pat;
+    for (const uint32_t s : {17u, 19u, 23u, 29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u, 61u})
+        for (uint32_t k = 0; k < s; ++k)
+            for (uint32_t wd = 0; wd < 180; ++wd) {
+                uint32_t x = 0;
+                for (uint32_t bt = 0; bt < 32; ++bt)
+                    if ((30030u * k + M[wd * 32 + bt]) % s != 0) x |= 1u << bt;
+                pat.push_back(x);
+            }
+    uint32_t* d_pat = static_cast<uint32_t*>(ctx.alloc_device(pat.size() * 4));
+    ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
+    kb.set_arg(7, sizeof(d_pat), &d_pat);
+    const auto t0 = clock_::now();
+    kb.launch(ctx.list(), (mt_blocks + 63) / 64);   // MT_CB
+    ctx.host_sync();
+    Context::free_mem(ctx.context(), d_pat);
+    if (verbose)
+        std::fprintf(stderr, "hl_mt: table %.1f MB built in %.1f ms\n", double(words) * 4 / 1e6,
+                     std::chrono::duration<double, std::milli>(clock_::now() - t0).count());
+    const uint32_t nchk = env::u32("GB_MT_CHECK", 0, 0, 100000000u);
+    if (nchk > 0) {
+        uint32_t* h = static_cast<uint32_t*>(ctx.alloc_shared(words * 4));
+        ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), h, d_mtab, words * 4, nullptr, 0, nullptr));
+        ctx.host_sync();
+        uint64_t x = 0x9E3779B97F4A7C15ull, bad = 0, ones = 0;
+        for (uint32_t i = 0; i < nchk; ++i) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            const uint64_t bit = (i < 2 * 5760) ? i : x % (uint64_t(words) * 32);
+            const uint64_t m = (mt_k_lo + bit / 5760) * 30030ull + M[bit % 5760];
+            const bool t = (h[bit >> 5] >> (bit & 31)) & 1u;
+            ones += t;
+            if (t != is_prime_u64(m)) {
+                if (bad < 10) std::fprintf(stderr, "hl_mt: table bit %llu (m = %llu) = %d, wrong\n",
+                                           (unsigned long long)bit, (unsigned long long)m, int(t));
+                ++bad;
+            }
+        }
+        Context::free_mem(ctx.context(), h);
+        std::fprintf(stderr, "hl_mt: table check %u bits, %llu prime, %llu wrong\n", nchk,
+                     (unsigned long long)ones, (unsigned long long)bad);
+        if (bad) throw std::runtime_error("hl_mt: multiplier table wrong");
     }
 }
 
@@ -1547,7 +1711,7 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
                 // canonical tables (uploaded once): per class only the
                 // word offset of each group (primes.cpp)
                 const std::vector<uint32_t> ys = small_prime_group_offsets(
-                    sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period);
+                    sieve_primes, sg.mask_count_seg, sg.cgeo.Q[c], sg.cgeo.qmod, mask_period, mask_xp);
                 if (ys.size() != mask_groups_n)
                     throw std::runtime_error("class masks: group layout mismatch");
                 std::memcpy(b.group_y[sg.slot] + c * MAX_MASK_GROUPS_HOST, ys.data(), ys.size() * 4);
@@ -1591,7 +1755,8 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     k_sieve.set_arg(15, sizeof(own_end),       &own_end);
     k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
     k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
-    k_sieve.set_arg(18, sizeof(mask_groups_n), &mask_groups_n);
+    const uint32_t groups_xp = mask_groups_n | mask_xp << 8;   // make_prime_map: n_groups_xp
+    k_sieve.set_arg(18, sizeof(groups_xp), &groups_xp);
     k_sieve.set_arg(19, 4, &cm_u32);
     k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
     k_sieve.set_arg(21, 4, &sg.phis);
@@ -1739,6 +1904,12 @@ void DenseRun::enqueue_hitlists(const Segment& sg, uint32_t& hl_jb) {
         k_hlh->set_arg(10, sizeof(hl_capg), &hl_capg);
         k_hlh->set_arg(11, sizeof(d_hl_counts), &d_hl_counts);
         k_hlh->set_arg(12, sizeof(bkt_err), &bkt_err);
+        if (hl_mt) {
+            const uint32_t mt_words = mt_blocks * 180u;
+            k_hlh->set_arg(13, sizeof(d_mtab), &d_mtab);
+            k_hlh->set_arg(14, sizeof(mt_k_lo), &mt_k_lo);
+            k_hlh->set_arg(15, sizeof(mt_words), &mt_words);
+        }
         k_hlh->launch_overlap(ctx.list(), hl_G, ev.hl[sg.slot]);   // exactly hl_G: the region layout
         hl_used[sg.slot] = true;
     }
@@ -2334,6 +2505,7 @@ void DenseRun::release_device_objects() {
     Context::free_mem(ctx.context(), d_large_bases);
     if (d_hl_lists) Context::free_mem(ctx.context(), d_hl_lists);
     if (d_hl_counts) Context::free_mem(ctx.context(), d_hl_counts);
+    if (d_mtab) Context::free_mem(ctx.context(), d_mtab);
     Context::free_mem(ctx.context(), bkt_err);
     Context::free_mem(ctx.context(), d_full_bases);
     Context::free_mem(ctx.context(), d_full_gaps);
