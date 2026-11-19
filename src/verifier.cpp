@@ -398,6 +398,7 @@ private:
     void end_iteration(const Segment& sg);
     void drain_final_segment();
     void collect_slot(uint32_t sl, SegmentStats& rec);
+    void reset_slot_counters(uint32_t sl);
     void check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left);
 
     // Helpers (former lambdas of run_gpu)
@@ -978,10 +979,10 @@ void DenseRun::allocate_slot_buffers() {
         b.pending[s]   = static_cast<uint32_t*>(ctx.alloc_device(size_t(pending_cap) * 4));
         b.pending_n[s] = static_cast<uint32_t*>(ctx.alloc_shared(4));
         b.acct[s]      = static_cast<uint32_t*>(ctx.alloc_shared(8));
-        std::memset(b.acct[s], 0, 8);
         // Ridge append buffer: u32 count in word 0 (low half) + RIDGE_CAP
         // (n, p) pairs; shared so the host merges it without a D2H copy.
         b.ridge[s]     = static_cast<uint64_t*>(ctx.alloc_shared((1 + 2 * size_t(RIDGE_CAP)) * 8));
+        reset_slot_counters(s);
         b.p_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
         b.p_first[s] = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
         std::memset(b.p_hist[s], 0, (MAX_GB_PRIME / 2 + 1) * 4);
@@ -1887,15 +1888,12 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     // blocks forever (this caused size-dependent hangs). All events are
     // quiescent here: their previous signals belonged to segment k-2,
     // whose check kernel was host-synchronized during the last iteration.
+    // leftover_n / pending_n / acct / ridge's count are zeroed by the host
+    // after each collect (reset_slot_counters) instead of three 1-byte-
+    // pattern MemoryFills per segment (builtin fill kernels; long6 +0.14%).
+    // Under unitrace those fills appear to stall until count30 ends (67 us
+    // average): an instrumentation artefact, not a bubble of the real run.
     const uint32_t zero = 0;
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.acct[sg.slot], &zero, 4, 8,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
     // statistics: p_hist / p_first / x_cnt are reset by the host after
     // each collect (collect_stats); x_hist is used by sampled segments only
     if (stats_on && stats.segments % stats_sample == 0)
@@ -2480,6 +2478,18 @@ void DenseRun::collect_slot(uint32_t sl, SegmentStats& rec) {
                           prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
                           gstats.get(), sampled_slot[sl]);
     ridges->save(ridge_file);
+    reset_slot_counters(sl);
+}
+
+/// Zeroes slot @p sl's checker counters (leftover_n, pending_n, acct and the
+/// ridge count) from the host, as collect_stats does for p_hist / x_cnt.
+/// @pre no command that touches the slot is in flight (its check and count30
+///      events have fired, or the slot was never used).
+void DenseRun::reset_slot_counters(uint32_t sl) {
+    *b.leftover_n[sl] = 0;
+    *b.pending_n[sl] = 0;
+    b.acct[sl][0] = b.acct[sl][1] = 0;
+    *reinterpret_cast<uint32_t*>(b.ridge[sl]) = 0;
 }
 
 /// Positive coverage of a collected slot: every even of its segment must be
