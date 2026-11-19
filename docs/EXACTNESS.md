@@ -74,6 +74,28 @@ in `sieve_large_packed` at :3108, the harvest skip at :4344.
 **If violated.** A mark of a composite that the mask stage did not clear is
 dropped, so the map holds a composite as prime.
 
+## 2b. SLM skip set: m divisible by 7..29 (tile items, mid windows)
+
+**Rule.** The tile sieve's medium items (`med_prime_cop`) and the mid windows
+for p < MIDW_COP_MAXP (`mid_window` via `cop_marks`) skip a mark p·m when m
+is divisible by 7, 11, 13, 17, 19, 23 or 29: the mask stage cleared every
+multiple of these primes, and p·m ≠ r (p ≥ 83). A prime's marks along a class
+array have multipliers m, m + 30, m + 60, ...; with c = m · 30⁻¹ mod COP_M
+(COP_M = 7·11·…·29) mark t has m ≡ 30 (c + t), so r | m iff r | c + t.
+
+**Conditions.**
+- The mask stage covers 7..29 (MASK_MAX_P > 61, as rule 2; the verifier
+  throws if the medium items run without it).
+- c is right: the host writes it into the high word of the items' first bits
+  (`first_bits_class_range` with cop_j0 = own_end; the class bit itself stays
+  < 2³²), mid_setup into the second half of the i0 table. host_tests checks
+  30 c ≡ m (mod COP_M); check_constants checks COP_M and the inverses.
+- The per-word walk relies on no 32 consecutive c + t all being redundant
+  (the longest run for 7..29 is 8).
+
+**If violated.** A needed mark is skipped (wrong c) and the map holds a
+composite as prime: prime counts change, the run may still PASS.
+
 ## 3. Read-before-mark in the packed kernel
 
 **Rule.** `map_clear_chk` (kernels/goldbach.cl:336) reads the map word

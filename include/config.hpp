@@ -55,7 +55,11 @@ namespace gb {
 // packed kernel, the flattened phase B and the rest of the six rounds
 // (x1.72 / x1.74 vs v2.6.0 per 1e11, x1.89 per production slice vs v2.5.1);
 // the A/B switches they left are removed (refused). Results unchanged.
-inline constexpr const char* VERSION = "2.7.0";
+// v2.8.0 (round 10, 2026-11-19, HISTORY.md §9.2ad): the SLM stages (tile
+// medium items, mid windows for p < 131072) skip marks whose multiplier has a
+// factor 7..29; constant wheel tables generated into goldbach_tables.h; the
+// base-prime cache is checked beside the GPU init. Results unchanged.
+inline constexpr const char* VERSION = "2.8.0";
 
 // ---- make_prime_map geometry --------------------------------------------
 // One work-group = one tile. SLM holds 64-bit words; one bit represents one

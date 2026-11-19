@@ -25,7 +25,11 @@ cmake -S . -B build -DGB_WERROR=ON  # what CI builds (strict warnings as errors)
 ```
 
 With `ocloc` on `PATH`, CMake recompiles `kernels/*_bmg.spv` whenever a
-kernel source changes; without it the shipped modules are used. The
+kernel source changes; without it the shipped modules are used. By hand:
+`ocloc compile -file kernels/goldbach.cl -device bmg -output kernels/goldbach
+-options "-I kernels"` — goldbach.cl includes its generated constant tables,
+`kernels/goldbach_tables.h` (rerun `python3 kernels/gen_tables.py` after
+changing the generator; ctest `kernel_tables` fails on a stale header). The
 validators and benchmark tools live in the companion repository
 [goldbach-tools](https://github.com/SINF-KEN/goldbach-tools), cloned next to
 this one (`tools -> ../goldbach-tools`); without it only `goldbach_l0`,
@@ -121,7 +125,9 @@ instead).
 - Kernel modules: deterministic for the pinned ocloc; CI enforces
   byte-identity. Only `.spv` is shipped (`.bin` is local ocloc output).
 - Base primes: regenerated deterministically when no valid cache exists;
-  caches are content-checked on load.
+  caches are hash- and content-checked before any result is trusted (the
+  dense verifier checks beside its GPU init; a damaged file fails the run
+  and is moved to `<file>.bad`).
 - Results: `--csv` reports `version=`; the statistics log records each run;
   production journal rows record the release and the verifier's full output.
 - The companion goldbach-tools repository is versioned separately; CI

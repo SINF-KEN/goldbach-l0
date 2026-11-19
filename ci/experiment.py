@@ -163,7 +163,8 @@ def main():
             if not ocloc:
                 sys.exit("ocloc not found")
             cmd = ["nice", "-n", "10", ocloc, "compile", "-file", t["src"] / "kernels/goldbach.cl",
-                   "-device", "bmg", "-output", out / "spv" / lb] + (["-options", opts] if opts else [])
+                   "-device", "bmg", "-output", out / "spv" / lb,
+                   "-options", f"-I {t['src'] / 'kernels'} {opts}".strip()]   # goldbach_tables.h
             rc, o = g.sh(cmd, cwd=out / "spv", logf=out / "spv" / f"{lb}.log", timeout=1800)
             spv = out / "spv" / f"{lb}_bmg.spv"
             if rc != 0 or not spv.exists():

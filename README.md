@@ -22,7 +22,13 @@ compiled to SPIR-V and a C++23 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts, prime gaps).
 
-**v2.7.0: 132 billion even numbers per second** at 4×10¹⁸ (131 G at the
+**v2.8.0: 140 billion even numbers per second** at 4×10¹⁸ (139.7 G at the
+top of the range) with exact statistics and prime gaps on, **+6.2% / +6.4%
+over v2.7.0** with byte-identical results: the SLM sieve stages skip marks
+`p·m` whose multiplier `m` has a factor 7..29, which the mask stage has
+already cleared (HISTORY.md §9.2ad).
+
+v2.7.0 reached **132 billion even numbers per second** at 4×10¹⁸ (131 G at the
 top of the range, 2.4 J per 10⁹ evens) with exact statistics and prime gaps
 on: **×1.72 / ×1.74 over v2.6.0**, and a full 5×10¹³ production slice in
 **193 s instead of 364 s** (×1.89 over the v2.5.1 release it replaces, with

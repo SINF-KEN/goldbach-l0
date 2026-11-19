@@ -187,10 +187,11 @@ void PrimeCacheView::release() noexcept {
     owned_.shrink_to_fit();
     ptr_ = nullptr;
     count_ = 0;
+    pending_ = {};
 }
 
 bool PrimeCacheView::map_file(const std::string& file, uint64_t n, bool allow_larger,
-                              PrimeCacheView& out) {
+                              PrimeCacheView& out, bool defer_check) {
     const int fd = ::open(file.c_str(), O_RDONLY);
     if (fd < 0) return false;
     struct stat st{};
@@ -213,7 +214,8 @@ bool PrimeCacheView::map_file(const std::string& file, uint64_t n, bool allow_la
     ::close(fd);
     if (!why) {
         const auto* p = reinterpret_cast<const uint32_t*>(static_cast<const char*>(m) + CACHE_HEADER);
-        if (prime_payload_hash(p, size_t(cnt)) != hash) why = "payload hash mismatch";
+        if (defer_check) {}
+        else if (prime_payload_hash(p, size_t(cnt)) != hash) why = "payload hash mismatch";
         else if (!prime_payload_ok(p, size_t(cnt), lim)) why = "payload content check failed";
         if (why) munmap(m, size_t(st.st_size));
         else {
@@ -224,6 +226,7 @@ bool PrimeCacheView::map_file(const std::string& file, uint64_t n, bool allow_la
             out.count_ = lim > n            // primes <= n only (a prefix: the payload is ascending)
                 ? size_t(std::upper_bound(p, p + cnt, uint32_t(std::min<uint64_t>(n, UINT32_MAX))) - p)
                 : size_t(cnt);
+            out.pending_ = defer_check ? Pending{file, size_t(cnt), lim, hash} : Pending{};
             return true;
         }
     }
@@ -231,12 +234,26 @@ bool PrimeCacheView::map_file(const std::string& file, uint64_t n, bool allow_la
     return false;
 }
 
-PrimeCacheView PrimeCacheView::load(uint64_t n, const char* cache_path) {
+const char* PrimeCacheView::deferred_check() const {
+    if (pending_.file.empty()) return nullptr;
+    const auto* p = reinterpret_cast<const uint32_t*>(static_cast<const char*>(map_) + CACHE_HEADER);
+    const char* why = prime_payload_hash(p, pending_.cnt) != pending_.hash ? "payload hash mismatch"
+                    : !prime_payload_ok(p, pending_.cnt, pending_.lim) ? "payload content check failed"
+                    : nullptr;
+    if (why) {
+        std::fprintf(stderr, "error: prime cache %s failed its check (%s): renamed to %s.bad\n",
+                     pending_.file.c_str(), why, pending_.file.c_str());
+        std::rename(pending_.file.c_str(), (pending_.file + ".bad").c_str());
+    }
+    return why;
+}
+
+PrimeCacheView PrimeCacheView::load(uint64_t n, const char* cache_path, bool defer_check) {
     PrimeCacheView view;
     const char* path = cache_path ? cache_path : "base_primes.cache";
     // Keyed filename: caches for different limits coexist.
     const std::string keyed = std::string(path) + "." + std::to_string(n);
-    if (map_file(keyed, n, false, view)) return view;
+    if (map_file(keyed, n, false, view, defer_check)) return view;
     // Next: the smallest keyed cache <path>.<L> with L > n, exposing its
     // primes <= n, so every run below one big cache (e.g. sqrt(5e18)) shares
     // it instead of writing a ~430 MB file per distinct --limit.
@@ -255,7 +272,7 @@ PrimeCacheView PrimeCacheView::load(uint64_t n, const char* cache_path) {
             const uint64_t L = std::strtoull(num.c_str(), nullptr, 10);
             if (L > n && (best == 0 || L < best)) best = L;
         }
-        if (best && map_file((dir / (stem + std::to_string(best))).string(), n, true, view))
+        if (best && map_file((dir / (stem + std::to_string(best))).string(), n, true, view, defer_check))
             return view;
     }
     // Slow path (~2.6 s at sqrt(5e18)): generate, publish the keyed cache.

@@ -88,10 +88,12 @@ goldbach-l0/
 │   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
 │   └── sparse.cpp          run_gpu_sparse
 ├── kernels/
-│   ├── goldbach.cl         dense kernels: make_prime_map, sieve_large_packed,
-│   │                       hl_harvest / hl_apply, check30_*, count30;
+│   ├── goldbach.cl         dense kernels: make_prime_map, mid_window, sieve_large_packed,
+│   │                       mt_build / hl_harvest_mt / hl_apply, check30_*, count30;
 │   │                       validation kernels (sieve_large_primes, prep_large_fb,
 │   │                       unpack_large_test, map_compare)
+│   ├── goldbach_tables.h   its constant wheel tables (GENERATED: gen_tables.py;
+│   │                       ocloc needs -I kernels; ctest kernel_tables checks it)
 │   ├── sparse.cl           sparse kernels
 │   └── *_bmg.spv           shipped modules (byte-identical to the pinned ocloc)
 ├── tests/                  host_tests, stats_ref, check_constants, cli_tests,
@@ -149,7 +151,7 @@ A_W64 8 / 10 / 14 / 16 windows, and the timing-only ablations (ABL_*,
 LARGE_NOMARK; sparse.cl ABLL_* / ABL3_* / ABL_NOPEND). The host's GB_WHEEL_W
 and GB_BUCKET_WHEEL (usable only with such a rebuilt module) went with them,
 as did the run-time switches that only restored a superseded path or served
-one measurement: GB_TWIN=0 (plain v1.9.0 checker; CHECK_PHASE_A_CANDS /
+one measurement: GB_TWIN=0 (plain v1.9.0 checker, refused since 2026-11-19; CHECK_PHASE_A_CANDS /
 GB_CHECK_CAP with it), GB_HL_FUSE=0, GB_UPLOAD_STAGED, GB_BUCKET_RESET_BARRIER,
 GB_WRITE_CHECKED and GB_CHECK_NCAND. Host-mirrored kernel constants without a
 host override (WG_SIZE, WORDS_PER_ITEM, LARGE_PRIMES_PER_ITEM, MASK_MAX_P,
@@ -510,6 +512,12 @@ the design record.
   PrimeCacheView::map_file mmaps it and checks size, hash and content
   (keyed filename so different limits coexist; zero-copy payload; a
   pre-v2.6 "GBPR" file is reported and regenerated, ~2.6 s at sqrt(5e18)).
+  The dense verifier maps the cache with the hash + content check deferred
+  (`load(..., defer_check)`) and runs `deferred_check()` on a thread beside
+  its GPU init (started after the module load: a live second thread made
+  zeInit ~60 ms slower), joined before the segment loop: init 0.645 ->
+  0.527 s per process. A failed check renames the file to `<file>.bad` and
+  fails the run (the retry regenerates the cache).
   `small_prime_mask_table`: 64 masks per prime indexed by word-index mod
   p; q_first must be ODD. `is_prime_u64`: deterministic Miller-Rabin,
   bases {2,3,5,7,11,13,17,19,23,29,31,37}, valid for all u64.

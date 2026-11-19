@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -318,6 +319,10 @@ struct RunSetup {
 
     // ---- load_base_primes -------------------------------------------------
     gb::PrimeCacheView prime_view;
+    // its payload check (hash + content, ~0.12 s), run beside the GPU init
+    // (DenseRun::run) and joined at the end of init (create_events); declared
+    // after prime_view, so an early exit joins it before the mapping goes away
+    std::future<const char*> cache_check;
     const uint32_t* sieve_primes = nullptr;  // mmap-backed (or owned) by prime_view
     double cache_seconds = 0.0;
     uint32_t mask_count = 0;         // primes < 64: the small-prime mask path
@@ -407,6 +412,7 @@ private:
     // bucket ring, which only A/B knobs still reached.
     static constexpr uint32_t ncls_map = 8;
     const uint32_t cm_u32 = 2;       // kernel class-mode argument
+    bool med_cop = false;            // first bits carry med_prime_cop residues (items)
     uint32_t a_w64 = 0;              // phase-A item width (CHECK_PHASE_A_W64)
     // checked[] (bit per even) is validation output of the tools only: the
     // verifier passes write_checked = 0 and no buffer (the kernels never
@@ -567,7 +573,7 @@ void RunSetup::resolve_range() {
     if (limit < 4) throw std::runtime_error("limit < 4: no even n >= 4 to verify");
     // Knobs of the checkers and map layouts removed in v2.6 are refused, not
     // ignored: a run asking for one would otherwise silently run something else.
-    for (const char* gone : {"GB_SPLIT", "GB_SPLIT_CAP", "GB_SPLIT_STAGES", "GB_TWIN_CAP", "GB_C30",
+    for (const char* gone : {"GB_SPLIT", "GB_SPLIT_CAP", "GB_SPLIT_STAGES", "GB_TWIN", "GB_TWIN_CAP", "GB_C30",
                              "GB_CLASSMAP", "GB_HITLIST", "GB_MASK_GROUPS"})
         if (env::present(gone))
             throw std::runtime_error(std::string(gone) + " was removed in v2.6 (the mod-30 map and "
@@ -632,7 +638,7 @@ void RunSetup::load_base_primes() {
     const auto t_cache = clock_::now();
     prime_view = gb::PrimeCacheView::load(
         std::max<uint64_t>(sqrt_limit, 64),
-        prime_cache_path ? prime_cache_path : "base_primes.cache");
+        prime_cache_path ? prime_cache_path : "base_primes.cache", true);
     // mmap-backed (or owned) read-only prime list; no intermediate copy.
     sieve_primes = prime_view.data();
     cache_seconds = seconds_since(t_cache);
@@ -667,20 +673,13 @@ void RunSetup::load_base_primes() {
     // 34K -0.11%, 36K -0.11% (long-end -0.06%), 38K 0.0%, 42K +0.27% -> 36K.
     // v2.6 mid-prime SLM windows (HISTORY.md §9.2x): primes [split, GB_MIDWIN)
     // go to mid_window, and the auto split drops to MIDWIN_SPLIT (2026-11-17
-    // grid: split 800..3500 x bound 2..4M within 0.3%). They need the mod-30
-    // class map (the twin and split checkers on, GB_CLASSMAP default),
+    // grid: split 800..3500 x bound 2..4M within 0.3%). They need
     // q >= 2^60 (mod_ff) and class arrays < 2^24 bits (exact float
     // remainders); otherwise the old split. GB_MIDWIN=0 disables.
     midwin_p2 = env::u64("GB_MIDWIN", MIDWIN_P2_DEFAULT, 0, UINT32_MAX);
     {
-        const auto is = [](const char* k, const char* v) {
-            const char* e = env::raw(k);
-            return e && std::string(e) == v;
-        };
         const uint64_t qof_est = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
-        midwin_pre = midwin_p2 > 0 && !is("GB_TWIN", "0") && !is("GB_SPLIT", "0") &&
-                     !is("GB_CLASSMAP", "0") && !is("GB_CLASSMAP", "6") &&
-                     start_even >= (uint64_t(1) << 60) + MAX_GB_PRIME + 2 &&
+        midwin_pre = midwin_p2 > 0 && start_even >= (uint64_t(1) << 60) + MAX_GB_PRIME + 2 &&
                      (qof_est + 14) / 15 < (uint64_t(1) << 24);
     }
     if (sieve_split == 0 || sieve_split > sieve_count)
@@ -838,6 +837,12 @@ void DenseRun::set_group_sizes() {
         if (v.size() < 65536)
             for (const It& t : v) { med_items_host.push_back(t.j); med_items_host.push_back(t.w); }
     }
+    // The items run med_prime_cop: the first bits of their primes carry the
+    // multiplier residue, and its skips rely on the mask stage clearing
+    // every multiple of 7..29 (docs/EXACTNESS.md).
+    med_cop = !med_items_host.empty();
+    if (med_cop && !(mask_count > 0 && sieve_primes[mask_count - 1] >= 29))
+        throw std::runtime_error("medium items need the mask stage through 29");
     k_sieve.set_group_size(WG_SIZE);
     // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
     // kernel indexes by global id). N must be a non-zero multiple of the
@@ -1277,7 +1282,7 @@ void DenseRun::allocate_large_prime_buffers() {
         k_mids->set_group_size(WG_SIZE);
         k_midw->set_group_size(midw_wg);
         for (int s = 0; s < 2; ++s)
-            d_mid_i0[s] = static_cast<uint32_t*>(ctx.alloc_device(size_t(mid_n) * 8 * 4));
+            d_mid_i0[s] = static_cast<uint32_t*>(ctx.alloc_device(size_t(mid_n) * 16 * 4));  // i0 + residues
         if (verbose)
             std::fprintf(stderr, "mid windows: primes [%u, %u], %u primes, %u-bit windows, wg %u\n",
                          sieve_primes[sieve_split], sieve_primes[mid_end - 1], mid_n,
@@ -1574,6 +1579,10 @@ void DenseRun::create_events() {
     // segment). Pools are per-event so each can be reset independently.
     init_mark("upload");
     ev.create(ctx.context());
+    // nothing computed from the base primes is trusted before their cache passed
+    if (const char* why = cache_check.get())
+        throw std::runtime_error(std::string("base-prime cache damaged (") + why + "): moved aside, rerun");
+    init_mark("cache check (joined)");
 
     stats.init_seconds = seconds_since(t_start);
     stats.init_cache_s  = cache_seconds;
@@ -1762,7 +1771,7 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
         // the host loop's.
         parallel_for(0, sieve_split, 6, [&](uint32_t j0, uint32_t j1) {
             first_bits_class_range(fb_host.data(), sieve_primes, sieve_split, j0, j1,
-                                   sg.q_first, sg.q_last, sg.cgeo);
+                                   sg.q_first, sg.q_last, sg.cgeo, med_cop ? own_end : UINT32_MAX);
             for (uint32_t c = 0; c < sg.cgeo.K; ++c)
                 std::memcpy(b.first_bits[sg.slot] + size_t(c) * sieve_split + j0,
                             fb_host.data() + size_t(c) * sieve_split + j0, size_t(j1 - j0) * 8);
@@ -2607,6 +2616,10 @@ void DenseRun::release_device_objects() {
 RunStats DenseRun::run() {
     // ---- Level Zero setup (ctx, mod and the first four kernels: DenseRun's
     // member initializers) -----------------------------------------------------
+    // The base-prime cache check runs beside the rest of init (buffers,
+    // uploads, mt_build: ~0.5 s). Started only now: a second thread alive
+    // during zeInit / module creation made those ~60 ms slower.
+    cache_check = std::async(std::launch::async, [this] { return prime_view.deferred_check(); });
     configure_checkers();
     configure_ridges_and_stats();
     set_group_sizes();

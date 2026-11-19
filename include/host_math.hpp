@@ -122,9 +122,18 @@ ClassGeo class_geometry(uint64_t q_first, uint64_t q_odds, uint32_t K = 2);
 /// @post  for j in [j0, j1), every class c: fb[c * sieve_split + j] = (q - Q[c]) / qmod
 ///        for the smallest q >= max(p^2, q_first), q = 0 mod p, q in class c,
 ///        q <= q_last; ~0 if none (or p | qmod). Other entries untouched.
+///        For j >= cop_j0 (K = 8) a found entry also carries, in its high
+///        word, c = (m mod COP_M) * 30^-1 mod COP_M for its q = m p (the
+///        medium stage's med_prime_cop; the bit itself is < 2^32 there).
 void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
                             uint32_t sieve_split, uint32_t j0, uint32_t j1,
-                            uint64_t q_first, uint64_t q_last, const ClassGeo& g);
+                            uint64_t q_first, uint64_t q_last, const ClassGeo& g,
+                            uint32_t cop_j0 = UINT32_MAX);
+
+/// COP_M in kernels/goldbach.cl: 7 * 11 * 13 * 17 * 19 * 23 * 29 (the mask
+/// primes whose multiples med_prime_cop skips), and 30^-1 mod COP_M.
+inline constexpr uint64_t COP_M = 215656441;
+inline constexpr uint64_t COP_INV30 = 208467893;
 
 /// Per-tile first-mark table for the table path (u32, tile-major: row t holds
 /// the tile-local first bit of every prime in tile t, UINT32_MAX = none).

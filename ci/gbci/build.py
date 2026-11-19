@@ -70,7 +70,7 @@ def kernel_freshness(wt, logf):
         for ln in mods.group(1).splitlines():
             label, src, opts = (ln.strip().split("|") + ["", ""])[:3]
             cmd = ["nice", "-n", "15", oc, "compile", "-file", wt / src, "-device", "bmg", "-output", f"{td}/{label}"]
-            rc, _ = sh(cmd + (["-options", opts] if opts else []), cwd=td, logf=logf)
+            rc, _ = sh(cmd + ["-options", f"-I {(wt / src).parent} {opts}".strip()], cwd=td, logf=logf)
             fresh, shipped = Path(td) / f"{label}_bmg.spv", wt / "kernels" / f"{label}_bmg.spv"
             if rc != 0 or not fresh.exists() or not shipped.exists() or fresh.read_bytes() != shipped.read_bytes():
                 bad.append(label)
