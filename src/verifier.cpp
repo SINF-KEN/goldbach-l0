@@ -39,7 +39,6 @@ double seconds_since(clock_::time_point t0) {
 //
 //   d_prime_map   : odd-prime bitset for the current q segment
 //                   bit i  <->  q = q_first + 2*i
-//   d_checked     : bit-packed verification state, bit i <-> even n index i
 //   d_gb_primes   : uint16 candidate primes p <= 9781 (uploaded once)
 //   d_sieve_primes: uint32 base primes (uploaded once)
 //   d_leftovers   : uint32 indices of unresolved even numbers
@@ -53,7 +52,6 @@ struct GpuBuffers {
     // Per-slot buffers: the segment pipeline alternates between slot 0 and
     // slot 1 so segment k's GPU work overlaps segment k-1's host work.
     uint64_t* prime_map[2]  = {};  // odd-prime bitset for the q segment
-    uint64_t* checked[2]    = {};  // bit i <-> even n index i
     uint64_t* first_bits[2] = {};  // per-prime first markable bit (segment-global)
     uint64_t* mask_table[2] = {};  // small-prime word masks (per segment: q_first-dependent)
     uint32_t* leftovers[2]  = {};  // compact exception list
@@ -410,7 +408,11 @@ private:
     static constexpr uint32_t ncls_map = 8;
     const uint32_t cm_u32 = 2;       // kernel class-mode argument
     uint32_t a_w64 = 0;              // phase-A item width (CHECK_PHASE_A_W64)
-    const uint32_t write_checked = 0;   // checked[] is validation output (tools) only
+    // checked[] (bit per even) is validation output of the tools only: the
+    // verifier passes write_checked = 0 and no buffer (the kernels never
+    // touch it then; tools/debug_check_hi.cpp allocates its own)
+    const uint32_t write_checked = 0;
+    uint64_t* const no_checked = nullptr;
     Plan30 plan30;
     std::unique_ptr<Kernel> k_ca, k_cb;
 
@@ -439,8 +441,7 @@ private:
     // ---- size_buffers ---------------------------------------------------------
     GpuBuffers b;                    // every device / shared buffer (allocated below)
     uint64_t map_words = 0;          // prime map per slot (whole tiles)
-    uint32_t chk_stride30 = 0;       // mod-30 checker: words per class of checked[]
-    uint64_t chk_words = 0;          // checked[] per slot
+    uint32_t chk_stride30 = 0;       // mod-30 checker: words per class of checked[] (unused: no buffer)
     uint32_t pending_cap = 0;        // two-phase checker: pending list capacity
     uint64_t table_bytes = 0;        // per-tile first-mark table per slot
     bool use_table = false;
@@ -864,10 +865,9 @@ void DenseRun::size_buffers() {
     const uint64_t tpc_max = (max_odds / 15 + 2 + BITS_PER_TILE - 1) / BITS_PER_TILE;
     const uint64_t map_tiles  = std::max(dense_tiles, ncls_map * tpc_max);
     map_words  = map_tiles * TILE_WORDS;
-    // checked[] (validation output only) holds the 15 even classes at
-    // chk_stride30 words each.
+    // checked[] (tools only) would hold the 15 even classes at chk_stride30
+    // words each; the kernels still take the stride.
     chk_stride30 = uint32_t((max_segment_evens / 15 + 1 + 63) / 64 + 1);
-    chk_words  = std::max<uint64_t>((max_segment_evens + 63) / 64, 15ull * chk_stride30);
     // Evens phase A leaves to phase B: ~0.045% of a segment at 4e18 (106K
     // of 233.75M), ~0.25% on a sampled segment (586K). Sized at 1/32 of the
     // segment (12x the sampled peak); the host fails closed if a segment
@@ -931,7 +931,6 @@ void DenseRun::size_buffers() {
 void DenseRun::allocate_slot_buffers() {
     for (int s = 0; s < 2; ++s) {
         b.prime_map[s]  = static_cast<uint64_t*>(ctx.alloc_device(map_words * 8));
-        b.checked[s]    = static_cast<uint64_t*>(ctx.alloc_device(chk_words * 8));
         // (v2.6: the unused S1 / S5 split maps that were kept "for v1.12.0's
         // device-memory layout" are gone: 1e12 at 4e18, 6 ABBA rounds, 0.03%.)
         // per-class tables back to back
@@ -2261,7 +2260,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     const uint32_t se32 = uint32_t(sg.seg_evens);
     k_ca->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_ca->set_arg(1, 4, &cw32);
-    k_ca->set_arg(2, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_ca->set_arg(2, sizeof(no_checked), &no_checked);
     k_ca->set_arg(3, 4, &chk_stride30);
     k_ca->set_arg(4, sizeof(b.c30_cands), &b.c30_cands);
     k_ca->set_arg(5, sizeof(b.c30_meta), &b.c30_meta);
@@ -2288,7 +2287,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     // (collection) order everything after it.
     if (stats_on) enqueue_count30(sg, false);
     k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
-    k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
+    k_cb->set_arg(1, sizeof(no_checked), &no_checked);
     k_cb->set_arg(2, 4, &chk_stride30);
     k_cb->set_arg(3, sizeof(b.c30_rest), &b.c30_rest);
     k_cb->set_arg(4, sizeof(b.c30_rtab), &b.c30_rtab);
@@ -2556,7 +2555,6 @@ void DenseRun::release_device_objects() {
     // Free GPU memory.
     for (int s = 0; s < 2; ++s) {
         Context::free_mem(ctx.context(), b.prime_map[s]);
-        Context::free_mem(ctx.context(), b.checked[s]);
         Context::free_mem(ctx.context(), b.first_bits[s]);
         Context::free_mem(ctx.context(), b.mask_table[s]);
         if (b.group_masks[s]) Context::free_mem(ctx.context(), b.group_masks[s]);
