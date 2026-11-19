@@ -26,28 +26,30 @@ primes, prime and twin-prime counts, prime gaps).
 top of the range) with exact statistics and prime gaps on, **+6.2% / +6.4%
 over v2.7.0** with byte-identical results: the SLM sieve stages skip marks
 `p·m` whose multiplier `m` has a factor 7..29, which the mask stage has
-already cleared (HISTORY.md §9.2ad).
+already cleared (HISTORY.md §9.2ad). A full 5×10¹³ production slice takes
+**181.3 s** (193.0 s with v2.7.0), so the whole [4×10¹⁸, 5×10¹⁸] takes about
+**42 days** on one B580.
 
 v2.7.0 reached **132 billion even numbers per second** at 4×10¹⁸ (131 G at the
 top of the range, 2.4 J per 10⁹ evens) with exact statistics and prime gaps
 on: **×1.72 / ×1.74 over v2.6.0**, and a full 5×10¹³ production slice in
 **193 s instead of 364 s** (×1.89 over the v2.5.1 release it replaces, with
-byte-identical statistics). The whole [4×10¹⁸, 5×10¹⁸] now takes about
-**45 days** on one B580 (83 days with v2.5.1). The gain comes from six
-rounds of kernel work (HISTORY.md §9.2ab), the largest being the
-**prime-multiplier hit lists**: for a prime `p ≥ ∛q` a mark `p·m` matters
-only when `m` is prime, which removes ~77% of the large-prime atomics. The
+byte-identical statistics), cutting the whole range from 83 to about 45
+days. The gain comes from six rounds of kernel work (HISTORY.md §9.2ab),
+the largest being the **prime-multiplier hit lists**: for a prime `p ≥ ∛q`
+a mark `p·m` matters only when `m` is prime, which removes ~77% of the
+large-prime atomics. The
 rules these fast paths rely on, and where each is checked, are in
 [docs/EXACTNESS.md](docs/EXACTNESS.md).
 
 | Document | Contents |
 |---|---|
 | [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | what PASS means, the mathematical argument, every invariant and its guard, the v2.3.0 and v2.6.0 audits |
-| [docs/EXACTNESS.md](docs/EXACTNESS.md) | the rules the fast paths (prime-multiplier hit lists, the 17..43 mark skip, read-before-mark, mod_ff_q) rely on, where each is enforced and what breaks |
+| [docs/EXACTNESS.md](docs/EXACTNESS.md) | the rules the fast paths (prime-multiplier hit lists, the 17..43 mark skip, the 7..29 SLM skip, read-before-mark, mod_ff_q) rely on, where each is enforced and what breaks |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | hardware and software, build, tests, CI, the kernel shipping procedure, reproducibility, production operation |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | how performance is measured and compared; raw data in [bench/](bench/) |
 | [docs/PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) | the detailed reference: configuration, CLI, environment, pipeline, kernels, host |
-| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2ac, numbered as before), the per-version performance record, the removed wheel path |
+| [docs/HISTORY.md](docs/HISTORY.md) | the log of every optimization kept or dropped (§9.2–§9.2ad, numbered as before), the per-version performance record, the removed wheel path |
 | [docs/PIPELINE.md](docs/PIPELINE.md) | the production run as a diagram, from `run_range.sh` to the journal |
 | [ci/README.md](ci/README.md) | the local CI: release gating, production control |
 
@@ -63,11 +65,13 @@ next:
 1. **`make_prime_map`** (tile sieve) — the map holds only `q` coprime to 30,
    as eight class arrays (one per residue mod 30); one work-group sieves one
    16 KB SLM tile: primes up to 79 by whole-word mask tables, the rest up
-   to the split (1500) as work items of ~100 marks with SLM atomics.
+   to the split (1500) as work items of ~100 marks with SLM atomics,
+   skipping marks whose multiplier has a factor 7..29 (the masks cleared them).
 2. **mid-prime windows** (`mid_setup` / `mid_window`) — primes from the
    split to 2.5×10⁶ are sieved in 128 KB SLM windows of each class array,
    one SLM atomic per mark instead of an L2 atomic; each window is ANDed
-   into the map at the end, so the packed kernel can overlap it.
+   into the map at the end, so the packed kernel can overlap it. Below
+   131072 the windows skip the same 7..29 multipliers as the tile sieve.
 3. **`sieve_large_packed`** — primes from 2.5×10⁶ to 2× the segment's odd
    count (~4.3×10⁸), streamed at one byte per prime; a division-free
    float-float modulo finds the first multiple, and only multipliers coprime
@@ -123,24 +127,29 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
-| Window (bench.py, 5 paired rounds) | v2.7.0 | v2.6.0 | change |
+| Window (bench.py, 5 paired rounds) | v2.8.0 | v2.7.0 | change |
 |---|---|---|---|
-| long — 10¹¹ at 4×10¹⁸ | **132.22 G evens/s** | 76.66 G | **+72.45%** (±0.12%) |
-| long-end — 10¹¹ ending at 5×10¹⁸ | **131.37 G** | 75.67 G | **+73.61%** (±0.07%) |
+| long — 10¹¹ at 4×10¹⁸ | **140.58 G evens/s** | 132.34 G | **+6.22%** (±0.08%) |
+| long-end — 10¹¹ ending at 5×10¹⁸ | **139.69 G** | 131.27 G | **+6.39%** (±0.04%) |
 
-| Full production slice (5×10¹³ at 4.14065×10¹⁸, `GB_BUCKET_VERIFY=500`, exact gaps) | wall | GPU | init |
+| Full production slice (5×10¹³, `GB_BUCKET_VERIFY=500`, exact gaps) | wall | GPU | init |
 |---|---|---|---|
-| v2.5.1 (release bb3a96f) | 364.1 s | 355.6 s | 8.4 s |
-| **v2.7.0** | **193.0 s** | 192.2 s | 0.7 s |
+| v2.5.1 (release bb3a96f, slice at 4.14065×10¹⁸) | 364.1 s | 355.6 s | 8.4 s |
+| v2.7.0 (same slice) | 193.0 s | 192.2 s | 0.7 s |
+| **v2.8.0** (production, slices at 4.1447×10¹⁸) | **181.3 s** | 180.8 s | 0.53 s |
 
-Measured 2026-11-18/19 with exact statistics including the exact prime-gap
-walk; the slice's `goldbach_stats.state`, `.state.gaps` and ridges are
-byte-identical between the two versions. Per 10¹¹ integers at 4×10¹⁸:
-large-prime sieve 125 ms (was 342 ms in v2.6.0), tile sieve 185 ms,
-checker and statistics 165 ms; the next segment's sieve overlaps the
-checker, so the parts add up to more than the 378 ms GPU time. v2.7.0
+v2.5.1 and v2.7.0 were measured on the same slice 2026-11-18/19 with exact
+statistics including the exact prime-gap walk; its `goldbach_stats.state`,
+`.state.gaps` and ridges are byte-identical between the two versions.
+v2.8.0 is the steady production rate on the evening of 2026-11-19 (same
+configuration; v2.7.0 averaged 193 s on the production slices before it).
+v2.6.0 → v2.7.0 was ×1.72 / ×1.74 on the bench windows (HISTORY.md §9.2ab).
+Per 10¹¹ integers, from the v2.8.0 production slices: tile sieve 162 ms
+(185 ms in v2.7.0), large-prime sieve 122 ms (342 ms in v2.6.0), checker
+and statistics 143 ms (165 ms); the next segment's sieve overlaps the
+checker, so the parts add up to more than the ~361 ms GPU time. v2.8.0
 needs ~7 GB of the B580's 12 GB (the prime-multiplier table and the hit
-lists) and ~0.7 s of start-up per process. The figure below is redrawn
+lists) and ~0.53 s of start-up per process. The figure below is redrawn
 for every new version (the `Version figures` workflow measures it against
 the previous one and opens a pull request). The history of every version and
 every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and

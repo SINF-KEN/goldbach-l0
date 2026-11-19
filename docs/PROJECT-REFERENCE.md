@@ -642,6 +642,14 @@ dominated and not comparable.)
 
 ### 13.2 Measured performance
 
+- v2.8.0 (2026-11-19, round 10, HISTORY.md §9.2ad): bench.py 5 paired
+  rounds vs v2.7.0: long **140.58 G** ev/s (132.34, +6.22% ±0.08%),
+  long-end **139.69 G** (131.27, +6.39% ±0.04%); 6e11 at 4e18, 3 rounds,
+  +6.31%. Production slices (5e13 at 4.1447e18, `GB_BUCKET_VERIFY=500`,
+  exact gaps, release 535dbab): **181.3 s** wall, GPU 180.8 s, init 0.53 s
+  (v2.7.0: 193 s). Per 1e11: tile sieve 162 ms, large 122 ms, checker +
+  statistics 143 ms. Full [4e18, 5e18] ~42 days. Device memory ~7 GB
+  (+12 MB for the mid-window skip table).
 - v2.7.0 (2026-11-18/19, speed rounds 2-7 + cleanup, HISTORY.md §9.2ab/ac):
   bench.py 5 paired rounds vs v2.6.0 (c3990ea): long **132.22 G** ev/s
   (76.66, +72.45% ±0.12%), long-end **131.37 G** (75.67, +73.61% ±0.07%);
