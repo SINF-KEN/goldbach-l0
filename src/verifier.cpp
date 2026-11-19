@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -318,6 +319,10 @@ struct RunSetup {
 
     // ---- load_base_primes -------------------------------------------------
     gb::PrimeCacheView prime_view;
+    // its payload check (hash + content, ~0.12 s), run beside the GPU init
+    // (DenseRun::run) and joined at the end of init (create_events); declared
+    // after prime_view, so an early exit joins it before the mapping goes away
+    std::future<const char*> cache_check;
     const uint32_t* sieve_primes = nullptr;  // mmap-backed (or owned) by prime_view
     double cache_seconds = 0.0;
     uint32_t mask_count = 0;         // primes < 64: the small-prime mask path
@@ -632,7 +637,7 @@ void RunSetup::load_base_primes() {
     const auto t_cache = clock_::now();
     prime_view = gb::PrimeCacheView::load(
         std::max<uint64_t>(sqrt_limit, 64),
-        prime_cache_path ? prime_cache_path : "base_primes.cache");
+        prime_cache_path ? prime_cache_path : "base_primes.cache", true);
     // mmap-backed (or owned) read-only prime list; no intermediate copy.
     sieve_primes = prime_view.data();
     cache_seconds = seconds_since(t_cache);
@@ -1574,6 +1579,10 @@ void DenseRun::create_events() {
     // segment). Pools are per-event so each can be reset independently.
     init_mark("upload");
     ev.create(ctx.context());
+    // nothing computed from the base primes is trusted before their cache passed
+    if (const char* why = cache_check.get())
+        throw std::runtime_error(std::string("base-prime cache damaged (") + why + "): moved aside, rerun");
+    init_mark("cache check (joined)");
 
     stats.init_seconds = seconds_since(t_start);
     stats.init_cache_s  = cache_seconds;
@@ -2607,6 +2616,10 @@ void DenseRun::release_device_objects() {
 RunStats DenseRun::run() {
     // ---- Level Zero setup (ctx, mod and the first four kernels: DenseRun's
     // member initializers) -----------------------------------------------------
+    // The base-prime cache check runs beside the rest of init (buffers,
+    // uploads, mt_build: ~0.5 s). Started only now: a second thread alive
+    // during zeInit / module creation made those ~60 ms slower.
+    cache_check = std::async(std::launch::async, [this] { return prime_view.deferred_check(); });
     configure_checkers();
     configure_ridges_and_stats();
     set_group_sizes();

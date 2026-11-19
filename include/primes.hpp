@@ -67,16 +67,27 @@ public:
     /// writes <cache_path>.<n>. A file is used only if it passes map_file.
     /// @param n           prime limit (inclusive), < 2^32.
     /// @param cache_path  cache base name; nullptr means "base_primes.cache".
+    /// @param defer_check a mapped file's payload checks (hash + content,
+    ///        ~0.12 s at sqrt(4e18)) are left to deferred_check(), which the
+    ///        caller MUST run before trusting any result computed from the
+    ///        primes (the dense verifier runs it beside its GPU init).
     /// @return a view of the odd primes <= n, ascending.
-    static PrimeCacheView load(uint64_t n, const char* cache_path);
+    static PrimeCacheView load(uint64_t n, const char* cache_path, bool defer_check = false);
 
     /// Maps one cache file and verifies it: format "GBP2", limit == @p n (or
     /// > n with @p allow_larger: only its primes <= n are exposed), exact
-    /// size, payload hash, content check. A present but damaged or outdated
-    /// file is reported on stderr.
+    /// size, payload hash, content check (the last two left to
+    /// deferred_check() with @p defer_check). A present but damaged or
+    /// outdated file is reported on stderr.
     /// @return true with @p out viewing the file; false (out unchanged) otherwise.
     static bool map_file(const std::string& file, uint64_t n, bool allow_larger,
-                         PrimeCacheView& out);
+                         PrimeCacheView& out, bool defer_check = false);
+
+    /// The payload checks a load(..., true) left open (nothing otherwise):
+    /// read-only, safe beside readers of data(). On a failure the cache file
+    /// is renamed to <file>.bad (the next run regenerates it).
+    /// @return nullptr if the payload passed (or none was pending), else why not.
+    const char* deferred_check() const;
     /// @return pointer to the first prime, or nullptr for an empty view.
     const uint32_t* data() const { return ptr_; }
     /// @return number of primes in the view.
@@ -85,6 +96,8 @@ public:
 private:
     void move_from(PrimeCacheView& other) noexcept {
         owned_ = std::move(other.owned_);
+        pending_ = std::move(other.pending_);
+        other.pending_ = {};
         ptr_ = other.ptr_;
         count_ = other.count_;
         map_ = other.map_;
@@ -101,6 +114,11 @@ private:
     size_t count_ = 0;
     void* map_ = nullptr;
     size_t map_len_ = 0;
+    struct Pending {                   // a deferred payload check (load with defer_check)
+        std::string file;              // empty: none pending
+        size_t cnt = 0;                // the whole payload (not only the exposed prefix)
+        uint64_t lim = 0, hash = 0;    // header values
+    } pending_;
 };
 
 /// Small-prime word-mask table for the GPU sieve (see goldbach.cl stage 3a).

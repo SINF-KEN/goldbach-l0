@@ -125,7 +125,9 @@ instead).
 - Kernel modules: deterministic for the pinned ocloc; CI enforces
   byte-identity. Only `.spv` is shipped (`.bin` is local ocloc output).
 - Base primes: regenerated deterministically when no valid cache exists;
-  caches are content-checked on load.
+  caches are hash- and content-checked before any result is trusted (the
+  dense verifier checks beside its GPU init; a damaged file fails the run
+  and is moved to `<file>.bad`).
 - Results: `--csv` reports `version=`; the statistics log records each run;
   production journal rows record the release and the verifier's full output.
 - The companion goldbach-tools repository is versioned separately; CI

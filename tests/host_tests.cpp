@@ -141,6 +141,14 @@ void test_prime_cache()
             const auto view = PrimeCacheView::load(n, kb.c_str());
             check(view.size() == good.size() && std::equal(good.begin(), good.end(), view.data()),
                   std::string("PrimeCacheView refuses a cache with a ") + why);
+            {   // deferred check (the dense verifier's path): maps the file,
+                // deferred_check() refuses it and moves it aside
+                write(kb + "." + std::to_string(n), pl);
+                const auto dv = PrimeCacheView::load(n, kb.c_str(), true);
+                check(dv.deferred_check() != nullptr, std::string("deferred check refuses a cache with a ") + why);
+                check(!fs::exists(kb + "." + std::to_string(n)) && fs::exists(kb + "." + std::to_string(n) + ".bad"),
+                      std::string("deferred check moves the damaged cache aside (") + why + ")");
+            }
             const std::string fp = kb + ".direct";
             write(fp, pl);                                                // fread path
             check(segmented_odd_primes_up_to_cached(n, fp.c_str()) == good,
@@ -166,6 +174,19 @@ void test_prime_cache()
                   "PrimeCacheView refuses a cache with a replaced prime (payload hash)");
             check(segmented_odd_primes_up_to_cached(n, f.c_str()) == good,
                   "cached loader refuses a cache with a replaced prime (payload hash)");
+            {   // deferred: a good cache passes, the same damage is caught
+                const auto ok = PrimeCacheView::load(n, kb.c_str(), true);
+                check(ok.size() == good.size() && ok.deferred_check() == nullptr,
+                      "deferred check passes a good cache");
+                o = std::fopen(f.c_str(), "r+b");
+                std::fseek(o, long(28 + 4 * i), SEEK_SET);
+                std::fwrite(&composite, 4, 1, o);
+                std::fclose(o);
+                const auto dv = PrimeCacheView::load(n, kb.c_str(), true);
+                const char* why = dv.deferred_check();
+                check(why && std::string(why) == "payload hash mismatch" && fs::exists(f + ".bad"),
+                      "deferred check refuses a replaced prime (payload hash) and moves the file aside");
+            }
         }
         {   // a pre-hash "GBPR" cache (header and payload intact) is not trusted
             const std::string kb = (dir / "cv_old").string(), f = kb + "." + std::to_string(n);

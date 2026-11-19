@@ -512,6 +512,12 @@ the design record.
   PrimeCacheView::map_file mmaps it and checks size, hash and content
   (keyed filename so different limits coexist; zero-copy payload; a
   pre-v2.6 "GBPR" file is reported and regenerated, ~2.6 s at sqrt(5e18)).
+  The dense verifier maps the cache with the hash + content check deferred
+  (`load(..., defer_check)`) and runs `deferred_check()` on a thread beside
+  its GPU init (started after the module load: a live second thread made
+  zeInit ~60 ms slower), joined before the segment loop: init 0.645 ->
+  0.527 s per process. A failed check renames the file to `<file>.bad` and
+  fails the run (the retry regenerates the cache).
   `small_prime_mask_table`: 64 masks per prime indexed by word-index mod
   p; q_first must be ODD. `is_prime_u64`: deterministic Miller-Rabin,
   bases {2,3,5,7,11,13,17,19,23,29,31,37}, valid for all u64.
