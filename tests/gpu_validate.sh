@@ -17,9 +17,13 @@
 #    verification of the hit-listed primes against a full packed-kernel
 #    rebuild at both ends of [4e18, 5e18], ragged segments and multi-batch
 #    hit lists included;
-# 3. the bit-exact kernel validators when goldbach-tools is checked out
+# 3. the Level Zero validation layer (oneapi-src/level-zero): --info, a dense
+#    and a sparse run under parameter validation, handle lifetime tracking,
+#    the events checker and the leak checker; any checker warning, leak or
+#    failed core API call fails, and so does a layer that did not load;
+# 4. the bit-exact kernel validators when goldbach-tools is checked out
 #    (debug_check_hi, debug_map, debug_sieve, debug_fb).
-# "quick" skips 3 and the larger windows (~2 min instead of ~12).
+# "quick" skips 4 and the larger windows (~2 min instead of ~12).
 # Never touches the campaign files: every run writes into a temp directory.
 set -u
 BUILD=$(readlink -f "${1:-build}")
@@ -108,7 +112,47 @@ e2e "X=1" --start 1000000000000000 --limit 1000000100000000 --segment 1000000
 if "$BIN" --cpu-check 1000000 2>&1 | grep -q PASS; then echo "  ok   --cpu-check 1000000"
 else echo "  FAIL --cpu-check"; fail=$((fail + 1)); fi
 
-# --- 3. bit-exact kernel validators (goldbach-tools) ---------------------------
+# --- 3. Level Zero validation layer ------------------------------------------
+# The loader skips a layer it cannot load without a word, so the leak checker's
+# report ("Check balance of create/destroy calls", printed at exit) is required
+# as proof the layer ran. Failed core calls come from the loader log (trace
+# level: the layer logs every non-SUCCESS result there); Sysman (zes*) calls
+# are left out, as an unsupported sensor is expected and never fails a run.
+# Small windows: the events checker keeps a graph of every append.
+echo "== Level Zero validation layer"
+vl() {      # vl LABEL goldbach_l0 args...
+    local label=$1; shift
+    local log=$T/l0log
+    rm -rf "$log" "$T/st.state" "$T/st.log"; mkdir -p "$log"
+    out=$(ZE_ENABLE_VALIDATION_LAYER=1 ZE_ENABLE_PARAMETER_VALIDATION=1 ZE_ENABLE_HANDLE_LIFETIME=1 \
+          ZEL_ENABLE_EVENTS_CHECKER=1 ZEL_ENABLE_BASIC_LEAK_CHECKER=1 \
+          ZEL_ENABLE_LOADER_LOGGING=1 ZEL_LOADER_LOGGING_LEVEL=trace ZEL_LOADER_LOG_DIR="$log" \
+          GB_STATS_STATE="$T/st.state" GB_STATS_LOG="$T/st.log" "$BIN" "$@" 2>&1)
+    local rc=$?
+    local bad
+    bad=$( { printf '%s\n' "$out" | grep -E '^Warning: |LEAK = '
+             cat "$log"/*.log 2>/dev/null | grep -E 'ERROR \(.*\) in ze[A-Z]'; } | head -20)
+    if [ $rc != 0 ]; then
+        echo "  FAIL $label: exit $rc"; printf '%s\n' "$out" | tail -5; fail=$((fail + 1))
+    elif [[ "$out" != *"Check balance of create/destroy calls"* ]]; then
+        echo "  FAIL $label: validation layer not loaded (libze_validation_layer.so missing?)"
+        fail=$((fail + 1))
+    elif [ -n "$bad" ]; then
+        echo "  FAIL $label:"; printf '%s\n' "$bad" | sed 's/^/    /'; fail=$((fail + 1))
+    elif [ "$label" != info ] && [[ "$out" != *result=PASS* || "$out" != *leftovers=0* ]]; then
+        echo "  FAIL $label: no PASS"; printf '%s\n' "$out" | tail -3; fail=$((fail + 1))
+    else
+        echo "  ok   $label"
+    fi
+}
+vl info --info
+VW="--start 4000000000000000000 --limit 4000000002000000000 --csv"
+# shellcheck disable=SC2086
+vl dense $VW
+# shellcheck disable=SC2086
+vl sparse $VW --sparse
+
+# --- 4. bit-exact kernel validators (goldbach-tools) ---------------------------
 if [ -z "$QUICK" ]; then
     echo "== kernel validators"
     for v in debug_check_hi debug_map debug_sieve debug_fb; do
