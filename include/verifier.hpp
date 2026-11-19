@@ -18,15 +18,16 @@ struct SegmentStats {
     uint64_t tiles          = 0;   // SLM tile work-groups in the tile sieve
     uint64_t large_items    = 0;   // large-prime kernel work-items
     uint32_t sieve_split    = 0;   // split index in force for this segment
-    uint32_t mask_count     = 0;   // small-prime mask entries
+    uint32_t mask_count     = 0;   // primes cleared by the small-prime masks
     uint32_t leftovers      = 0;   // unresolved evens in this segment
     double   sieve_seconds  = 0;   // make_prime_map GPU time
     double   large_seconds  = 0;   // large-prime kernel GPU time
     double   check_seconds  = 0;   // checker GPU time
-    double   offset_seconds = 0;   // host offset generation for this segment
+    double   offset_seconds = 0;   // host offset preparation (no such pass now: 0)
     double   wall_seconds   = 0;   // host wall time inside the loop iteration
 };
 
+// Totals and settings of one run (dense or sparse path).
 struct RunStats {
     uint64_t limit            = 0;   // evens in [4, limit] verified
     uint64_t start            = 0;   // first even n verified (scale testing)
@@ -34,7 +35,7 @@ struct RunStats {
                                      // --segment (sparse path: M * dlt); 0 = the argument
     uint64_t segments         = 0;
     uint64_t leftovers        = 0;   // numbers the GPU could not resolve (should be 0)
-    double   init_seconds     = 0.0; // prime generation + L0 setup + uploads
+    double   init_seconds     = 0.0; // base primes + L0 setup + uploads
     double   init_cache_s     = 0.0; // init: base-prime cache load/generation
     double   init_module_s    = 0.0; // init: L0 context + module (JIT) + kernels
     double   init_upload_s    = 0.0; // init: staging uploads incl. completion sync
@@ -45,7 +46,7 @@ struct RunStats {
     double   large_seconds    = 0.0; // GPU time in the large-prime kernel
     double   verify_seconds   = 0.0; // GPU time in the checker (event-timed)
     double   sync_seconds     = 0.0; // residual wall time (may overlap kernels)
-    double   offset_seconds   = 0.0; // host large-prime offset preparation
+    double   offset_seconds   = 0.0; // host offset preparation (no such pass now: 0)
     double   table_seconds   = 0.0; // host per-tile first-mark table build
     uint64_t total_tiles      = 0;   // sum of tile work-groups over all segments
     uint64_t total_large_items = 0;  // sum of large-prime kernel work-items
@@ -68,9 +69,9 @@ struct RunStats {
 };
 
 /// Verifies Goldbach for every even n in [max(start_even, 4) rounded up to
-/// even, limit] on the GPU (mod-30 class map, hit lists / packed / tile
-/// sieves, mod-30 checker; legacy variants selected by GB_* env). The range
-/// below start is assumed verified elsewhere (slices of a campaign).
+/// even, limit] on the GPU (mod-30 class map from the tile, mid-window,
+/// packed and hit-list sieves; mod-30 checker). The range below start is
+/// assumed verified elsewhere (slices of a campaign).
 ///
 /// @param limit             last n to verify (inclusive).
 /// @param segment_even      integer span per pipeline segment (rounded up to

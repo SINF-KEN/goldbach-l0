@@ -1,28 +1,22 @@
 #pragma once
-// Host side of the mod-30 checker (v1.13.0; kernels check30_a / check30_b in
+// Host side of the mod-30 checker (kernels check30_a / check30_b in
 // kernels/goldbach.cl). Shared by the verifier and tools/debug_check_hi.
 //
 // Evens are grouped by n mod 30 (15 classes r = 0, 2, ..., 28) and read the
-// mod-30 class map directly (no merge30): for a candidate p = s (mod 30),
-// q = n - p lies in the class array of residue r - s, and consecutive evens
-// of class r (n, n + 30, ...) are consecutive bits of that array. Only the
-// candidate classes s with r - s coprime to 30 are used, so every phase-A test
-// can succeed (the mod-6 checker spent 1/4 of its tests on q = 0 (mod 5) for
-// 4/5 of the evens). A funnel ORs pattern shifts: mask bit d = candidate
-// p + 30d (same class, same array), used only where every p + 30d is prime;
-// 30 = 2 (mod 7) allows up to six members, and 4-5 member patterns are
-// plentiful among small primes.
+// mod-30 class map directly: for a candidate p = s (mod 30), q = n - p lies
+// in the class array of residue r - s, and consecutive evens of class r
+// (n, n + 30, ...) are consecutive bits of that array. Only the candidate
+// classes s with r - s coprime to 30 are used, so every phase-A test can
+// succeed. A funnel ORs pattern shifts: mask bit d = candidate p + 30d (same
+// class, same array), used only where every p + 30d is prime; 30 = 2 (mod 7)
+// allows up to six members, and 4-5 member patterns are plentiful among
+// small primes.
 //
 // The plan is a list of segments per class r, each (s, mask, funnels):
 // phase A takes the first `funnels` candidates p = s (mod 30) in ascending
-// order whose members are all prime and not yet covered for (r, s). Chosen
-// by a greedy on a real map at 4e18 (Miller-Rabin-exact sieve of 2e6 evens):
-// add funnels to a segment or open a new one, weighing a segment start (window
-// reload + pattern OR) at ~14 funnels as measured, until 0.1% of the evens
-// are left for phase B. Plans from reload weights 10-16 and targets
-// 0.07-0.15% all measured within 1% of each other (phase A + B per 425M
-// segment ~0.435-0.445 ms). Correctness does not depend on the plan: phase B
-// probes every candidate phase A did not test.
+// order whose members are all prime and not yet covered for (r, s). A
+// segment start costs a window reload + pattern OR. Correctness does not
+// depend on the plan: phase B probes every candidate phase A did not test.
 
 #include <cstdint>
 #include <numeric>
@@ -36,19 +30,15 @@ inline constexpr uint32_t C30_MAXD = 4;       // largest pattern shift: MUST mat
 inline constexpr uint32_t C30_MAXSEG = 15;    // segments per class (meta stride 32)
 inline constexpr uint32_t C30_UNITS[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 
-// Default plan (r = 0, 2, ..., 28; "s/mask x funnels"), v2.2: every funnel
-// member below CHECK30_TAIL = 3000 (the "3000:" prefix), so every even with
+// Default plan (r = 0, 2, ..., 28; "s/mask x funnels"). Every funnel member
+// is below CHECK30_TAIL = 3000 (the "3000:" prefix), so every even with
 // p(n) >= 3000 fails phase A and phase B finds its exact p(n) (complete tail
-// statistics and ridges, include/gstats.hpp). Greedy plan (window reload
-// weighed as 10 funnels, 84 members per class) measured at 4e18 per 425M
-// segment: phase A + B 0.383 ms vs 0.402 ms for the v1.13.0 plan (members up
-// to 9749), 0.046% of the evens left for phase B.
-// r2b (2026-11-18): re-planned by a per-class local search (cost + lambda *
-// pending, lambda 0.025; funnel 1, window 1.5 + 1 per extra pattern member,
-// costs re-measured by ablation: a window reload is ~3.3 funnels now, not
-// 10-14) on an exact map at 4.2e18 (1e7 evens): pending 0.046% -> 0.038%
-// for the same simulated phase-A cost; uses mask 5 (p, p + 60), which has
-// its own specialized pattern OR. +0.28% on both bench windows.
+// statistics and ridges, include/gstats.hpp). Chosen by a per-class local
+// search (cost + lambda * pending, lambda 0.025; funnel 1, window 1.5 + 1 per
+// extra pattern member: costs measured by ablation, a window reload is ~3.3
+// funnels) on an exact map at 4.2e18 (1e7 evens): 0.038% of the evens are
+// left for phase B (a greedy plan: 0.046%, +0.28% slower). Mask 5
+// (p, p + 60) has its own specialized pattern OR in the kernel.
 inline constexpr uint32_t CHECK30_TAIL = 3000;
 inline constexpr const char* CHECK30_PLAN =
     "3000:"

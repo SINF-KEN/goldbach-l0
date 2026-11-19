@@ -5,15 +5,15 @@
 // (n = p + q, both prime, no smaller prime works for n) — e.g.
 //   4000000000169717704 = 4000000000169713571 + 4133  (ridge 4133).
 // The phase-B checkers probe each pending even's candidate list in ascending
-// order, so their FIRST hit is exactly that p (the mod-30 family probes the
+// order, so their FIRST hit is exactly that p (the mod-30 checker probes the
 // useful residues first and the futile ones — q = 3 / 5 only — last, which is
 // exact whenever n > MAX_GB_PRIME + 5; the host validation below drops the
 // rare tiny-n records where that ordering could differ). Every even whose
-// ridge is at least the checker plan's member bound (Plan30::member_lt; 3000
-// since v2.2: every phase-A funnel member is below it) fails phase A, passes
-// through phase B and cannot be missed; ridges below that bound may be, so
-// the verifier clamps the floor to the active checker's phase-A ceiling
-// (clamp_floor_above; per segment for fallback checkers).
+// ridge is at least the checker plan's member bound (Plan30::member_lt, 3000:
+// every phase-A funnel member is below it) fails phase A, passes through
+// phase B and cannot be missed; ridges below that bound may be, so the
+// verifier clamps the floor to the plan's phase-A ceiling
+// (clamp_floor_above).
 //
 // The kernel appends (n, p) pairs above the floor to a bounded buffer
 // (RIDGE_CAP); the host merges it into the RIDGE_KEEP largest, and every
@@ -31,8 +31,8 @@
 // rank,even,p,q,segment,found row per top entry plus a header comment,
 // rewritten atomically whenever the top changes. found = Unix time (s) the
 // entry first entered the store (0 = unknown: rows from a v1 store); a
-// re-run that finds a stored even again keeps the original time. It accumulates across runs; delete it
-// to reset the leaderboard.
+// re-run that finds a stored even again keeps the original time. The store
+// accumulates across runs; delete it to reset the leaderboard.
 
 #include <algorithm>
 #include <cstdint>
@@ -100,8 +100,8 @@ public:
                                          : floor_;
     }
 
-    /// Raises the floor unconditionally (host-side floor adjustments such as
-    /// the ridge pass's funnel-member margin; callers print their own note).
+    /// Raises the floor to at least @p v, without the note clamp_floor_above
+    /// prints (currently unused).
     void force_floor(uint32_t v) { if (v > floor_) floor_ = v; }
 
     uint64_t appends() const { return appends_; }

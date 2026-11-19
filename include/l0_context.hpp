@@ -98,8 +98,6 @@ private:
     ze_command_list_handle_t list_ = nullptr;
 };
 
-/// SPIR-V module loaded from a file (produced from kernels/*.cl by ocloc) and
-/// JIT-compiled for the context's device. Non-copyable.
 /// Resolves a kernel module path. A relative path is looked up from the
 /// working directory and relative to the executable's directory and its
 /// parent (a release dir holds kernels/ next to goldbach_l0; a build dir sits
@@ -110,6 +108,8 @@ private:
 /// @throws std::runtime_error naming every place tried when none is readable.
 std::string locate_module(const std::string& path, bool exe_first = false);
 
+/// SPIR-V module loaded from a file (produced from kernels/*.cl by ocloc) and
+/// JIT-compiled for the context's device. Non-copyable.
 class Module {
 public:
     /// @param ctx       context whose device the module is built for; must

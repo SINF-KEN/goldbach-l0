@@ -4,10 +4,68 @@ The optimization log, moved out of [PROJECT-REFERENCE.md](PROJECT-REFERENCE.md)
 with its section numbers unchanged, so "§9.2x" references in the code, the
 commit messages and the other documents still mean the same thing: every
 kernel or host change kept or dropped, with its measurements (§9.2–§9.2ac),
-the per-version performance record (§13.2), and the removed wheel
-representation (§15). Section numbers without a file name refer to this file
+the per-version performance record (§13.2), the removed wheel
+representation (§15) and the v2.x release notes (§R). Section numbers without a file name refer to this file
 when they are listed here, otherwise to PROJECT-REFERENCE.md (§1–§16).
 Methodology: [BENCHMARKING.md](BENCHMARKING.md).
+
+--------------------------------------------------------------------------
+## R. Releases (v2.x)
+
+What each release changed (moved here from the `VERSION` comment in
+include/config.hpp). Section numbers refer to this file.
+
+- **v2.0.0** Adds the sparse class map pipeline (--sparse, HISTORY.md
+  §9.2k); the dense path is unchanged since v1.13.0.
+- **v2.0.1** correctness fixes only (--wheel low-range witnesses, §15; CLI
+  and ScmEngine fail-closed paths); dense and --sparse kernels
+  byte-identical.
+- **v2.1.0** cleanup release — concluded experiment kernels/tools and their
+  A/B-only env knobs removed; production paths unchanged (spv
+  byte-identical). PROJECT-REFERENCE.md §7 lists every GB_* variable.
+- **v2.2.0** exact Goldbach statistics on the dense path
+  (include/gstats.hpp, HISTORY.md §9.2l) and a tail-bounded mod-30 checker
+  plan (every phase-A member < 3000: complete ridges and p(n) >= 3000 tail).
+- **v2.2.1** fail closed above 2^64 - 2^40 (the base-prime bound wrapped to
+  ~16 above ~1.8446744e19 and sieved with primes < 64 only: false PASS);
+  results below that unchanged, kernels byte-identical.
+- **v2.3.0** hit lists replace the bucket ring for the largest primes (+8.5%
+  / +9.2%, §9.2t) plus packed-kernel setup trims (§9.2s); hardening:
+  campaign statistics state merged under a lock, durably, refusing damaged
+  state; atomic, content-checked prime cache; leftover indices
+  range-checked; empty / reversed ranges are usage errors; the --wheel mode
+  is removed. Results unchanged (statistics byte-identical, maps verified
+  word for word).
+- **v2.4.0** prime gap statistics (the live paper's section 2.2), exact:
+  every gap's count, sums of g^k (k <= 4), N(g), the largest gap, every gap
+  >= 700 with its first occurrence (gaps30's full walk on every segment,
+  cross-checked against count30's bit-parallel tail and first / last primes;
+  ~11% GPU time). GB_GAPS=sampled walks only the sampled segments, GB_GAPS=0
+  disables. New GBSTATS fields, a .gaps state file; every earlier field
+  unchanged.
+- **v2.5.0** the gap walk fused into count30 (one read of the class map, the
+  range masks and look-back shared; per prime only g / 2 into the histogram
+  and the maximum: moments, count and sum come from the histogram, its tail
+  is cross-checked against the bit-parallel tail). Results unchanged.
+- **v2.5.1** the packed kernel's gap-stream loads bypass L3 (LSC L1S_L3UC):
+  the ~33 MB per segment stream no longer evicts the class map under the
+  atomics (+0.4%). Results unchanged.
+- **v2.6.0** (audit 2026-11-17, CORRECTNESS.md §6): positive coverage
+  accounting (every even of a segment counted as resolved or left for the
+  CPU; a checker that did not run fails the run, dense and --sparse); the
+  prime cache carries a payload hash ("GBP2"); the twin / class-split
+  checkers, the dense / mod-6 maps and the bucket ring are removed (only A/B
+  knobs reached them; those knobs are refused). Results unchanged.
+- **v2.7.0** (speed rounds 2-7 + cleanup, 2026-11-18/19, HISTORY.md
+  §9.2ab/ac): prime-multiplier hit lists, the 17..43 mark skip,
+  read-before-mark in the packed kernel, the flattened phase B and the rest
+  of the six rounds (x1.72 / x1.74 vs v2.6.0 per 1e11, x1.89 per production
+  slice vs v2.5.1); the A/B switches they left are removed (refused).
+  Results unchanged.
+- **v2.8.0** (round 10, 2026-11-19, HISTORY.md §9.2ad): the SLM stages (tile
+  medium items, mid windows for p < 131072) skip marks whose multiplier has
+  a factor 7..29; constant wheel tables generated into goldbach_tables.h;
+  the base-prime cache is checked beside the GPU init. Results unchanged.
 
 --------------------------------------------------------------------------
 ## 9. Kernel reference — the large-prime stage and the optimization log
