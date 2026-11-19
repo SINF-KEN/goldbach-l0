@@ -59,6 +59,8 @@ add_test(NAME host_tests COMMAND host_tests)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME check_constants COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/check_constants.py)
+    # kernels/goldbach_tables.h == a fresh kernels/gen_tables.py run
+    add_test(NAME kernel_tables COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/kernels/gen_tables.py --check)
     add_test(NAME campaign_queue COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/test_campaign_queue.py)
     add_test(NAME production_env COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/test_production_env.py)
     # the local CI's logic (journal chain, gates, release pruning); also the GitHub static job
@@ -98,7 +100,8 @@ if(OCLOC_EXE)
         COMMAND ${OCLOC_EXE} compile -file ${CMAKE_SOURCE_DIR}/kernels/goldbach.cl
                 -device bmg
                 -output ${CMAKE_SOURCE_DIR}/kernels/goldbach
-        DEPENDS ${CMAKE_SOURCE_DIR}/kernels/goldbach.cl
+                -options "-I ${CMAKE_SOURCE_DIR}/kernels"
+        DEPENDS ${CMAKE_SOURCE_DIR}/kernels/goldbach.cl ${CMAKE_SOURCE_DIR}/kernels/goldbach_tables.h
         COMMENT "Compiling goldbach.cl -> goldbach_bmg.spv (ocloc, Battlemage)"
         VERBATIM
     )
@@ -132,7 +135,7 @@ else()
     add_custom_target(kernels ALL
         COMMENT "kernels: ocloc not found, using shipped kernels/goldbach_bmg.spv")
     message(STATUS "ocloc not found — using the shipped kernels/goldbach_bmg.spv "
-        "(to rebuild kernels: ocloc compile -file kernels/goldbach.cl -device bmg -output kernels/goldbach)")
+        "(to rebuild kernels: ocloc compile -file kernels/goldbach.cl -device bmg -output kernels/goldbach -options \"-I kernels\")")
 endif()
 
 # ---------------------------------------------------------------------------

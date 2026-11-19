@@ -25,7 +25,11 @@ cmake -S . -B build -DGB_WERROR=ON  # what CI builds (strict warnings as errors)
 ```
 
 With `ocloc` on `PATH`, CMake recompiles `kernels/*_bmg.spv` whenever a
-kernel source changes; without it the shipped modules are used. The
+kernel source changes; without it the shipped modules are used. By hand:
+`ocloc compile -file kernels/goldbach.cl -device bmg -output kernels/goldbach
+-options "-I kernels"` — goldbach.cl includes its generated constant tables,
+`kernels/goldbach_tables.h` (rerun `python3 kernels/gen_tables.py` after
+changing the generator; ctest `kernel_tables` fails on a stale header). The
 validators and benchmark tools live in the companion repository
 [goldbach-tools](https://github.com/SINF-KEN/goldbach-tools), cloned next to
 this one (`tools -> ../goldbach-tools`); without it only `goldbach_l0`,

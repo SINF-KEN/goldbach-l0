@@ -88,10 +88,12 @@ goldbach-l0/
 │   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
 │   └── sparse.cpp          run_gpu_sparse
 ├── kernels/
-│   ├── goldbach.cl         dense kernels: make_prime_map, sieve_large_packed,
-│   │                       hl_harvest / hl_apply, check30_*, count30;
+│   ├── goldbach.cl         dense kernels: make_prime_map, mid_window, sieve_large_packed,
+│   │                       mt_build / hl_harvest_mt / hl_apply, check30_*, count30;
 │   │                       validation kernels (sieve_large_primes, prep_large_fb,
 │   │                       unpack_large_test, map_compare)
+│   ├── goldbach_tables.h   its constant wheel tables (GENERATED: gen_tables.py;
+│   │                       ocloc needs -I kernels; ctest kernel_tables checks it)
 │   ├── sparse.cl           sparse kernels
 │   └── *_bmg.spv           shipped modules (byte-identical to the pinned ocloc)
 ├── tests/                  host_tests, stats_ref, check_constants, cli_tests,
