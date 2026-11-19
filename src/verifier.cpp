@@ -132,9 +132,12 @@ void* stage_upload(Context& ctx, const void* data, size_t bytes, void* dst) {
 }
 
 // Per-slot kernel-timestamp events: sieve/large/check for each of the two
-// pipeline slots. One pool per event so each can be reset independently.
+// pipeline slots. One pool holds all of them; each event is still reset on
+// its own (zeEventHostReset acts on one event, not on its pool), as the
+// sparse path's SparseEvents always did.
 struct SlotEvents {
-    ze_event_pool_handle_t pool[22] = {};
+    static constexpr uint32_t kEvents = 22;
+    ze_event_pool_handle_t pool = nullptr;
     ze_event_handle_t sieve[2] = {};
     ze_event_handle_t large[2] = {};
     ze_event_handle_t check[2] = {};   // last checker kernel (host waits on it)
@@ -145,18 +148,20 @@ struct SlotEvents {
     ze_event_handle_t hl[2] = {};      // hl_harvest (timing only; counted in large_s)
     ze_event_handle_t mw[2] = {};      // mid_window (timing only; counted in sieve_s)
 
-    /// Creates the twenty-two pools and events.
+    /// Creates the pool and its twenty-two events.
     /// @throws std::runtime_error on failure; destroy() is safe afterwards.
     void create(ze_context_handle_t ctx) {
-        for (int i = 0; i < 22; ++i) {
-            ze_event_pool_desc_t pd{};
-            pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
-            pd.count = 1;
-            pd.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-            ZE_CHECK(zeEventPoolCreate(ctx, &pd, 0, nullptr, &pool[i]));
+        // KERNEL_TIMESTAMP is load-bearing beyond timing: timestamp events
+        // flush on signal (PROJECT-REFERENCE.md §14).
+        ze_event_pool_desc_t pd{};
+        pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+        pd.count = kEvents;
+        pd.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+        ZE_CHECK(zeEventPoolCreate(ctx, &pd, 0, nullptr, &pool));
+        for (uint32_t i = 0; i < kEvents; ++i) {
             ze_event_desc_t ed{};
             ed.stype  = ZE_STRUCTURE_TYPE_EVENT_DESC;
-            ed.index  = 0;
+            ed.index  = i;
             ed.signal = ZE_EVENT_SCOPE_FLAG_DEVICE;
             ed.wait   = ZE_EVENT_SCOPE_FLAG_DEVICE;
             ze_event_handle_t* e = (i < 2) ? &sieve[i]
@@ -168,7 +173,7 @@ struct SlotEvents {
                                  : (i < 18) ? &xv[(i - 12) / 2][(i - 12) % 2]
                                  : (i < 20) ? &hl[i - 18]
                                             : &mw[i - 20];
-            ZE_CHECK(zeEventCreate(pool[i], &ed, e));
+            ZE_CHECK(zeEventCreate(pool, &ed, e));
         }
     }
     /// Destroys whatever create() made; safe after a partial create.
@@ -184,8 +189,7 @@ struct SlotEvents {
             if (hl[i]) zeEventDestroy(hl[i]);
             if (mw[i]) zeEventDestroy(mw[i]);
         }
-        for (int i = 0; i < 22; ++i)
-            if (pool[i]) zeEventPoolDestroy(pool[i]);
+        if (pool) zeEventPoolDestroy(pool);
     }
 };
 
@@ -1576,7 +1580,7 @@ void DenseRun::create_events() {
     // Per pipeline slot: sieve signals after the tile-sieve launch, large
     // after the large-prime launch (the check kernel waits on BOTH GPU-side),
     // check signals after the check launch (the host waits on it once per
-    // segment). Pools are per-event so each can be reset independently.
+    // segment). One pool; every event is reset on its own.
     init_mark("upload");
     ev.create(ctx.context());
     // nothing computed from the base primes is trusted before their cache passed
@@ -2679,83 +2683,62 @@ bool verify_cpu(uint64_t limit, bool verbose) {
 // ------------------------------------------------------- device info -------
 
 void print_device_info() {
-    ze_result_t r = zeInit(ZE_INIT_FLAG_GPU_ONLY);
-    if (r != ZE_RESULT_SUCCESS)
-        throw std::runtime_error("zeInit failed: " + std::to_string(std::to_underlying(r)));
+    for (const auto& [d, dev] : gpu_devices()) {
+        ze_device_properties_t p{};
+        p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+        ZE_CHECK(zeDeviceGetProperties(dev, &p));
 
-    uint32_t nd = 0;
-    zeDriverGet(&nd, nullptr);
-    if (nd == 0) throw std::runtime_error("no Level Zero driver found");
-    std::vector<ze_driver_handle_t> drivers(nd);
-    zeDriverGet(&nd, drivers.data());
+        ze_device_properties_t p12{};   // timerResolution lives here (v1.17+)
+        p12.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2;
+        const bool have12 =
+            zeDeviceGetProperties(dev, &p12) == ZE_RESULT_SUCCESS;
+        const double timer_hz = have12 ? double(p12.timerResolution) : 0.0;
 
-    bool found = false;
-    for (ze_driver_handle_t d : drivers) {
-        uint32_t nv = 0;
-        zeDeviceGet(d, &nv, nullptr);
-        std::vector<ze_device_handle_t> devs(nv);
-        zeDeviceGet(d, &nv, devs.data());
+        ze_device_memory_properties_t m{};
+        m.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
+        uint32_t nm = 1;
+        ZE_CHECK(zeDeviceGetMemoryProperties(dev, &nm, &m));
 
-        for (ze_device_handle_t dev : devs) {
-            ze_device_properties_t p{};
-            p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-            if (zeDeviceGetProperties(dev, &p) != ZE_RESULT_SUCCESS) continue;
-            if (p.type != ZE_DEVICE_TYPE_GPU) continue;
-            found = true;
+        ze_device_compute_properties_t c{};
+        c.stype = ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES;
+        ZE_CHECK(zeDeviceGetComputeProperties(dev, &c));
 
-            ze_device_properties_t p12{};   // timerResolution lives here (v1.17+)
-            p12.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2;
-            const bool have12 =
-                zeDeviceGetProperties(dev, &p12) == ZE_RESULT_SUCCESS;
-            const double timer_hz = have12 ? double(p12.timerResolution) : 0.0;
+        ze_api_version_t api = ZE_API_VERSION_1_0;
+        ZE_CHECK(zeDriverGetApiVersion(d, &api));
 
-            ze_device_memory_properties_t m{};
-            m.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
-            uint32_t nm = 1;
-            zeDeviceGetMemoryProperties(dev, &nm, &m);
-
-            ze_device_compute_properties_t c{};
-            c.stype = ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES;
-            zeDeviceGetComputeProperties(dev, &c);
-
-            ze_api_version_t api = ZE_API_VERSION_1_0;
-            zeDriverGetApiVersion(d, &api);
-
-            std::printf("device           : %s\n", p.name);
-            std::printf("vendor id        : 0x%04x  (Intel = 0x8086)\n", p.vendorId);
-            std::printf("device id        : 0x%04x\n", p.deviceId);
-            std::printf("numEUs           : %u (threads/EU %u)\n",
-                        p.numEUsPerSubslice * p.numSubslicesPerSlice * p.numSlices,
-                        p12.numThreadsPerEU);
-            std::printf("slices/subslices : %u / %u  (EUs per subslice %u)\n",
-                        p.numSlices, p.numSubslicesPerSlice, p.numEUsPerSubslice);
-            std::printf("core clock       : %u MHz\n", p.coreClockRate);
-            std::printf("timer resolution : %.0f ns/tick\n",
-                        timer_hz > 0 ? 1e9 / timer_hz : 0.0);
-            std::printf("memory           : %.1f GB (%u MHz, %u-bit)\n",
-                        double(m.totalSize) / double(1ull << 30),
-                        m.maxClockRate, m.maxBusWidth);
-            std::printf("work-group size  : max %u\n", c.maxGroupSizeX);
-            std::printf("subgroup sizes   :");
-            for (uint32_t i = 0; i < c.numSubGroupSizes; ++i)
-                std::printf(" %u", c.subGroupSizes[i]);
-            std::printf("\n");
-            std::printf("L0 API version   : %u.%u\n",
-                        ZE_MAJOR_VERSION(api), ZE_MINOR_VERSION(api));
-            ze_driver_properties_t dp{};
-            dp.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
-            if (zeDriverGetProperties(d, &dp) == ZE_RESULT_SUCCESS)
-                std::printf("driver version   : %u\n", dp.driverVersion);
-            std::printf("\nconfig           : WG %u | TILE_WORDS %u (%.0f KB SLM) | "
-                        "phase-A words %u | MAX_GB_PRIME %u | "
-                        "seg default %llu\n",
-                        WG_SIZE, TILE_WORDS, double(TILE_WORDS * 8) / 1024.0,
-                        CHECK_PHASE_A_W64,
-                        MAX_GB_PRIME,
-                        (unsigned long long)DEFAULT_SEGMENT_EVEN);
-        }
+        std::printf("device           : %s\n", p.name);
+        std::printf("vendor id        : 0x%04x  (Intel = 0x8086)\n", p.vendorId);
+        std::printf("device id        : 0x%04x\n", p.deviceId);
+        std::printf("numEUs           : %u (threads/EU %u)\n",
+                    p.numEUsPerSubslice * p.numSubslicesPerSlice * p.numSlices,
+                    p12.numThreadsPerEU);
+        std::printf("slices/subslices : %u / %u  (EUs per subslice %u)\n",
+                    p.numSlices, p.numSubslicesPerSlice, p.numEUsPerSubslice);
+        std::printf("core clock       : %u MHz\n", p.coreClockRate);
+        std::printf("timer resolution : %.0f ns/tick\n",
+                    timer_hz > 0 ? 1e9 / timer_hz : 0.0);
+        std::printf("memory           : %.1f GB (%u MHz, %u-bit)\n",
+                    double(m.totalSize) / double(1ull << 30),
+                    m.maxClockRate, m.maxBusWidth);
+        std::printf("work-group size  : max %u\n", c.maxGroupSizeX);
+        std::printf("subgroup sizes   :");
+        for (uint32_t i = 0; i < c.numSubGroupSizes; ++i)
+            std::printf(" %u", c.subGroupSizes[i]);
+        std::printf("\n");
+        std::printf("L0 API version   : %u.%u\n",
+                    ZE_MAJOR_VERSION(api), ZE_MINOR_VERSION(api));
+        ze_driver_properties_t dp{};
+        dp.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
+        if (zeDriverGetProperties(d, &dp) == ZE_RESULT_SUCCESS)
+            std::printf("driver version   : %u\n", dp.driverVersion);
+        std::printf("\nconfig           : WG %u | TILE_WORDS %u (%.0f KB SLM) | "
+                    "phase-A words %u | MAX_GB_PRIME %u | "
+                    "seg default %llu\n",
+                    WG_SIZE, TILE_WORDS, double(TILE_WORDS * 8) / 1024.0,
+                    CHECK_PHASE_A_W64,
+                    MAX_GB_PRIME,
+                    (unsigned long long)DEFAULT_SEGMENT_EVEN);
     }
-    if (!found) throw std::runtime_error("no GPU device reported by Level Zero");
 }
 
 } // namespace gb

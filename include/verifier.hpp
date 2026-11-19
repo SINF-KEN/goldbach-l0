@@ -110,7 +110,8 @@ RunStats run_gpu(uint64_t limit,
 
 /// Prints device / driver / runtime information and the build's tuning
 /// constants to stdout, one block per Level Zero GPU.
-/// @throws std::runtime_error if zeInit fails or no GPU device is reported.
+/// @throws std::runtime_error if Level Zero initialization fails or no GPU
+///         device is reported.
 void print_device_info();
 
 /// Independent CPU reference check by trial division (no GPU, no sieve);
