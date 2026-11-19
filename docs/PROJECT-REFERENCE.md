@@ -159,11 +159,23 @@ could only desync it from the host. G30_COLS (count30 lane columns) is folded
 on, and the dead helpers mark_multiples_w30 / bkt_div32 are gone.
 The sections below still name them as history; the git history has the code.
 Proof of no kernel change: the -O0 and -O2 LLVM IR (clang -x cl -target
-spir64) of all three modules is byte-identical before and after. The numeric tunables
-that stay overridable with ocloc -D (experiment arms) are TILE_WORDS and
-LARGE_PACK_PPI (each with its host GB_ override) and the kernel-only
-TABLE_BATCH, TILE_WHEEL_MAXP, MED_BATCH, PROBE_BATCH, G30_SIMD (sparse.cl:
-SCM_M / SCM_K / SCM_RES_LIST / A3_SPAN select its module variant).
+spir64) of all three modules is byte-identical before and after.
+
+Kernel switches after the speed rounds (2026-11-19, [§9.2ac](HISTORY.md#92ac-cleanup-after-the-speed-rounds-2026-11-19)):
+the rounds' A/B switches are resolved to their production values and the
+losing variants deleted — LARGE_SKR, LARGE_MQ, MQ_V4, MQ_RKT, MQ_HOIST,
+HL_RKT, HL_FX, HL_END, HL_FLAT, HL_APPLY_LAST, HL_QS, HL_SKR, HL_SKR2,
+MED_BF, MASK_COAL, CB_FLAT, CA_PAIR, CA_ONEWIN, CA_SHF, CA_PRO, G30_BLK,
+MIDW_FLOOR, MIDW_ANDST, MIDW_SKIP, the ABL_* ablations — and every kernel's
+machine code is byte-identical before and after (ocloc disasm). goldbach.cl
+has one `#if` left: `#ifndef TILE_WORDS`, the only numeric tunable still
+overridable with ocloc -D (with the host's GB_TILE_WORDS; ci/experiment.py
+builds such arms). TABLE_BATCH, TILE_WHEEL_MAXP, MED_BATCH, MED_SPLITN,
+MED_W7_MAXP, MQ_MAXP, SKR_MAXP, SKR2_MAXP, LARGE_PACK_PPI, A_W64,
+PROBE_BATCH, CA_SG, G30_SIMD, MT_CB, HL_BAL, MIDW_BATCH and MIDW_SG are plain
+#defines: an experiment edits them in a copy of the source. sparse.cl:
+SCM_M / SCM_K / SCM_RES_LIST / A3_SPAN select its module variant. The rules
+the fast paths rely on are in [EXACTNESS.md](EXACTNESS.md).
 
 Device assumptions in config.hpp header comment: 20 Xe-cores, 160 vector
 engines, 128 KB SLM per Xe-core, 256 KB L1, 18 MB shared L3, subgroup
@@ -280,16 +292,20 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_BUCKET_VERIFY_DUMP=1` | with GB_BUCKET_VERIFY: on the first mismatch print the differing bits with Miller-Rabin truth |
 | `GB_BUCKET=0` / `GB_BUCKET_MINP=p` / `GB_BUCKET_GROUPS=n` | hit lists off (every large prime in the packed kernel) / threshold prime / grid of a separate hl_apply (n >= 1) |
 | `GB_BUCKET_VERIFY=N` | validate the hit-listed primes on every Nth segment (1 = all; N >= 1: 0 or empty is an error) against a rebuild with the packed kernel over all large primes; throws on any difference |
-| `GB_HITLIST_K=n` | hit-list batch length (default 128, n in [1, 128], else an error; list buffer < 4 GiB) ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)) |
+| `GB_HITLIST_K=n` | hit-list batch length (default 256, n in [1, 256], else an error), lowered until one batch's lists fit below 4 GiB and `GB_HL_LIST_MAX` ([§9.2t](HISTORY.md#92t-hit-lists-replace-the-bucket-ring-gb_hitlist-2026-10-06)) |
+| `GB_HL_MT=0` | old hit-list path: `hl_harvest` over every multiplier, primes > q_odds_full only, instead of the prime-multiplier table (`mt_build` / `hl_harvest_mt`, [§9.2ab](HISTORY.md#92ab-speed-rounds-2-7-prs-34-29-33-2026-11-1819-725--736)); a fallback, exact but slower; the packed kernel then overlaps mid_window |
+| `GB_HL_LIST_MAX=B` | hit-list memory budget in bytes (default 3.5e9): K is lowered until one batch's lists fit ([EXACTNESS.md](EXACTNESS.md) §6) |
+| `GB_MT_CHECK=N` | after mt_build, compare N multiplier-table bits (the first 2 x 5760, then random) with Miller-Rabin; any wrong bit fails the run (copies the whole table to the host: seconds) |
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` ([§9.2w](HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)) |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest ([§9.2v](HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)) |
 | `GB_MASK_PERIOD=N` | max mask-group period in words (default 4096; more than 8 groups fall back to the per-prime mask loop) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32 in [32, 1024], else the run fails; default 128) |
 | `GB_GAPS=0` / `GB_GAPS=sampled` | with the statistics: no prime-gap statistics / walk the gap histogram and moments only on the sampled segments (count, tail and maximum stay exact everywhere); default (`exact`, also `1`): every segment; any other value is an error |
-| `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default 320) |
+| `GB_GAPS_GROUPS=N` | count30 work-groups on walked segments (N in [1, 4096], else an error; default GAPS30_GROUPS = 48 per 160 EUs, scaled by the device's EU count: 48 on the B580) |
 | `GB_MED_P=N` | tile-kernel medium-stage bound (default `MED_MIN_P`) |
 | `GB_MIDWIN=N` / `GB_MIDWIN_KB` / `GB_MIDWIN_WG` | mid-prime SLM window pass: primes [split, N) in windows of KB of SLM with work-groups of WG (defaults 2500000 / 128 / 1024; `GB_MIDWIN=0` off and the auto split back to 36000) ([§9.2x](HISTORY.md#92x-mid-prime-slm-windows-gb_midwin-2026-11-17)) |
 | `GB_CHECK_BGROUPS=N` | phase-B work-groups (default 40; N >= 1: 0 would skip phase B, so it fails the run before GPU work) |
+| removed 2026-11-19 | `GB_C30_LATE`, `GB_C30_PREB`, `GB_ML_OVERLAP`, `GB_HL_LAM2`, `GB_HL_CAPG`, `GB_HLH_WG`, `GB_HL_UNCOMP`, `GB_MT_UNCOMP`, `GB_MASK_XP`, `GB_MED_ITEMS`, `GB_MINP_FLOOR`, `GB_HL_FILLDBG`: speed-round A/B switches whose default is now fixed ([§9.2ac](HISTORY.md#92ac-cleanup-after-the-speed-rounds-2026-11-19)); setting one is an error before any GPU work, so an A/B arm cannot silently measure the default |
 | removed in v2.6 | `GB_SPLIT`, `GB_SPLIT_CAP`, `GB_SPLIT_STAGES`, `GB_TWIN_CAP`, `GB_C30`, `GB_CLASSMAP`, `GB_HITLIST`, `GB_MASK_GROUPS`: their pipelines (twin / class-split checkers, dense / mod-6 maps, bucket ring) are gone; setting one is an error before any GPU work, never silently ignored |
 | `NEOReadDebugKeys=1` | driver-side: REQUIRED for any NEO debug env var to have effect (source-verified, §14); alone it is perf-neutral |
 | `ZET_ENABLE_METRICS=1` | driver-side metrics enablement (+ `sysctl dev.xe.observation_paranoid=0`, Metrics Library; see §14) |
@@ -316,19 +332,23 @@ CPU setup: base primes to sqrt(limit) via the mmap'd, hash-checked GBP2 cache (s
            reciprocal + shift + ms32 tables for the split range
 L0 setup:  Context (immediate command list, IN_ORDER flag — LOAD-BEARING,
            see §11), Module from SPIR-V, kernels @ WG_SIZE
-Buffers:   per-slot x2 (double buffering): prime_map, checked, first_bits,
+Buffers:   per-slot x2 (double buffering): prime_map, first_bits,
            mask tables, pending, leftovers, counters, ridge, histograms,
-           tile_first; shared: gb_primes, sieve_primes, packed large primes,
-           hit lists (K = 128 segments x capacity), magic/shifts/ms32
+           tile_first, mid-window first bits; shared: gb_primes,
+           sieve_primes, packed large primes, hit lists (K <= 256 segments x
+           regions, <= GB_HL_LIST_MAX), multiplier table (HL_MT, 2.7-3.4 GB
+           at 4e18..5e18), magic/shifts/ms32
 Per segment k (slot = k&1):
   host prep (overlaps GPU of segment k-1): first bits (class map,
     parallel_for over primes into a persistent buffer), tile_first table
     (parallel_for), small-prime group offsets
   enqueue: counter zero-fills, EVENT RESETS, make_prime_map(tiles),
-           [every K-th segment: BARRIER, hl_harvest],
-           BARRIER, sieve_large_packed_hl (hit-list apply fused in),
-           [GB_BUCKET_VERIFY: rebuild + map_compare], count30 (statistics),
-           check30_a, check30_b (sampled segments: check30_xs* / _xb)
+           mid_setup, [every K-th segment: hl_harvest_mt],
+           BARRIER, mid_window, BARRIER (HL_MT), sieve_large_packed_hl
+           (hit-list apply fused in, after the packed primes),
+           [GB_BUCKET_VERIFY: rebuild + map_compare], BARRIER, check30_a,
+           BARRIER, count30 (statistics), check30_b (sampled segments:
+           check30_xs* / _xb)
   collect segment k-1 (other slot): host-sync on its check event, query
     kernel timestamps, check error flags / pending / leftover counts,
     statistics, Miller-Rabin fallback for leftovers

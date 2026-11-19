@@ -572,6 +572,14 @@ void RunSetup::resolve_range() {
         if (env::present(gone))
             throw std::runtime_error(std::string(gone) + " was removed in v2.6 (the mod-30 map and "
                                      "checker with hit lists are the only pipeline)");
+    // The speed rounds' A/B switches (2026-11-19): refused too, so an A/B arm
+    // that sets one does not silently measure the default twice.
+    for (const char* gone : {"GB_C30_LATE", "GB_C30_PREB", "GB_ML_OVERLAP", "GB_HL_LAM2", "GB_HL_CAPG",
+                             "GB_HLH_WG", "GB_HL_UNCOMP", "GB_MT_UNCOMP", "GB_MASK_XP", "GB_MED_ITEMS",
+                             "GB_MINP_FLOOR", "GB_HL_FILLDBG"})
+        if (env::present(gone))
+            throw std::runtime_error(std::string(gone) + " was removed on 2026-11-19 (its default is "
+                                     "fixed; docs/HISTORY.md 9.2ac)");
     gb::require_supported_limit(limit);
     // The last even n is limit rounded down (as run_gpu_sparse does). An odd
     // limit left the segment and count30 ranges ending on an even q, so the

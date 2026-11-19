@@ -3,7 +3,7 @@
 The optimization log, moved out of [PROJECT-REFERENCE.md](PROJECT-REFERENCE.md)
 with its section numbers unchanged, so "§9.2x" references in the code, the
 commit messages and the other documents still mean the same thing: every
-kernel or host change kept or dropped, with its measurements (§9.2–§9.2aa),
+kernel or host change kept or dropped, with its measurements (§9.2–§9.2ac),
 the per-version performance record (§13.2), and the removed wheel
 representation (§15). Section numbers without a file name refer to this file
 when they are listed here, otherwise to PROJECT-REFERENCE.md (§1–§16).
@@ -1336,6 +1336,57 @@ project's claims instead of reading them. What it changed:
 - **Measured, not changed**: `--sparse` 1.015e12 evens/s at 4e18 (14.6x the
   dense path's 69.3 G): `ci/sparse_crosscheck.sh` re-verifies the range
   independently in ~5.7 days.
+
+--------------------------------------------------------------------------
+### 9.2ab Speed rounds 2-7 (PRs #34, #29-#33, 2026-11-18/19): +72.5% / +73.6%
+Six stacked PRs on v2.6.0 (c3990ea), one per round, each exact against v2.6
+main on 1e11 at 4e18 with `GB_BUCKET_VERIFY` (stats.state, stats.state.gaps,
+ridges, stats.log except times byte-identical). The gains are cumulative,
+measured with 5 paired rounds on the 1e11 windows at 4e18 (long) and ending
+at 5e18 (long-end), against the pre-v2.6 main 8e99af0 the rounds started from:
+
+| PR | round | what | long | long-end |
+|---|---|---|---|---|
+| #34 speed-1 | 2 | packed prime loop not unrolled (+3.2 % alone: instruction fetch), large WG 128 -> 32, harvest 1024-thread groups x 64 segments, 16-byte mid_window I/O, coalesced tile store, wheel-7 medium marks; check30_a 32-bit miss epilogue + class-interleaved groups, count30 gap walk in registers beside phase B, phase A re-planned | +9.23 % | +9.40 % |
+| #29 speed-2 | 3 | skip packed / harvest marks p m with m divisible by 17..29 (p < 60M) and 31..43 (p < 10M): the mask stage already cleared them; m0 from mod_ff_q's quotient for p in [2^21, 60M); hit lists from 1.6 x q_odds; wheel-7 medium marks only p <= 8192 (fixes a -8 % at 1e12); mid_window from ones + atomic AND (overlap with the packed kernel); mask groups without 3, 5; medium-stage load balance; check30_a SIMD16 | +17.89 % | +17.46 % |
+| #30 speed-3 | 4 | prime-multiplier hit lists (HL_MT): for p >= cbrt(q) only prime m matter, a GPU-built table of prime multipliers files ~77 % fewer large-stage atomics; hit lists from 0.15 x q_odds (~35M at 4e18); table 2.7-3.4 GB, init +0.4-0.5 s; SLM mark constant in a register; 67..79 folded into the mask groups | +49.1 % | +49.3 % |
+| #31 speed-4 | 5 | read the map word before each packed mark (exact: concurrent writers only AND-clear; pays now that mid windows clear first); mt_build 128 blocks per group (init -70..90 ms); count30 before phase B; medium items of ~100 marks replace the owned walk; gap walk one step per non-empty block of 30 | +60.7 % | +61.4 % |
+| #32 speed-5 | 6 | packed loop loads 4 wheel entries per load; first multiplier from a (bitmap, rank) block; harvest rank-table setup, float segment index, precomputed walk end; check30_b flattened probe loop on a 40-group grid beside the next tile sieve; check30_a paired candidates | +68.2 % | +68.9 % |
+| #33 speed-6 | 7 | exact hit estimate + round-robin 256-prime chunks (K ~149 in the same 3.5 GB list budget); harvest setup from one float-float quotient, one flat hit/word loop, apply after the packed primes; multiplier table uncompressed; mid_window branch-free floor remainder, 64-bit atomic window store | +72.45 % | +73.61 % |
+
+The last row is the whole stack against v2.6 main c3990ea (76.66 -> 132.22
+and 75.67 -> 131.37 Gev/s, 95 % CI +-0.12 % / +-0.07 %; gpu per 1e11 652 ->
+378 ms, large stage 342 -> 125 ms). On a full production slice (5e13 at
+4.14065e18, GB_BUCKET_VERIFY=500, GB_GAPS=exact) the active release bb3a96f
+took 364.1 s and the stack 193.0 s, with stats.state, stats.state.gaps and
+the ridges byte-identical. Merged onto v2.6 the stack is ~0.9 % slower than
+the same rounds on the pre-v2.6 base; ~0.7 % of that is v2.6's coverage
+atomic in check30_a, kept on purpose. The rules these paths rely on are in
+docs/EXACTNESS.md.
+
+### 9.2ac Cleanup after the speed rounds (2026-11-19)
+The rounds left their A/B switches and losing variants behind:
+kernels/goldbach.cl + src/verifier.cpp grew from ~5,160 to ~8,700 lines, the
+kernel from 18 to 115 `#if` branches, and the GB_* knobs from 61 to 76 (as
+read in src/ and include/). The cleanup resolved every kernel switch to its
+production value (only `#ifndef TILE_WORDS` stays, for ci/experiment.py's
+`-DTILE_WORDS` arms) and deleted the losing variants and ABL_* ablations:
+LARGE_SKR, LARGE_MQ, MQ_V4 (1 / 2), MQ_RKT, MQ_HOIST, HL_RKT, HL_FX, HL_END,
+HL_FLAT, HL_APPLY_LAST, HL_QS, HL_BAL = 0, HL_SKR, HL_SKR2, MED_BF, MASK_COAL,
+MED_SPLITN = 0, CB_FLAT, ABL_BSKIP, CA_PAIR (0 / 2), CA_ONEWIN, CA_SHF, CA_PRO,
+ABL_WIN / LD / CAND / MASK1 / ONEF / NOPEND / FUN, G30_BLK, A_W64 != 12,
+MIDW_FLOOR, MIDW_ANDST (0 / 1 / 2), MIDW_SKIP (1-3), and the unused mod_ff.
+The remaining tunables are plain #defines. Every kernel's machine code is
+byte-identical before and after (ocloc disasm: the .text sections differ
+only in the 8-byte module hash; .data.const identical).
+
+Host knobs removed (default kept): GB_C30_LATE, GB_C30_PREB, GB_ML_OVERLAP,
+GB_HL_LAM2, GB_HL_CAPG, GB_HLH_WG, GB_HL_UNCOMP, GB_MT_UNCOMP, GB_MASK_XP,
+GB_MED_ITEMS, GB_MINP_FLOOR, GB_HL_FILLDBG. Kept: GB_HL_MT (=0: the old
+hl_harvest path, a fallback), GB_HL_LIST_MAX, GB_MT_CHECK. The per-slot
+checked[] buffers (never written by the verifier: write_checked = 0) are
+gone, -58.4 MB of device memory at the 467.5M segment. New loud checks: see
+EXACTNESS.md.
 
 ## 13. Performance
 
