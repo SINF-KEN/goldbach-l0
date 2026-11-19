@@ -2449,7 +2449,7 @@ void DenseRun::check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left) {
                                      " + leftovers " + std::to_string(n_left) + " != segment evens" + seg);
         return;
     }
-    if (!acct_slot[sl]) return;          // acct_slot = !sampled: never true here
+    if (!acct_slot[sl]) return;          // acct_slot == !sampled: not taken (sampled returned above)
     const uint64_t res_a = b.acct[sl][0], res_b = b.acct[sl][1];
     if (res_a + pend != prev_seg_evens)
         throw std::runtime_error("coverage: phase A resolved " + std::to_string(res_a) + " + pending " +
