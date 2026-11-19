@@ -245,7 +245,8 @@ The atomic costs ~0.7 % (PR #33). It is kept on purpose.
 1. `./build.sh` with the pinned ocloc; commit the fresh `.spv` (CI's kernels
    gate). `ctest -LE gpu` (check_constants covers the constants above).
 2. Exactness against the previous build with val.sh on 4e18 +1e11 and 5e18
-   −1e11 with `GB_BUCKET_VERIFY=1`, on 1e12, 1e14 and 1e18 (+1e10), and on a
+   −1e11 with `GB_BUCKET_VERIFY=1` (add `GB_BUCKET_VERIFY_FULL=1` when mid_window
+   changes: the default reference runs mid_window itself), on 1e12, 1e14 and 1e18 (+1e10), and on a
    5e8 window at 4e18. stats.state, stats.state.gaps, ridges and stats.log
    (except times) must be byte-identical.
 3. `GB_HL_MT=0` at 4e18 must stay exact (the fallback).
