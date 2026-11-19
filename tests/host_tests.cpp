@@ -1613,6 +1613,21 @@ void test_host_math_first_bits()
                 }
             check(cok, "first_bits_class_range K=" + std::to_string(K) + " " + tag +
                        " vs first class multiple; untouched columns kept");
+            if (K != 8 || ql >= (uint64_t(1) << 36)) continue;   // class bits < 2^32
+            // the multiplier residues (cop_j0 = a): 30 c = m (mod COP_M) for
+            // the first bit's q = m p, the bit itself unchanged
+            std::vector<uint64_t> cop(size_t(K) * split, 0);
+            first_bits_class_range(cop.data(), primes.data(), split, 0, split, qf, ql, g, a);
+            bool rok = true;
+            for (uint32_t c = 0; c < K; ++c)
+                for (uint32_t j = 0; j < split; ++j) {
+                    const uint64_t v = cop[size_t(c) * split + j], p = primes[j];
+                    if (v == ~0ull) continue;
+                    const uint64_t bit = v & 0xFFFFFFFFull, cres = v >> 32;
+                    const uint64_t m = (g.Q[c] + 30 * bit) / p;
+                    rok &= j < a ? cres == 0 : (cres < COP_M && 30 * cres % COP_M == m % COP_M);
+                }
+            check(rok, "first_bits_class_range " + tag + " multiplier residues");
         }
     }
 }

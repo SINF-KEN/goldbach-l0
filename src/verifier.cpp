@@ -412,6 +412,7 @@ private:
     // bucket ring, which only A/B knobs still reached.
     static constexpr uint32_t ncls_map = 8;
     const uint32_t cm_u32 = 2;       // kernel class-mode argument
+    bool med_cop = false;            // first bits carry med_prime_cop residues (items)
     uint32_t a_w64 = 0;              // phase-A item width (CHECK_PHASE_A_W64)
     // checked[] (bit per even) is validation output of the tools only: the
     // verifier passes write_checked = 0 and no buffer (the kernels never
@@ -836,6 +837,12 @@ void DenseRun::set_group_sizes() {
         if (v.size() < 65536)
             for (const It& t : v) { med_items_host.push_back(t.j); med_items_host.push_back(t.w); }
     }
+    // The items run med_prime_cop: the first bits of their primes carry the
+    // multiplier residue, and its skips rely on the mask stage clearing
+    // every multiple of 7..29 (docs/EXACTNESS.md).
+    med_cop = !med_items_host.empty();
+    if (med_cop && !(mask_count > 0 && sieve_primes[mask_count - 1] >= 29))
+        throw std::runtime_error("medium items need the mask stage through 29");
     k_sieve.set_group_size(WG_SIZE);
     // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
     // kernel indexes by global id). N must be a non-zero multiple of the
@@ -1275,7 +1282,7 @@ void DenseRun::allocate_large_prime_buffers() {
         k_mids->set_group_size(WG_SIZE);
         k_midw->set_group_size(midw_wg);
         for (int s = 0; s < 2; ++s)
-            d_mid_i0[s] = static_cast<uint32_t*>(ctx.alloc_device(size_t(mid_n) * 8 * 4));
+            d_mid_i0[s] = static_cast<uint32_t*>(ctx.alloc_device(size_t(mid_n) * 16 * 4));  // i0 + residues
         if (verbose)
             std::fprintf(stderr, "mid windows: primes [%u, %u], %u primes, %u-bit windows, wg %u\n",
                          sieve_primes[sieve_split], sieve_primes[mid_end - 1], mid_n,
@@ -1764,7 +1771,7 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
         // the host loop's.
         parallel_for(0, sieve_split, 6, [&](uint32_t j0, uint32_t j1) {
             first_bits_class_range(fb_host.data(), sieve_primes, sieve_split, j0, j1,
-                                   sg.q_first, sg.q_last, sg.cgeo);
+                                   sg.q_first, sg.q_last, sg.cgeo, med_cop ? own_end : UINT32_MAX);
             for (uint32_t c = 0; c < sg.cgeo.K; ++c)
                 std::memcpy(b.first_bits[sg.slot] + size_t(c) * sieve_split + j0,
                             fb_host.data() + size_t(c) * sieve_split + j0, size_t(j1 - j0) * 8);

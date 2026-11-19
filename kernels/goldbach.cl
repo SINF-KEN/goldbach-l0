@@ -904,6 +904,100 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
     }
 }
 
+// Medium item, marks with multipliers coprime to 7..29 only (2026-11-19).
+// A mark q = p m with m divisible by a mask prime r in 7..29 is redundant:
+// the mask stage clears every multiple of r (r < 83 <= p, q > r). Along a
+// class array consecutive marks have m, m + 30, m + 60, ...; with c = m / 30
+// mod COP_M (host: the high word of fb_global) mark t of the item has
+// m = 30 (c + t), so r | m iff (c + t) = 0 (mod r). Per word of 32 marks the
+// item ORs one shifted constant pattern per r and walks the set bits of the
+// rest: the stage pays per SLM atomic MESSAGE (4 extra ALU ops per mark:
+// +2%), and the lanes of a sub-group hold items of equal raw length, so
+// their useful counts per word differ by a few marks only. Messages per
+// 100-mark item: 86 with wheel 7 -> ~69 (tile -0.078 ms per segment).
+/// @pre    as med_prime_f32n; cres = (m mod COP_M) * 30^-1 mod COP_M for the
+///         mark q = m p at fb; nbits <= TILE_BITS.
+/// @post   every mark of p in [tile_bit0, tile_bit0 + nbits) whose
+///         multiplier has no factor 7..29 is cleared.
+#define COP_M 215656441u         // 7 * 11 * 13 * 17 * 19 * 23 * 29 (host: COP_M)
+#define COP_INV30 208467893u     // 30^-1 mod COP_M
+#define COP_INV15 201279345u     // 15^-1 mod COP_M
+#define COP_NR 7u
+// a private array: its loads fold to constants in the unrolled loops (a
+// __constant table stays a table: tile +0.024 ms per segment)
+#define COP_PRIMES {7u, 11u, 13u, 17u, 19u, 23u, 29u}
+inline u32 cop_pat(const u32 r)   // bits 0, r, 2r, ... < 32 (folded per r)
+{
+    u32 v = 0;
+    for (u32 j = 0; j < 32u; j += r) v |= 1u << j;
+    return v;
+}
+/// Marks bit, bit + p, ..., n raw marks, of a prime whose mark at bit has
+/// residue c (of its multiplier m: c = m / 30 mod COP_M), skipping those
+/// with r | m for r in COP_R.
+/// @pre    c < 2^31; bit + n p < 2^24 (mad24); t32 covers the marks.
+inline void cop_marks(volatile __local u32* t32, const u32 c, const u32 p, u32 bit,
+                      const u32 n, const u32 c1)
+{
+    const u32 R[COP_NR] = COP_PRIMES;
+    u32 o[COP_NR];                              // per r: first redundant mark of the word
+    #pragma unroll
+    for (u32 i = 0; i < COP_NR; ++i) {
+        const u32 r = R[i], cr = c % r;
+        o[i] = cr ? r - cr : 0u;
+    }
+    for (u32 j0 = 0; j0 < n; j0 += 32u, bit += 32u * p) {
+        u32 skip = 0;
+        #pragma unroll
+        for (u32 i = 0; i < COP_NR; ++i) {
+            const u32 r = R[i];
+            skip |= cop_pat(r) << o[i];
+            o[i] += r - 32u % r;                // next word: (o - 32) mod r
+            o[i] -= (o[i] >= r) ? r : 0u;
+        }
+        const u32 rem = n - j0;
+        u32 mm = ~skip & ((rem >= 32u) ? ~0u : ((1u << rem) - 1u));
+        while (mm) {
+            const u32 b = mad24(ctz(mm), p, bit);
+            mm &= mm - 1u;
+            atomic_and(&t32[b >> 5], CLR_MASK_R(c1, b));
+        }
+    }
+}
+
+/// ceil(span / p) for span < 2^24: float quotient + exact fix-ups.
+inline u32 ceil_div_f(const u32 span, const u32 p, const float ip)
+{
+    u32 n = (u32)((float)span * ip);
+    n += (n * p < span) ? 1u : 0u;
+    n -= (n > 0u && (n - 1u) * p >= span) ? 1u : 0u;
+    return n;
+}
+
+/// @pre    as med_prime_f32n; cres = (m mod COP_M) * 30^-1 mod COP_M for the
+///         mark q = m p at fb; nbits <= TILE_BITS.
+/// @post   every mark of p in [tile_bit0, tile_bit0 + nbits) whose
+///         multiplier has no factor 7..29 is cleared.
+inline void med_prime_cop(volatile __local u32* t32, const u32 fb, const u32 cres, const u32 p,
+                          const u32 tile_bit0, const u32 nbits, const u32 c1)
+{
+    if (fb == 0xFFFFFFFFu) return;
+    // first mark at or after tile_bit0 (as med_prime_f32n)
+    const float pf = (float)p, ip = 1.0f / pf;
+    const float df = (float)(int)(fb - tile_bit0);
+    const float qf = floor(df * ip);
+    float rf = fma(-qf, pf, df);
+    rf += (rf < 0.0f) ? pf : 0.0f;
+    rf -= (rf >= pf) ? pf : 0.0f;
+    const bool ahead = fb >= tile_bit0;
+    const u32 bit = ahead ? fb - tile_bit0 : (u32)rf;
+    if (bit >= nbits) return;
+    // t = marks from fb to bit: an exact multiple of p below 2^24, so the
+    // float quotient is within 0.05 of t and rint is exact
+    const u32 t = ahead ? 0u : (u32)rint((float)(tile_bit0 + bit - fb) * ip);
+    cop_marks(t32, cres + t, p, bit, ceil_div_f(nbits - bit, p, ip), c1);
+}
+
 inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
                           const u32 tile_bit0, const u32 qc7, const u32 s7, const u32 c1)
 {
@@ -952,6 +1046,7 @@ inline void own_prime_f32(__local u32* t32, const u32 tf, const u32 p,
 // The fused mask stage runs in the coalesced word order (2026-11-18, +0.1%).
 #define MED_SPLITN 128
 #define MED_BATCH 8
+#define MED_COP_BATCH 4          // items (med_prime_cop): 8 spills, 6 / 4 equal
 
 // ----------------------------------------------------------------------------
 // make_prime_map
@@ -1398,34 +1493,40 @@ __kernel void make_prime_map(
                 // Host-planned items (prime, tile word range) of about equal
                 // mark counts, sorted by mark count: the lanes of a sub-group
                 // run equally long mark loops. Rows of WG_SIZE items snake.
+                // fb_global's high word holds the item prime's residue c
+                // (med_prime_cop).
+                __global const uint2* fb2 = (__global const uint2*)fb_global;
                 const u32 nrow = (med_nit + WG_SIZE - 1u) / WG_SIZE;
                 const u32 meo = WG_SIZE - 1u - me;
                 u32 r = 0;
-                for (; r + MED_BATCH <= nrow; r += MED_BATCH) {
-                    u32 fbv[MED_BATCH], pv[MED_BATCH], wv[MED_BATCH];
+                for (; r + MED_COP_BATCH <= nrow; r += MED_COP_BATCH) {
+                    u32 fbv[MED_COP_BATCH], cv[MED_COP_BATCH], pv[MED_COP_BATCH], wv[MED_COP_BATCH];
                     #pragma unroll
-                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                    for (u32 u = 0; u < MED_COP_BATCH; ++u) {
                         const u32 it = (r + u) * WG_SIZE + (((r + u) & 1u) ? meo : me);
                         const bool ok = it < med_nit;
                         const uint2 d = med_items[ok ? it : 0u];
+                        const uint2 f = fb2[d.x];
                         wv[u] = ok ? d.y : 0u;
-                        fbv[u] = ok ? fb32[2u * d.x] : 0xFFFFFFFFu;
+                        fbv[u] = ok ? f.x : 0xFFFFFFFFu;
+                        cv[u] = f.y;
                         pv[u] = ok ? sieve_primes[d.x] : 0u;
                     }
                     #pragma unroll
-                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                    for (u32 u = 0; u < MED_COP_BATCH; ++u) {
                         const u32 w0 = wv[u] & 0xFFFFu, w1 = wv[u] >> 16;
-                        med_prime_f32n(t32 + w0, fbv[u], pv[u], tb + 32u * w0, qc7v, s7v,
-                                       32u * (w1 - w0), c1v);
+                        med_prime_cop(t32 + w0, fbv[u], cv[u], pv[u], tb + 32u * w0,
+                                      32u * (w1 - w0), c1v);
                     }
                 }
                 for (; r < nrow; ++r) {
                     const u32 it = r * WG_SIZE + ((r & 1u) ? meo : me);
                     if (it >= med_nit) continue;
                     const uint2 d = med_items[it];
+                    const uint2 f = fb2[d.x];
                     const u32 w0 = d.y & 0xFFFFu, w1 = d.y >> 16;
-                    med_prime_f32n(t32 + w0, fb32[2u * d.x], sieve_primes[d.x], tb + 32u * w0, qc7v, s7v,
-                                   32u * (w1 - w0), c1v);
+                    med_prime_cop(t32 + w0, f.x, f.y, sieve_primes[d.x], tb + 32u * w0,
+                                  32u * (w1 - w0), c1v);
                 }
                 j = sieve_split;
             } else
@@ -3402,23 +3503,38 @@ __kernel void sieve_large_packed_hl(
 // ----------------------------------------------------------------------------
 #define MIDW_BATCH 4             // 2026-11-17: 4 > 8 = 16 (window pass -1%)
 #define MIDW_SG 16               // SIMD16: window pass -3% vs the compiler's SIMD32
+#ifndef MIDW_COP_MAXP
+#define MIDW_COP_MAXP 131072u    // cop_marks below (batches whose last prime is below)
+#endif
 __constant uchar INV15[15] = {0, 1, 8, 0, 4, 0, 0, 13, 2, 0, 0, 11, 0, 7, 14};
 /// @pre    q_first odd; primes[a .. a + n) in (30, 2^32) coprime to 30;
 ///         phis = 8 dense phases (nibbles) of the class arrays.
 /// @post   i0tab[c * n + j] = smallest class-c bit i whose q = q_first +
-///         2 (15 i + phi_c) is a multiple of primes[a + j].
+///         2 (15 i + phi_c) is a multiple of primes[a + j]; for primes below
+///         MIDW_COP_MAXP i0tab[(8 + c) * n + j] = the residue c of that mark's
+///         multiplier (cop_marks).
 __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const u32 n,
                         const u64 q_first, const u32 phis, __global u32* restrict i0tab)
 {
     const u32 j = get_global_id(0);
     if (j >= n) return;
     const u32 p = primes[a + j];
-    // exact 64-bit remainder: once per prime per segment, free beside the
-    // window pass (bench null), and valid for every p (mod_ff needs p >= 4096)
-    const u32 r = (u32)(q_first % (u64)p);
+    // exact 64-bit quotient and remainder: once per prime per segment, free
+    // beside the window pass (bench null), and valid for every p (mod_ff
+    // needs p >= 4096)
+    const u64 qp = q_first / p;
+    const u32 r = (u32)(q_first - qp * p);
     u32 t = r ? p - r : 0u;
     t += (t & 1u) ? p : 0u;                 // q_first odd: first odd multiple at q_first + t
     const u32 b0 = t >> 1;                  // its dense bit, < p
+    // its multiplier m0 = qp + (r + t) / p, (r + t) in {0, p, 2p}; the
+    // multiplier residue c = m / 30 mod COP_M (cop_marks) of class c's first
+    // mark m0 + 2k is c0 + k / 15
+    // (only the primes mid_window walks with cop_marks: the 64-bit modulo
+    // costs, and mid_setup runs beside the tile sieve)
+    const bool cop = p < MIDW_COP_MAXP;
+    const u64 m0 = qp + ((r + t == 0u) ? 0u : ((r + t == p) ? 1u : 2u));
+    const u32 c0 = cop ? (u32)((m0 % COP_M) * (u64)COP_INV30 % COP_M) : 0u;
     const u32 pinv = INV15[p % 15u];
     const u32 b15 = b0 % 15u;
     #pragma unroll
@@ -3426,6 +3542,11 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
         const u32 ph = (phis >> (4u * c)) & 15u;
         const u32 k = ((ph + 15u - b15) * pinv) % 15u;   // b0 + k p = ph (mod 15)
         i0tab[c * n + j] = (b0 + k * p - ph) / 15u;
+        if (cop) {
+            u32 cc = c0 + (k * COP_INV15) % COP_M;
+            cc -= (cc >= COP_M) ? COP_M : 0u;
+            i0tab[(8u + c) * n + j] = cc;
+        }
     }
 }
 
@@ -3495,6 +3616,27 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     __global const u32* it = i0tab + (size_t)cls * n;
     __global const u32* pr = primes + a;
     u32 j = lid;
+    // primes below MIDW_COP_MAXP: many marks per window, skip the multipliers
+    // with factors 7..29 (cop_marks; the class's residue table follows i0's)
+    __global const u32* ct = i0tab + (size_t)(8u + cls) * n;
+    for (; j + (MIDW_BATCH - 1u) * wg < n && pr[j + (MIDW_BATCH - 1u) * wg] < MIDW_COP_MAXP;
+         j += MIDW_BATCH * wg) {
+        u32 iv[MIDW_BATCH], pv[MIDW_BATCH], cv[MIDW_BATCH];
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) {
+            iv[u] = it[j + u * wg]; pv[u] = pr[j + u * wg]; cv[u] = ct[j + u * wg];
+        }
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) {
+            const u32 p = pv[u];
+            const u32 bit = midw_first(iv[u], p, ws);
+            if (bit >= wb) continue;
+            const float ip = 1.0f / (float)p;
+            // marks from i0 to the window's first: exact multiple below 2^24
+            const u32 t = (u32)rint((float)(ws + bit - iv[u]) * ip);
+            cop_marks(v, cv[u] + t, p, bit, ceil_div_f(wb - bit, p, ip), c1v);
+        }
+    }
     for (; j + (MIDW_BATCH - 1u) * wg < n; j += MIDW_BATCH * wg) {
         u32 iv[MIDW_BATCH], pv[MIDW_BATCH];
         #pragma unroll

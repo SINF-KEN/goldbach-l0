@@ -119,6 +119,12 @@ def main():
          gbl["SKR2_MAXP"] <= gbl["SKR_MAXP"])
     same("SKR_R = 17 * 19 * 23 * 29", 17 * 19 * 23 * 29, gbl["SKR_R"])
     same("host MOD_FF_MIN_P >= 512", True, cfg["MOD_FF_MIN_P"] >= 512)
+    hm = host_constants("include/host_math.hpp")
+    same("COP_M (host_math.hpp)", hm["COP_M"], gbl["COP_M"])
+    same("COP_M = 7 * 11 * ... * 29 (all below MASK_MAX_P)", 7 * 11 * 13 * 17 * 19 * 23 * 29, gbl["COP_M"])
+    same("COP_INV30 (host_math.hpp)", hm["COP_INV30"], gbl["COP_INV30"])
+    same("COP_INV30 * 30 = 1 mod COP_M", 1, gbl["COP_INV30"] * 30 % gbl["COP_M"])
+    same("COP_INV15 * 15 = 1 mod COP_M", 1, gbl["COP_INV15"] * 15 % gbl["COP_M"])
     hk = re.search(r"HL_MAX_K_HOST\s*=\s*(\d+)", read("src/verifier.cpp"))
     same("HL_MAX_K_HOST (verifier.cpp) / HL_MAX_K", int(hk.group(1)), gbl["HL_MAX_K"])
 
