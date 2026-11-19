@@ -80,7 +80,9 @@ ClassGeo class_geometry(uint64_t q_first, uint64_t q_odds, uint32_t K) {
 
 void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
                             uint32_t sieve_split, uint32_t j0, uint32_t j1,
-                            uint64_t q_first, uint64_t q_last, const ClassGeo& g) {
+                            uint64_t q_first, uint64_t q_last, const ClassGeo& g,
+                            uint32_t cop_j0) {
+    static_assert(30 * COP_INV30 % COP_M == 1);
     for (uint32_t c = 0; c < g.K; ++c)
         std::fill(fb + size_t(c) * sieve_split + j0, fb + size_t(c) * sieve_split + j1, ~0ull);
     const uint64_t M = g.qmod;
@@ -96,7 +98,11 @@ void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
             const uint64_t m = m0 + (mt + M - m0 % M) % M;
             const uint64_t q = m * p;
             if (q > q_last) continue;
-            fb[size_t(c) * sieve_split + j] = (q - g.Q[c]) / M;
+            const uint64_t bit = (q - g.Q[c]) / M;
+            const uint64_t cop = (j >= cop_j0 && M == 30) ? m % COP_M * COP_INV30 % COP_M : 0;
+            if (cop && bit >> 32)
+                throw std::runtime_error("first_bits_class_range: class bit >= 2^32 with a residue");
+            fb[size_t(c) * sieve_split + j] = bit | cop << 32;
         }
     }
 }
