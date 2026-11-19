@@ -80,6 +80,19 @@ Thresholds: `DEFAULTS` in `ci/gbci/core.py`, overridable in
   versions, sparse, every window): rows go to `bench/bench-results.csv`;
   `benchmark.md` holds medians, figures and, for every arm, the per-phase
   difference (sieve / large / check / sync) that makes it faster or slower.
+  These rows land in the production tree's journal, are labelled after
+  VERSION (code promoted before a bump runs under the old number) and are
+  not committed.
+- The committed journal and the README figures: the **Version figures**
+  workflow (`ci/version_bench.py`). A push to main that changes the VERSION
+  in `include/config.hpp` measures the new version against the previous one
+  (each built from its first commit on main with its shipped `.spv`, every
+  figure window, 5 interleaved runs, production paused ~5 min through
+  `ci/experiment.py`), appends the rows to `bench/bench-results.csv`, adds
+  the label to `bench/figure-versions`, redraws `docs/images/` and opens a
+  pull request (CI dispatched on its branch). `workflow_dispatch` measures
+  given versions (`v2.7.0,v2.6.0`) or repeats the current one (`force`); run
+  on a branch, it commits to that branch instead.
 
 ## Commands
 

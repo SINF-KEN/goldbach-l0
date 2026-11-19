@@ -1,0 +1,20 @@
+# Versions drawn in docs/images/waterfall-*-by-version.png, newest first
+# (docs/make-plots.sh). ci/version_bench.py adds every version the workflow
+# "Version figures" measures. Not drawn (as before this file): v1.8.0, v1.8.1,
+# v2.2.1, and the CI quick-bench labels (v2.3.0-prev, -prod, ...), which are
+# named after VERSION, not after a release commit.
+v2.7.0
+v2.6.0
+v2.5.1
+v2.3.0
+v2.1.0
+v2.0.0
+v1.13.0
+v1.12.0
+v1.11.0
+v1.10.1
+v1.10.0
+v1.9.0
+v1.8.2
+v1.7.0
+v1.6.2

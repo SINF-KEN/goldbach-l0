@@ -140,8 +140,9 @@ large-prime sieve 125 ms (was 342 ms in v2.6.0), tile sieve 185 ms,
 checker and statistics 165 ms; the next segment's sieve overlaps the
 checker, so the parts add up to more than the 378 ms GPU time. v2.7.0
 needs ~7 GB of the B580's 12 GB (the prime-multiplier table and the hit
-lists) and ~0.7 s of start-up per process. The figures below are from
-v2.5.1 and earlier. The history of every version and
+lists) and ~0.7 s of start-up per process. The figure below is redrawn
+for every new version (the `Version figures` workflow measures it against
+the previous one and opens a pull request). The history of every version and
 every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and
 [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
