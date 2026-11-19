@@ -3647,15 +3647,35 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
             cop_marks(v, cv[u] + t, p, bit, ceil_div_f(wb - bit, p, ip), c1v);
         }
     }
-    for (; j + (MIDW_BATCH - 1u) * wg < n; j += MIDW_BATCH * wg) {
+    // per-lane pointers advanced by the batch: one 64-bit add per load at a
+    // uniform offset, not a zero-extend + shift + add per load (2026-11-19
+    // r12: the visits, not the marks, are most of the time above 131072)
+    __global const u32* itp = it + j;
+    __global const u32* prp = pr + j;
+    // primes below the window size: possibly several marks per window
+    for (; j + (MIDW_BATCH - 1u) * wg < n && pr[j - lid] < win_bits; j += MIDW_BATCH * wg,
+         itp += MIDW_BATCH * wg, prp += MIDW_BATCH * wg) {
         u32 iv[MIDW_BATCH], pv[MIDW_BATCH];
         #pragma unroll
-        for (u32 u = 0; u < MIDW_BATCH; ++u) { iv[u] = it[j + u * wg]; pv[u] = pr[j + u * wg]; }
+        for (u32 u = 0; u < MIDW_BATCH; ++u) { iv[u] = itp[u * wg]; pv[u] = prp[u * wg]; }
         #pragma unroll
         for (u32 u = 0; u < MIDW_BATCH; ++u) {
             const u32 p = pv[u];
             const u32 bit = midw_first(iv[u], p, ws);
             MIDW_MARK_LOOP(bit, p, wb, v)
+        }
+    }
+    // primes >= win_bits: at most one mark per window, no mark loop (each
+    // lane's j only advances, so a lane switching loops early is exact)
+    for (; j + (MIDW_BATCH - 1u) * wg < n; j += MIDW_BATCH * wg,
+         itp += MIDW_BATCH * wg, prp += MIDW_BATCH * wg) {
+        u32 iv[MIDW_BATCH], pv[MIDW_BATCH];
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) { iv[u] = itp[u * wg]; pv[u] = prp[u * wg]; }
+        #pragma unroll
+        for (u32 u = 0; u < MIDW_BATCH; ++u) {
+            const u32 bit = midw_first(iv[u], pv[u], ws);
+            if (bit < wb) atomic_and(&v[bit >> 5], CLR_MASK_R(c1v, bit));
         }
     }
     for (; j < n; j += wg) {
