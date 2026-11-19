@@ -18,10 +18,10 @@
 namespace {
 
 /// Parses an unsigned count in full decimal ("4000000000000000000") or
-/// e-notation ("4e18", "250e6"). The previous strtoull(..., 0) silently
-/// stopped at the first non-digit ("1e9" parsed as 1, "010" as octal 8),
-/// so a typo could produce a zero-work run that still reported PASS.
-/// Exact integer math only: mantissa * 10^exp with overflow checks.
+/// e-notation ("4e18", "250e6"), the whole string only: a plain strtoull
+/// stops at the first non-digit ("1e9" -> 1, "010" -> octal 8), so a typo
+/// could produce a zero-work run that still reports PASS. Exact integer
+/// math only: mantissa * 10^exp with overflow checks.
 /// @param s   text to parse (nullptr / empty rejected); no sign, no spaces.
 /// @param ok  set to true only when the whole string parsed without overflow.
 /// @return the value, or 0 when @p ok is false.
@@ -320,9 +320,8 @@ int main(int argc, char** argv) {
 
     // Range contract (GPU paths): verify every even n with max(start, 4) <= n
     // <= limit. An empty or reversed range is a usage error, never a PASS
-    // over evens that were not requested.
-    // --cpu-check 0 used to mean "flag absent" and silently ran a full GPU
-    // verification of the default range instead.
+    // over evens that were not requested. --cpu-check takes N >= 4 (a 0
+    // must not read as "flag absent" and run a GPU verification instead).
     if (cpu_check_set && cpu_check < 4) {
         std::println(stderr, "error: --cpu-check needs N >= 4");
         return 2;

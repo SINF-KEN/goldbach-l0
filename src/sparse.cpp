@@ -1,4 +1,4 @@
-// Sparse class map pipeline (v2.0, `--sparse`). See include/sparse.hpp for
+// Sparse class map pipeline (`--sparse`). See include/sparse.hpp for
 // the math and kernels/sparse.cl for the kernels.
 //
 // Per segment (slot = s & 1, double-buffered like run_gpu):
@@ -201,6 +201,8 @@ struct Events {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// ScmEngine's state: Level Zero objects, configuration, host tables, device
+// buffers and the per-slot segment records.
 struct ScmEngine::Impl {
     Context ctx;
     std::unique_ptr<Module> mod;
@@ -549,8 +551,8 @@ void ScmEngine::enqueue_check_only(uint64_t s, const std::vector<uint32_t>& map)
     im->check_only = nullptr;
 }
 
-// Enqueue segment s (N_s = N0 + s D) on slot s & 1. The slot must be idle
-// (collected). Advances the tile first-hit state by one segment.
+// Enqueue segment s (N_s = N0 + s D) on slot s & 1 (contract: sparse_run.hpp).
+// Advances the tile first-hit state by one segment.
 void ScmEngine::enqueue(uint64_t s)
 {
     Impl& I = *im;
@@ -689,7 +691,7 @@ void ScmEngine::enqueue(uint64_t s)
 }
 
 // Wait for slot's segment, check the fail-closed counters, fetch its
-// leftovers (resolve() verifies them on the CPU).
+// leftovers (contract: sparse_run.hpp; resolve() verifies them on the CPU).
 ScmSegResult ScmEngine::collect(uint32_t slot)
 {
     Impl& I = *im;
@@ -834,6 +836,7 @@ uint64_t ScmEngine::sample_pending(uint32_t slot, uint32_t max_evens,
 }
 
 // ---------------------------------------------------------------------------
+// run_gpu_sparse (contract: sparse_run.hpp)
 RunStats run_gpu_sparse(uint64_t limit, uint64_t segment_even, const std::string& spv_path,
                         bool verbose, uint64_t start_even, uint32_t split_p,
                         const char* prime_cache_path, bool collect_segments)
