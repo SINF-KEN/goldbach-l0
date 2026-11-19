@@ -635,7 +635,8 @@ dominated and not comparable.)
   8 rounds each. 2.74 J per 1e9 evens (long); full [4e18, 5e18] ~83 days.
   Per 1e11 at 4e18: large 431 ms, tile sieve 168 ms, checker + statistics
   175 ms, GPU 718 ms (the sieve overlaps the checker, §9.2v).
-  Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`):
+  Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`; redrawn
+  for every new VERSION by the `Version figures` workflow):
 
   ![steady window by version](images/waterfall-steady-by-version.png)
   ![current version by window](images/waterfall-current-by-window.png)

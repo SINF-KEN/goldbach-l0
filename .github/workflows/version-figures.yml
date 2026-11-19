@@ -1,0 +1,138 @@
+# Keeps bench/bench-results.csv and the README figures current. When the
+# VERSION in include/config.hpp changes on main, the new version is measured
+# against the previous one on the production B580 (ci/version_bench.py ->
+# ci/experiment.py: each version built from its first commit on main with
+# its committed .spv, interleaved bench.py runs on every figure window,
+# production paused ~5 min), the rows go into the journal, the version into
+# bench/figure-versions, docs/make-plots.sh redraws docs/images/, and the
+# result comes back as a pull request (on main) or as a commit on the
+# dispatched branch. A version already in the journal is not measured again
+# unless forced.
+name: Version figures
+
+on:
+  push:
+    branches: [main, ci/version-figures]   # BOOTSTRAP: the branch entry is removed after the first run
+    paths: [include/config.hpp, .github/workflows/version-figures.yml]
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "auto (current + previous VERSION), or e.g. v2.7.0,v2.6.0 (first = newest)"
+        default: auto
+      force:
+        description: "auto: measure even if the journal already has the current version"
+        type: boolean
+        default: false
+      runs:
+        description: "interleaved runs per version and window"
+        default: "5"
+
+permissions:
+  contents: write        # push the results branch
+  pull-requests: write   # open the pull request
+  actions: write         # dispatch CI on the results branch (GITHUB_TOKEN pushes trigger nothing)
+
+concurrency:
+  group: version-figures
+  cancel-in-progress: false
+
+env:
+  GOLDBACH_ROOT: ${{ vars.GOLDBACH_ROOT }}
+  PROD_DIR: ${{ vars.GOLDBACH_ROOT }}
+  TOOLS_DIR: ${{ vars.GOLDBACH_ROOT }}/../goldbach-tools
+
+jobs:
+  figures:
+    name: Measure the new version, redraw the figures (pauses production)
+    runs-on: [self-hosted, goldbach-gpu]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: goldbach-l0
+          fetch-depth: 0
+
+      - name: Production tree configured (repository variable GOLDBACH_ROOT)
+        run: |
+          test -n "$GOLDBACH_ROOT" && test -f "$PROD_DIR/ci/goldbach_ci.py" || {
+            echo "::error::set the repository variable GOLDBACH_ROOT to the production goldbach-l0 checkout (gh variable set GOLDBACH_ROOT --body /path/to/goldbach-l0); goldbach-tools is expected next to it"
+            exit 1; }
+
+      - name: Versions to measure
+        id: spec
+        working-directory: goldbach-l0
+        env:
+          VERSIONS: ${{ inputs.versions || 'auto' }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+          RUNS: ${{ inputs.runs || '5' }}
+        run: |
+          # shellcheck disable=SC2086
+          python3 ci/version_bench.py spec --versions "$VERSIONS" --runs "$RUNS" $FORCE \
+            -o "$RUNNER_TEMP/version-spec.json" --github-output "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/version-spec.json"
+
+      - name: Measure (ci/experiment.py, production paused)
+        if: steps.spec.outputs.todo == '1'
+        working-directory: goldbach-l0
+        run: |
+          python3 ci/experiment.py "$RUNNER_TEMP/version-spec.json" --prod-dir "$PROD_DIR" \
+            --out "$RUNNER_TEMP/version-bench" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Journal + figure-versions
+        if: steps.spec.outputs.todo == '1'
+        working-directory: goldbach-l0
+        run: python3 ci/version_bench.py append "$RUNNER_TEMP/version-bench/bench.csv" --spec "$RUNNER_TEMP/version-spec.json"
+
+      - name: goldbach-tools at its committed HEAD (tools -> ../goldbach-tools)
+        if: steps.spec.outputs.todo == '1'
+        run: |
+          rm -rf goldbach-tools
+          git clone -q --no-hardlinks "$TOOLS_DIR" goldbach-tools
+          echo "goldbach-tools $(git -C goldbach-tools rev-parse --short=12 HEAD)"
+
+      - name: Redraw docs/images (docs/make-plots.sh)
+        if: steps.spec.outputs.todo == '1'
+        working-directory: goldbach-l0
+        run: PY="$TOOLS_DIR/.venv/bin/python" bash docs/make-plots.sh
+
+      - name: Commit; pull request on main, push on a dispatched branch
+        if: steps.spec.outputs.todo == '1'
+        working-directory: goldbach-l0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABELS: ${{ steps.spec.outputs.labels }}
+          CUR: ${{ steps.spec.outputs.current }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/bench-results.csv bench/figure-versions docs/images/waterfall-*.png
+          git diff --cached --quiet && { echo "nothing changed"; exit 0; }
+          msg="bench: ${LABELS//,/ vs } measured, figures redrawn"
+          git commit -q -m "$msg" -m "Version figures run $RUN_URL (ci/version_bench.py + ci/experiment.py, production paused): rows appended to bench/bench-results.csv, docs/images/waterfall-*.png redrawn by docs/make-plots.sh."
+          if [ "$BRANCH" != main ]; then
+            git push origin "HEAD:$BRANCH"
+            echo "Results committed to \`$BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          head="bench/$CUR-${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/$head"
+          # the required checks: a GITHUB_TOKEN push starts no workflow, a dispatch does
+          gh workflow run ci.yml --ref "$head" || echo "::warning::could not dispatch CI on $head"
+          body="Measured by $RUN_URL: ${LABELS//,/ vs } on the production B580 (each version's first commit on main, shipped kernels, production configuration, interleaved bench.py runs). The paired comparison is in the run summary. Adds the rows to \`bench/bench-results.csv\` and redraws \`docs/images/\`."
+          if url=$(gh pr create --base main --head "$head" --title "$msg" --body "$body" 2>&1); then
+            echo "Pull request: $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::pull request not opened ($url). Open it: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$head?expand=1"
+            echo "Open the pull request: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$head?expand=1" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: version-figures-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/version-bench
+            goldbach-l0/docs/images/waterfall-*.png
+          if-no-files-found: ignore

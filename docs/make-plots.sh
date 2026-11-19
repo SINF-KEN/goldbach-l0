@@ -3,7 +3,8 @@
 # bench.py journal (bench/bench-results.csv) with tools/waterfall.py.
 #
 #   bash docs/make-plots.sh [CSV] [LABELS]
-#   defaults: bench/bench-results.csv, "v2.5.1,v2.3.0,v2.1.0,...,v1.6.2" (arm labels to compare)
+#   defaults: bench/bench-results.csv, the labels in bench/figure-versions
+#   (newest first; the workflow "Version figures" adds each new version)
 #
 # Figures (latest bench.py session per label and window, time per 1e10 integers):
 #   waterfall-long-by-version.png    long window (1e11 at 4e18, production-like),
@@ -19,7 +20,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CSV=${1:-bench/bench-results.csv}
-LABELS=${2:-v2.5.1,v2.3.0,v2.1.0,v2.0.0,v1.13.0,v1.12.0,v1.11.0,v1.10.1,v1.10.0,v1.9.0,v1.8.2,v1.7.0,v1.6.2}
+if [ -z "${2:-}" ]; then
+    LABELS=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' bench/figure-versions | paste -sd, -)
+else
+    LABELS=$2
+fi
 CUR=${LABELS%%,*}                     # first label = current version
 if [ -z "${PY:-}" ]; then              # caller's interpreter first (CI), else the tools venv
     PY=python3

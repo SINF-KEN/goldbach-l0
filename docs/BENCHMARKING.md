@@ -4,7 +4,11 @@ Raw data: [`bench/`](../bench/) — `bench-results.csv` is the append-only
 journal every `tools/bench.py` session writes (one row per run, never
 edited); `bench-20260926-sparse-v2.csv` is the v2.0 sparse session. Figures:
 `bash docs/make-plots.sh` (needs pandas + matplotlib) renders
-`docs/images/` from the journal. Results per change are recorded in
+`docs/images/` from the journal, one bar per label in `bench/figure-versions`.
+A new VERSION on main is measured and drawn automatically: the
+`Version figures` workflow (`ci/version_bench.py` + `ci/experiment.py`)
+benchmarks it against the previous version, appends the rows, adds the label,
+redraws the figures and opens a pull request. Results per change are recorded in
 [HISTORY.md](HISTORY.md) §9.2.
 
 ## The measure
