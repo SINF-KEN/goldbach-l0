@@ -1388,6 +1388,36 @@ checked[] buffers (never written by the verifier: write_checked = 0) are
 gone, -58.4 MB of device memory at the 467.5M segment. New loud checks: see
 EXACTNESS.md.
 
+### 9.2ad Round 10: SLM multiplier skip + table generator (2026-11-19, v2.8.0): +6.2% / +6.4%
+Two agents on v2.7.0 (9418788); merged branch perf/r10, exact on the full
+gate (4e18 and 5e18 with `GB_BUCKET_VERIFY=1`; 1e12, 1e14, 1e18 and 5e8 at
+4e18 with `GB_NOVERIFY=1`): stats.state, stats.state.gaps, ridges and
+stats.log except times byte-identical to v2.7.0.
+
+- **SLM multiplier skip** (a9e82ad): a mark p·m is redundant when m has a
+  factor 7..29 (the mask stage cleared it). Along one class array the
+  multipliers are m, m+30, ...; with c = m/30 mod 7·11·...·29 the t-th mark
+  is redundant exactly when r | c+t, so each 32-mark word ORs one shifted
+  constant pattern per r and visits only the remaining bits. Tile medium
+  items (c in the spare high word of the first-bit entry) and mid windows
+  for p < 131072 (c beside mid_setup's table, +12 MB). Tile 0.546 -> 0.472
+  ms, mid_window 0.321 -> 0.291 ms, period 1.568 -> 1.465 ms per segment.
+  The wheel-7 medium-item path is gone. EXACTNESS.md rule 2b.
+- **Generated wheel tables** (531f6cb): ten pasted constant tables (76 % of
+  goldbach.cl) come from kernels/gen_tables.py into goldbach_tables.h;
+  goldbach.cl 743 -> 180 KB, .spv byte-identical. ocloc needs `-I kernels`.
+- **Base-prime cache checked beside the GPU init** (c3bb083): init 0.645 ->
+  0.527 s per process; a damaged cache fails the run and is renamed .bad.
+- GB_TWIN refused; dead GB_SPLIT / GB_CLASSMAP checks removed (e829825).
+
+Paired, 5 rounds vs v2.7.0: long 132.34 -> 140.58 Gev/s (+6.22 %, +-0.08 %),
+long-end 131.27 -> 139.69 (+6.39 %, +-0.04 %); 6e11 at 4e18, 3 rounds,
++6.31 %. Nulls: a second skip set 31..47, register-pattern mask fill, SIMD16
+tile, two-word mark walk, mid-window table pair layouts, split / bound / plan
+re-sweeps. Measured, not changed: `GB_BUCKET_VERIFY=500` costs 3.7 % per
+production slice (kept by choice); the host loop is busy ~1.3 of each ~1.5 ms
+segment period, so further GPU gains will soon be host-bound.
+
 ## 13. Performance
 
 
