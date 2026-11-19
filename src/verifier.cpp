@@ -470,7 +470,6 @@ private:
     uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
     bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
     uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
-    uint32_t slot_gphis[2] = {0, 0};       // count30's phases in phase order (block-walk patterns)
     uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
     bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
     uint64_t sampled_evens = 0;            // evens of the sampled segments
@@ -1042,12 +1041,12 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
         const bool w = walked_slot[sl];
         if (w)
             for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
-        // count30's block walk: the internal gaps of the blocks with two or
-        // more primes, by pattern (bins after the histogram)
+        // count30's block walk: the internal gaps of the blocks of 30
+        // (bins g / 2 after the histogram)
         uint32_t hx[GAPS30_HBINS];
         if (w) {
             std::memcpy(hx, b.g_hist[sl], sizeof(hx));
-            const uint32_t dint = add_pattern_gaps(hx, b.g_hist[sl] + GAPS30_HBINS, slot_gphis[sl]);
+            const uint32_t dint = add_inner_gaps(hx, b.g_hist[sl] + GAPS30_HBINS);
             // count30's maximum covers the gaps into blocks only
             if (dint && (wmax >> 32) <= 2ull * dint && b.x_cnt[sl][11] != ~0u)
                 wmax = walk_max_exact(slot_qfirst[sl], b.x_cnt[sl][11], b.x_cnt[sl][12]);
@@ -2221,7 +2220,6 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
     slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
     slot_qfirst[sg.slot] = sg.q_first;
-    slot_gphis[sg.slot] = g_phis;
     k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cnt->set_arg(1, 4, &cw32);
     k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
