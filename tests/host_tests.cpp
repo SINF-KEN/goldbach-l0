@@ -114,7 +114,8 @@ void test_prime_cache()
     }
     {   // Header and size intact, payload damaged: the structural checks pass,
         // so only the content check can refuse it. (A concurrent builder's
-        // truncation could expose exactly such a zero hole before v2.3.0.)
+        // truncation exposes exactly such a zero hole when the cache is
+        // written in place.)
         const uint64_t n = 50000;
         const auto good = odd_primes_up_to(n);
         // a well-formed GBP2 file whose hash matches its (damaged) payload:
@@ -1660,7 +1661,7 @@ void test_host_math_first_bits()
 
 // ceil_div_f (kernels/goldbach.cl): (u32)(span * ip) plus one fix-up up is
 // ceil(span / p) for every span <= 2^21, also with 1/p off by 2 ulp (OpenCL
-// allows 2.5); the dropped fix-up down never fires. Every span for edge and
+// allows 2.5); a downward fix-up would never fire. Every span for edge and
 // sample primes.
 void test_ceil_div_f()
 {
