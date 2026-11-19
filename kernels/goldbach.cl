@@ -580,8 +580,9 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+__constant uchar INV7[7] = {0, 1, 4, 5, 2, 3, 6};   // x^-1 mod 7
 inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
-                          const u32 tile_bit0)
+                          const u32 tile_bit0, const u32 qc7, const u32 s7)
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
@@ -597,8 +598,38 @@ inline void med_prime_f32(volatile __local u32* t32, const u32 fb, const u32 p,
         const u32 rmu = (u32)rf;
         bit = rmu ? p - rmu : 0u;
     }
-    for (; bit < (u32)TILE_BITS; bit += p)
-        atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+    // Wheel 7, unrolled (2026-11-18, sieve -4.4 ms per 1e11): the marks of
+    // q = 0 (mod 7) are already cleared by the tile kernel's own sieving of
+    // 7 (mask or walk; q = p m >= 7 p, never 7 itself). Along a class array
+    // q(i) = qc + s i (s = 2 cmod = 30 or 6), so q_k = q_0 + s p k (mod 7)
+    // and exactly the k = k7 (mod 7) are skipped: blocks of 7 p take six
+    // marks at fixed offsets (no per-mark ALU), the tail tests each of at
+    // most 7 candidates. qc7 = qc mod 7, s7 = s mod 7.
+    if (p == 7u) {
+        for (; bit < (u32)TILE_BITS; bit += p)
+            atomic_and(&t32[bit >> 5], CLR_MASK(bit));
+        return;
+    }
+    if (bit < (u32)TILE_BITS) {
+        const u32 q0 = (qc7 + s7 * (tile_bit0 + bit)) % 7u;      // class bits < 2^24
+        const u32 k7 = ((7u - q0) * INV7[(s7 * p) % 7u]) % 7u;
+        const u32 p6 = 6u * p, p7 = 7u * p;
+        u32 o[6];
+        #pragma unroll
+        for (u32 t = 0; t < 6u; ++t) o[t] = (t + (t >= k7 ? 1u : 0u)) * p;
+        for (; bit + p6 < (u32)TILE_BITS; bit += p7) {
+            #pragma unroll
+            for (u32 t = 0; t < 6u; ++t) {
+                const u32 b = bit + o[t];
+                atomic_and(&t32[b >> 5], CLR_MASK(b));
+            }
+        }
+        for (u32 d = 0; d < 7u; ++d) {
+            const u32 b = bit + d * p;
+            if (b >= (u32)TILE_BITS) break;
+            if (d != k7) atomic_and(&t32[b >> 5], CLR_MASK(b));
+        }
+    }
 }
 
 // One prime of the thread-owned walk (table path) in 32-bit / float
@@ -731,6 +762,8 @@ __kernel void make_prime_map(
     const u32 phic = (cm == 2u) ? ((phis >> (4u * cls)) & 15u)
                                 : (cls ? (phis >> 8) : (phis & 0xFFu));
     const u32 cmod = (cm == 2u) ? 15u : 3u;            // dense bits per class bit
+    const u32 qc7v = (u32)((q_first + 2UL * phic) % 7UL);   // q of class bit 0, mod 7
+    const u32 s7v = (2u * cmod) % 7u;                       // q step per class bit, mod 7
     const u32 qf30 = (u32)(q_first % 30UL);            // wheel-30 phase (dense map)
     const u64 n_valid = (cm == 2u) ? ((q_odds > phic) ? (q_odds - phic + 14UL) / 15UL : 0UL)
                       : cm ? (cls ? n5 : n1) : q_odds;
@@ -1063,10 +1096,10 @@ __kernel void make_prime_map(
                 }
                 #pragma unroll
                 for (u32 u = 0; u < MED_BATCH; ++u)
-                    med_prime_f32(t32, fbv[u], pv[u], tb);
+                    med_prime_f32(t32, fbv[u], pv[u], tb, qc7v, s7v);
             }
             for (; j < sieve_split; j += WG_SIZE)
-                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb);
+                med_prime_f32(t32, fb32[2u * j], sieve_primes[j], tb, qc7v, s7v);
         }
         if (cm) {                                       // class map: no wheel (uniform)
             for (; j + (MED_BATCH - 1) * WG_SIZE < sieve_split; j += MED_BATCH * WG_SIZE) {
@@ -1107,8 +1140,12 @@ __kernel void make_prime_map(
     //   -> global word = (cls * tpc + tile_id) * TILE_WORDS + w
     // Bits beyond q_odds (last tile tail) are masked to 0 so the map is exact.
     __global u64* dst = prime_map + ((u64)cls * tpc + tile_id) * TILE_WORDS;
+    // Coalesced: word i * WG_SIZE + me (2026-11-18, sieve -1.5 ms per 1e11).
+    // Any thread may read any SLM word once every atomic is done: after the
+    // medium stage's barrier, or this one when that stage does not run.
+    if (!(own_end < sieve_split)) barrier(CLK_LOCAL_MEM_FENCE);   // uniform
     for (u32 i = 0; i < WORDS_PER_THREAD; ++i) {
-        const u32 w = my_word0 + i;
+        const u32 w = i * WG_SIZE + me;
         u64 v = tile[w];
         const u64 bit0 = tile_bit0 + (u64)w * 64UL;
         if (bit0 + 64UL > n_valid) {
@@ -1297,7 +1334,12 @@ inline void large_packed_body(
     // beyond the segment is rejected by the mark loop (first > q_last).
     const bool hi_range = (q_first >> 60) != 0;
     const ff_x qf_split = ff_split(q_first);
-    #pragma unroll
+    // NOT unrolled (2026-11-18): the 16 inlined copies of the setup + mark
+    // loop made the kernel instruction-fetch bound; a rolled loop over the
+    // item's primes is large_s -5.8% (bench +3.2% long / +3.3% long-end).
+    // Unroll 2 measured the same as 1; the sieve kernels' batch loops showed
+    // no such effect.
+    #pragma unroll 1
     for (u32 lane = 0; lane < LARGE_PACK_PPI; ++lane) {
         const u64 p = pv[lane];
         if (c0 + lane >= large_count) break;
@@ -1516,10 +1558,14 @@ inline u32 c30_orp(const u32 a, const u32 b, const u32 mask)
     else if ((mask) == 31u) C30_ORW1(31u); \
     else if ((mask) == 7u) C30_ORW1(7u); \
     else if ((mask) == 3u) C30_ORW1(3u); \
+    else if ((mask) == 5u) C30_ORW1(5u); \
     else C30_ORW1(mask); } while (0)
 
-// Phase A. One work-item = 1024 evens of one class; items_pad items per
-// class (a multiple of the work-group size: one class per work-group).
+// Phase A. One work-item = 64 * A_W64 evens of one class; items_pad items per
+// class (a multiple of the work-group size: one class per work-group). The
+// classes are interleaved over the groups (group g: class g % 15, block group
+// g / 15), so concurrently running groups read nearby windows of the class
+// arrays (phase A -11% with the 32-bit epilogue below).
 /// @pre    plan from make_plan30 (candidates prime, < MAX_GB_PRIME); the
 ///         segment's mod-30 class map complete (every set bit is a prime q,
 ///         barrier after the sieve kernels); tb = seg_start - q_first and the
@@ -1553,9 +1599,11 @@ __kernel void check30_a(
         const u32 write_checked,
         __global u32* restrict acct)             // [0] += evens resolved here
 {
-    const u32 gid = get_global_id(0);
-    const u32 cr = gid / items_pad;                    // uniform per work-group
-    const u32 blk = gid - cr * items_pad;
+    // class-interleaved groups: group g takes class g % 15 of block group
+    // g / 15, so concurrently running groups read nearby map windows
+    const u32 grp = get_group_id(0);
+    const u32 cr = grp % 15u;
+    const u32 blk = (grp / 15u) * get_local_size(0) + get_local_id(0);
     const u32 r = 2u * cr;
     const u32 e0 = ((r + 30u - sm30) % 30u) >> 1;      // first even index of the class
     const u32 ec = (cr < 15u && seg_evens > e0) ? (seg_evens - e0 + 14u) / 15u : 0u;
@@ -1627,37 +1675,42 @@ __kernel void check30_a(
         }
     }
 
-    u32 cnt = 0, res = 0;                              // misses / resolved (valid bits only)
-    #pragma unroll
-    for (u32 i = 0; i < A_W64; ++i) {
-        const u32 kb = k0 + 64u * i;
-        if (!live || kb >= ec) continue;
-        const u64 a = (u64)acc[2 * i] | ((u64)acc[2 * i + 1] << 32);
-        const u32 n = min(64u, ec - kb);
-        const u64 valid = (n >= 64u) ? ~0UL : ((1UL << n) - 1UL);
-        if (write_checked) checked[(u64)cr * chk_stride + (kb >> 6)] = a & valid;
-        cnt += (u32)popcount(~a & valid);
-        res += (u32)popcount(a & valid);
+    u32 cnt = 0;
+    // the bits past ec (and every bit of a dead item) were set at the start,
+    // so the misses are exactly the clear bits of acc
+    if (write_checked) {
+        #pragma unroll
+        for (u32 i = 0; i < A_W64; ++i) {
+            const u32 kb = k0 + 64u * i;
+            if (!live || kb >= ec) continue;
+            const u64 a = (u64)acc[2 * i] | ((u64)acc[2 * i + 1] << 32);
+            const u32 n = min(64u, ec - kb);
+            const u64 valid = (n >= 64u) ? ~0UL : ((1UL << n) - 1UL);
+            checked[(u64)cr * chk_stride + (kb >> 6)] = a & valid;
+        }
     }
+    #pragma unroll
+    for (u32 i = 0; i < 2 * A_W64; ++i) cnt += popcount(acc[i]);
+    cnt = 2u * A_W64 * 32u - cnt;
     const u32 off = sub_group_scan_exclusive_add(cnt);
     const u32 tot = sub_group_reduce_add(cnt);
-    const u32 rtot = sub_group_reduce_add(res);
-    if (get_sub_group_local_id() == 0 && rtot) atomic_add(acct, rtot);
+    // positive coverage: the sub-group's lanes hold consecutive items of one
+    // class, so its valid evens are min(ec - k0 of lane 0, its width)
+    // (clamped at 0); resolved = valid - misses
+    const u32 k0s = k0 - get_sub_group_local_id() * (A_W64 * 64u);
+    const u32 vtot = (cr < 15u && k0s < ec) ? min(ec - k0s, get_sub_group_size() * (A_W64 * 64u)) : 0u;
+    if (get_sub_group_local_id() == 0 && vtot > tot) atomic_add(acct, vtot - tot);
     u32 base = 0;
     if (get_sub_group_local_id() == 0 && tot) base = atomic_add(pending_count, tot);
     base = sub_group_broadcast(base, 0) + off;
     if (cnt) {
         #pragma unroll
-        for (u32 i = 0; i < A_W64; ++i) {
-            const u32 kb = k0 + 64u * i;
-            if (kb >= ec) continue;
-            const u64 a = (u64)acc[2 * i] | ((u64)acc[2 * i + 1] << 32);
-            const u32 n = min(64u, ec - kb);
-            u64 miss = ~a & ((n >= 64u) ? ~0UL : ((1UL << n) - 1UL));
+        for (u32 i = 0; i < 2 * A_W64; ++i) {
+            u32 miss = ~acc[i];
             while (miss) {
-                const u32 b = (u32)ctz(miss);
-                miss &= miss - 1UL;
-                if (base < pending_cap) pending[base] = e0 + 15u * (kb + b);
+                const u32 b = ctz(miss);
+                miss &= miss - 1u;
+                if (base < pending_cap) pending[base] = e0 + 15u * (k0 + 32u * i + b);
                 ++base;
             }
         }
@@ -2108,23 +2161,52 @@ __kernel void count30(
                 if (!aprev && 30u * 32u * (w - 2u) >= pos_lo) err |= G30T_ERR_LOOK;
             }
             if (!aprev) hp = cf >> 1;
+            // Each word's 8 class words are nibble-transposed (an 8 x 8 matrix
+            // of 4-bit blocks, 3 swap stages): group k then holds blocks
+            // 4 k .. 4 k + 3 with slot s of block 4 k + j at bit 4 s + j, the
+            // slots rotated by ord & 15 so ascending slots are ascending
+            // phases (the classes in phase order are a rotation of 0..7, host-
+            // checked). A block refill is a 3-level select of its group, a
+            // shift and a mask (was 8 bit gathers), the phase a nibble of phis.
+            const u32 r0 = ord & 15u;
             #pragma unroll
             for (u32 i = 0; i < C30_CW; ++i) {
-                // one prime per iteration (lanes diverge least): a block's
-                // primes as a 15-bit mask of half offsets, refilled from the
-                // next non-empty block
+                u32 W[8];
+                #pragma unroll
+                for (u32 c = 0; c < 8; ++c) W[c] = v[c][i];
+                #pragma unroll
+                for (u32 c = 0; c < 4; ++c) {
+                    const u32 t = ((W[c] >> 16) ^ W[c + 4]) & 0x0000FFFFu;
+                    W[c + 4] ^= t; W[c] ^= t << 16;
+                }
+                #pragma unroll
+                for (u32 c = 0; c < 8; c += (c & 1u) ? 3u : 1u) {
+                    const u32 t = ((W[c] >> 8) ^ W[c + 2]) & 0x00FF00FFu;
+                    W[c + 2] ^= t; W[c] ^= t << 8;
+                }
+                #pragma unroll
+                for (u32 c = 0; c < 8; c += 2) {
+                    const u32 t = ((W[c] >> 4) ^ W[c + 1]) & 0x0F0F0F0Fu;
+                    W[c + 1] ^= t; W[c] ^= t << 4;
+                }
+                #pragma unroll
+                for (u32 k = 0; k < 8; ++k) W[k] = rotate(W[k], 32u - 4u * r0);
                 u32 nb = any[i], m = 0u, hb = 0u;
                 const u32 h0 = 15u * 32u * (w + i);
                 while (nb | m) {
                     if (!m) {
                         const u32 b = ctz(nb);
                         nb &= nb - 1u;
-                        #pragma unroll
-                        for (u32 c = 0; c < 8; ++c) m |= ((v[c][i] >> b) & 1u) << ph[c];
+                        const u32 k = b >> 2;
+                        const u32 x01 = (k & 1u) ? W[1] : W[0], x23 = (k & 1u) ? W[3] : W[2];
+                        const u32 x45 = (k & 1u) ? W[5] : W[4], x67 = (k & 1u) ? W[7] : W[6];
+                        const u32 x03 = (k & 2u) ? x23 : x01, x47 = (k & 2u) ? x67 : x45;
+                        m = (((k & 4u) ? x47 : x03) >> (b & 3u)) & 0x11111111u;
                         hb = h0 + 15u * b;
                     }
-                    const u32 h = hb + ctz(m);
+                    const u32 s4 = ctz(m);
                     m &= m - 1u;
+                    const u32 h = hb + ((phis >> s4) & 15u);
                     const u32 d = h - hp;
                     hp = h;
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
@@ -2663,7 +2745,17 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
     const u32 wb = min(win_bits, nc - ws);  // valid bits of this window
     const u32 nw = (wb + 31u) >> 5;
     __global u32* gm = map32 + (size_t)cls * c5w32 + (ws >> 5);
-    for (u32 i = lid; i < nw; i += wg) win[i] = gm[i];
+    // 16-byte loads and stores (gm is 16 KB aligned): one work-group per Xe
+    // core, so the window load / store latency is exposed; uint4 issues 4x
+    // fewer messages (2026-11-18: window pass -5.5 ms per 1e11, +0.8%)
+    const u32 nw4 = nw >> 2;
+    {
+        __global const uint4* g4 = (__global const uint4*)gm;
+        __local uint4* w4 = (__local uint4*)win;
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) w4[i] = g4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) win[i] = gm[i];
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
     volatile __local u32* v = (volatile __local u32*)win;
     __global const u32* it = i0tab + (size_t)cls * n;
@@ -2708,5 +2800,11 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         MIDW_MARK_LOOP(bit, p, wb, v, ws)
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (u32 i = lid; i < nw; i += wg) gm[i] = win[i];
+    {
+        __global uint4* g4 = (__global uint4*)gm;
+        __local const uint4* w4 = (__local const uint4*)win;
+        #pragma unroll 8
+        for (u32 i = lid; i < nw4; i += wg) g4[i] = w4[i];
+        for (u32 i = (nw4 << 2) + lid; i < nw; i += wg) gm[i] = win[i];
+    }
 }

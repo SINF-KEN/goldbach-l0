@@ -43,24 +43,30 @@ inline constexpr uint32_t C30_UNITS[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 // weighed as 10 funnels, 84 members per class) measured at 4e18 per 425M
 // segment: phase A + B 0.383 ms vs 0.402 ms for the v1.13.0 plan (members up
 // to 9749), 0.046% of the evens left for phase B.
+// r2b (2026-11-18): re-planned by a per-class local search (cost + lambda *
+// pending, lambda 0.025; funnel 1, window 1.5 + 1 per extra pattern member,
+// costs re-measured by ablation: a window reload is ~3.3 funnels now, not
+// 10-14) on an exact map at 4.2e18 (1e7 evens): pending 0.046% -> 0.038%
+// for the same simulated phase-A cost; uses mask 5 (p, p + 60), which has
+// its own specialized pattern OR. +0.28% on both bench windows.
 inline constexpr uint32_t CHECK30_TAIL = 3000;
 inline constexpr const char* CHECK30_PLAN =
     "3000:"
-    "7/7x9,11/7x9,17/7x9,1/31x1;"
-    "1/7x8,13/7x8,19/3x17,1/3x1;"
-    "11/7x9,17/7x9,23/7x7,11/3x5;"
-    "7/7x9,17/7x9,13/7x8,19/15x2;"
-    "7/7x9,1/7x8,19/7x7,7/3x6;"
-    "11/7x9,17/7x9,23/7x7,29/31x2;"
+    "7/7x9,11/7x9,23/7x9,1/31x3;"
+    "1/7x8,13/7x8,19/3x17;"
+    "11/7x9,17/7x9,23/7x7,17/3x7;"
+    "7/7x9,17/7x9,23/7x8,13/15x4;"
+    "7/7x9,1/7x8,19/7x7,19/3x7;"
+    "11/7x9,17/7x9,23/7x7,29/15x4;"
     "11/7x9,29/3x21,1/31x3;"
-    "7/7x9,1/7x8,13/7x8,1/3x5;"
-    "17/7x9,29/3x21,23/7x5;"
-    "7/7x9,11/7x9,17/7x9,1/31x1;"
+    "7/7x9,1/7x8,13/7x8,1/5x7;"
+    "17/7x9,29/5x21,23/7x7;"
+    "7/7x9,11/7x9,17/7x9;"
     "7/7x9,1/7x8,13/7x8,19/15x3;"
-    "11/7x9,29/3x21,23/7x5;"
-    "7/7x9,11/7x9,17/7x9,1/31x1;"
-    "7/7x9,13/7x8,19/7x7,7/3x6;"
-    "11/7x9,17/7x9,29/7x7,11/3x5";
+    "11/7x9,29/5x21,23/7x7;"
+    "7/7x9,11/7x9,17/15x9,13/15x5;"
+    "7/7x9,13/7x8,19/7x7,7/3x9;"
+    "11/7x9,17/7x9,29/7x7,17/3x6";
 
 /// @return true iff @p x is coprime to 30 (a unit mod 30).
 inline bool c30_unit(uint32_t x) { return std::gcd(x % 30u, 30u) == 1; }

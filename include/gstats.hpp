@@ -73,11 +73,11 @@ inline constexpr uint32_t COUNT30_CW = 4;          // MUST match C30_CW in goldb
 inline constexpr uint32_t GAPS30_TAIL = 700;       // MUST match G30T_TAIL in goldbach.cl
 inline constexpr uint32_t GAPS30_HBINS = 1024;     // MUST match G30_HBINS in goldbach.cl
 inline constexpr uint32_t GAPS30_TCAP = 4096;      // tail entries per segment (~1 expected)
-inline constexpr uint32_t GAPS30_GROUPS = 64;      // default count30 grid on walked segments (work-groups, grid-stride)
+inline constexpr uint32_t GAPS30_GROUPS = 48;      // default count30 grid on walked segments (work-groups, grid-stride)
                                                   // on a GAPS30_REF_EUS device; scaled by the device's EU count
-                                                  // (gaps30_groups). Few groups leave hardware threads to phase A,
-                                                  // which overlaps count30 (B580: 16: -6.2%, 32: -0.5%, 48: -0.1%,
-                                                  // 64: best, 96 / 160: -0.4 / -0.3%, 320: -0.55%)
+                                                  // (gaps30_groups). count30 runs beside phase B and the next tile
+                                                  // sieve (GB_C30_LATE); B580 gpu ms per 1e11: 20 655, 24 645,
+                                                  // 28 641, 32/36 639, 40 657 (!), 44/48 638.5, 60 640, 64 645, 80 643
 inline constexpr uint32_t GAPS30_REF_EUS = 160;    // EUs of the device GAPS30_GROUPS was tuned on (B580: 20 Xe2 cores x 8)
 inline constexpr uint32_t GAPS30_GROUPS_MAX = 4096;
 inline constexpr uint32_t GAPS30_MAX_SG = 32;      // MUST match G30_MAX_SG in goldbach.cl

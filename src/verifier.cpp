@@ -94,6 +94,10 @@ struct GpuBuffers {
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
 inline constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
+inline constexpr uint32_t HL_HARVEST_WG = 1024; // hl_harvest work-group size (GB_HLH_WG)
+// Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
+// harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
+inline constexpr uint32_t HL_K_DEFAULT = 64;
 static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
 /// Copies host data to a device buffer through a shared staging allocation.
@@ -295,6 +299,9 @@ struct RunSetup {
 
     // ---- resolve_range ----------------------------------------------------
     uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS
+    // GB_C30_LATE (default on): count30 after the checker instead of beside
+    // phase A, so it runs beside phase B and the next segment's tile sieve
+    bool c30_late = env::onoff("GB_C30_LATE", true);
     uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
     uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
     RunStats stats;
@@ -1022,7 +1029,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // list. The harvest walks in (segment, offset) form: needs delta + p_max
     // < 2^32 and q_odds_full < 2 delta. GB_HITLIST_K sets the batch.
     hitlist = bucket_on;
-    hl_K = env::u32("GB_HITLIST_K", 128, 1u, HL_MAX_K_HOST);
+    hl_K = env::u32("GB_HITLIST_K", HL_K_DEFAULT, 1u, HL_MAX_K_HOST);
     // A segment's list is one region of hl_capg entries per harvest
     // work-group (hl_G groups, each harvesting a fixed share of the primes:
     // mean m = lam / hl_G hits per region). Capacity m * 1.10 + 10 sqrt(m) +
@@ -1126,7 +1133,10 @@ void DenseRun::allocate_large_prime_buffers() {
     if (hitlist) {
         k_hlh = std::make_unique<Kernel>(mod, "hl_harvest");
         k_hla = std::make_unique<Kernel>(mod, hl_fuse ? "sieve_large_packed_hl" : "hl_apply");
-        k_hlh->set_group_size(WG_SIZE);
+        // 1024 (2026-11-18): the scattered list stores are L2 write-combined;
+        // a larger group fills its regions' lines faster (harvest -6 ms per
+        // 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST work-items.
+        k_hlh->set_group_size(env::u32("GB_HLH_WG", HL_HARVEST_WG, HL_MAX_K_HOST, 1024u));
         k_hla->set_group_size(hl_fuse ? large_wg : WG_SIZE);
     }
     init_mark("  kernel create");
@@ -1860,11 +1870,16 @@ void DenseRun::enqueue_check(Segment& sg) {
     if (sampled) sampled_evens += sg.seg_evens;
     xs_used[sg.slot] = sampled;
     acct_slot[sg.slot] = !sampled;
-    if (stats_on) {
-        enqueue_count30(sg, sampled);
-    }
+    if (stats_on && !c30_late) enqueue_count30(sg, sampled);
     if (sampled) enqueue_check_sampled(sg, s30, ridge_thresh_u32);
     else enqueue_check30(sg, s30, ridge_thresh_u32);
+    // count30 late: after the checker, without a barrier, so it runs beside
+    // phase B and the next segment's tile sieve (an SLM-bound kernel that
+    // leaves issue slots free; beside phase A, which is ALU-bound, it cost
+    // ~1.5x as much). It only reads this slot's finished map (the barrier
+    // before phase A follows the marks); the next mid_window barrier and the
+    // host's wait on its event (collection) order everything after it.
+    if (stats_on && c30_late) enqueue_count30(sg, sampled);
     sg.enq_s = seconds_since(sg.t_enq);
     sg.launch_s = seconds_since(sg.t_launch0);
     sg.l3_s = seconds_since(sg.t_launch0);
@@ -1885,6 +1900,11 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     {
         uint32_t cls[8] = {0, 1, 2, 3, 4, 5, 6, 7};
         std::sort(cls, cls + 8, [&](uint32_t x, uint32_t y) { return sg.cgeo.phi[x] < sg.cgeo.phi[y]; });
+        // count30's gap walk takes the phase order as a rotation of the
+        // class order by ord & 15 (the residues sorted by (u - q0) mod 30)
+        for (uint32_t k = 0; k < 8; ++k)
+            if (cls[k] != (cls[0] + k) % 8)
+                throw std::runtime_error("count30: classes in phase order are not a rotation");
         for (uint32_t k = 0; k < 8; ++k) {
             g_ord |= cls[k] << (4 * k);
             g_phis |= sg.cgeo.phi[cls[k]] << (4 * k);
@@ -1917,7 +1937,8 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     k_cnt->set_arg(10, 4, &cwalk);
     k_cnt->set_arg(11, sizeof(b.g_part[sg.slot]), &b.g_part[sg.slot]);
     k_cnt->set_arg(12, sizeof(b.g_hist[sg.slot]), &b.g_hist[sg.slot]);
-    k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    if (c30_late) k_cnt->launch_overlap(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
+    else k_cnt->launch(ctx.list(), slot_ggroups[sg.slot], ev.splitk[sg.slot]);
     split_used[sg.slot] = true;
 }
 
@@ -2002,7 +2023,7 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_ca->set_arg(13, 4, &s30.phik);
     k_ca->set_arg(14, 4, &write_checked);
     k_ca->set_arg(15, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
-    // launch_overlap: phase A may run alongside count30 (both only
+    // launch_overlap: phase A may run alongside count30 (GB_C30_LATE=0; both only
     // read the finished map; the barrier above follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
@@ -2042,6 +2063,7 @@ void DenseRun::collect_previous_segment(Segment& sg) {
     const uint32_t prev = uint32_t((stats.segments - 1) & 1);
     const auto t_wait = clock_::now();
     ZE_CHECK(zeEventHostSynchronize(ev.check[prev], UINT64_MAX));
+    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[prev], UINT64_MAX));
     sg.wait_s = seconds_since(t_wait);
     const auto t_coll = clock_::now();
 
@@ -2096,6 +2118,7 @@ void DenseRun::end_iteration(const Segment& sg) {
 void DenseRun::drain_final_segment() {
     const uint32_t last = uint32_t((stats.segments - 1) & 1);
     ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
+    if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[last], UINT64_MAX));
     collect_slot(last, seg_stat);
 }
 
