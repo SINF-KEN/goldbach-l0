@@ -114,7 +114,7 @@ inline constexpr uint64_t HL_MT_MINP_DEN = 20;
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
 // the rotate funnel (12 spill-free; +0.18% / +0.20% long / long-end).
 inline constexpr uint32_t CHECK_PHASE_A_W64    = 12;
-// Mod-30 phase B (check30_b, flattened probe loop CB_FLAT): a small grid that
+// Mod-30 phase B (check30_b, flattened probe loop): a small grid that
 // runs beside the next segment's tile sieve instead of filling the GPU
 // (2026-11-18 r6b, 4e18 per segment: 640 groups 1.662 ms, 60 1.644, 40 1.634,
 // 30 1.644, 20 1.650; GB_CHECK_BGROUPS overrides).
@@ -153,8 +153,8 @@ inline constexpr uint32_t MED_MIN_P = 512;
 // With the mid-prime windows (medium primes up to the 1500th prime only,
 // load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
 inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
-// With the medium items (GB_MED_ITEMS, default MED_ITEMS_MIDWIN marks per item
-// with the mid windows) the medium stage starts right after the mask-group
+// With the medium items (MED_ITEMS_MIDWIN marks per item, with the mid
+// windows) the medium stage starts right after the mask-group
 // primes (67..79 are folded into the groups: the owned walk is empty).
 inline constexpr uint32_t MED_ITEMS_MIDWIN = 100;
 inline constexpr uint32_t MED_MIN_P_ITEMS = 80;
@@ -164,13 +164,15 @@ inline constexpr uint32_t MED_MIN_P_ITEMS = 80;
 // (MUST fit the device's per-work-group SLM) and its work-group size
 // (GB_MIDWIN_KB / GB_MIDWIN_WG override).
 inline constexpr uint64_t MIDWIN_P2_DEFAULT = 2500000;
-// Smallest prime the packed kernel's float-float remainder (mod_ff) may get:
-// it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split prime
-// is clamped to at least this (the tile kernel handles everything below).
+// Smallest prime the packed kernel's float-float remainder (mod_ff_q) may
+// get: it is wrong below 512 at q up to 2^63 (HISTORY.md §9.2z); the split
+// prime is clamped to at least this (the tile kernel handles everything
+// below). docs/EXACTNESS.md.
 inline constexpr uint32_t MOD_FF_MIN_P = 4096;
 inline constexpr uint32_t MIDWIN_SPLIT = 1500;
 inline constexpr uint32_t MIDWIN_KB = 128;
-// make_prime_map: owned primes folded into the class-map mask groups (GB_MASK_XP)
+// make_prime_map: owned primes folded into the class-map mask groups (67, 71,
+// 73, 79; +0.6 %, 2026-11-18)
 inline constexpr uint32_t MASK_XP_DEFAULT = 4;
 inline constexpr uint32_t MIDWIN_WG = 1024;
 

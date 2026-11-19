@@ -125,7 +125,7 @@ inline constexpr uint32_t GAPS30_TCAP = 4096;      // tail entries per segment (
 inline constexpr uint32_t GAPS30_GROUPS = 48;      // default count30 grid on walked segments (work-groups, grid-stride)
                                                   // on a GAPS30_REF_EUS device; scaled by the device's EU count
                                                   // (gaps30_groups). count30 runs beside phase B and the next tile
-                                                  // sieve (GB_C30_LATE); B580 gpu ms per 1e11: 20 655, 24 645,
+                                                  // sieve (since 2026-11-18 launched before phase B); B580 gpu ms per 1e11: 20 655, 24 645,
                                                   // 28 641, 32/36 639, 40 657 (!), 44/48 638.5, 60 640, 64 645, 80 643
 inline constexpr uint32_t GAPS30_REF_EUS = 160;    // EUs of the device GAPS30_GROUPS was tuned on (B580: 20 Xe2 cores x 8)
 inline constexpr uint32_t GAPS30_GROUPS_MAX = 4096;
