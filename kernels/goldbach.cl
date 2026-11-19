@@ -583,6 +583,18 @@ inline void mark_multiples_whl(volatile __global u64* prime_map, const u64 bit0,
 #ifndef HL_END
 #define HL_END 1
 #endif
+#ifndef HL_FLAT
+#define HL_FLAT 1                // hl_harvest_mt: one loop over hits and words
+#endif
+#ifndef HL_APPLY_LAST
+#define HL_APPLY_LAST 1          // fused apply after the packed primes
+#endif
+#ifndef HL_QS
+#define HL_QS 1                  // harvest setup from one float-float quotient
+#endif
+#ifndef HL_BAL
+#define HL_BAL 256               // primes per round-robin chunk (0: 1024-prime blocks)
+#endif
 // Only primes below SKR_MAXP: the target setup (~4 ps per prime) pays for
 // primes with >= ~2 marks per segment (large_s per 1e11: all primes 310.4,
 // < 130M 299.5, < 100M 294.7, < 80M 292.5, < 60M 290.7, < 40M 291.5).
@@ -2307,6 +2319,9 @@ inline void med_prime_nw(volatile __local u32* t32, const u64 fb, const u32 p,
 // subtract, no integer multiply, no divergent fix-up loops.
 /// @pre    61 < p < 2^23; tile_bit0 < 2^24; fb < 2^32 or the sentinel.
 /// @post   as med_prime_nw.
+#ifndef MED_BF
+#define MED_BF 1
+#endif
 #ifndef MED_W7_MAXP
 #define MED_W7_MAXP 8192u
 #endif
@@ -2317,6 +2332,19 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
 {
     if (fb == 0xFFFFFFFFu) return;
     u32 bit;
+#if MED_BF
+    {   // both arms, one select (no divergent branch; the float arm's value
+        // is discarded when fb >= tile_bit0)
+        // (fb - tile_bit0) mod p by a floor quotient (as midw_first)
+        const float df = (float)(int)(fb - tile_bit0);
+        const float pf = (float)p;
+        const float qf = floor(df * (1.0f / pf));
+        float rf = fma(-qf, pf, df);
+        rf += (rf < 0.0f) ? pf : 0.0f;
+        rf -= (rf >= pf) ? pf : 0.0f;
+        bit = (fb >= tile_bit0) ? fb - tile_bit0 : (u32)rf;
+    }
+#else
     if (fb >= tile_bit0) {
         bit = fb - tile_bit0;
     } else {
@@ -2329,6 +2357,7 @@ inline void med_prime_f32n(volatile __local u32* t32, const u32 fb, const u32 p,
         const u32 rmu = (u32)rf;
         bit = rmu ? p - rmu : 0u;
     }
+#endif
     // Wheel 7, unrolled (2026-11-18, sieve -4.4 ms per 1e11): the marks of
     // q = 0 (mod 7) are already cleared by the tile kernel's own sieving of
     // 7 (mask or walk; q = p m >= 7 p, never 7 itself). Along a class array
@@ -4675,7 +4704,7 @@ XS_KERNEL(check30_xs3, 3u, XS_W3)
 // the bucket: GB_BUCKET_VERIFY checks the result against tile + packed over
 // ALL large primes.
 // ----------------------------------------------------------------------------
-#define HL_MAX_K 128
+#define HL_MAX_K 256
 #ifndef HL_SKR
 #define HL_SKR 1                 // harvest skips hits p m, m divisible by 17..29 (LARGE_SKR)
 #endif
@@ -5300,10 +5329,62 @@ __kernel void hl_harvest_mt(
     if (lid < HL_MAX_K) lpos[lid] = 0u;
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 wend = (u64)(nseg - 1u) * delta + q_odds_tail;   // window [0, wend) in bits
+#if HL_QS
+    const ff_x qfs = ff_split(q_first);                         // uniform
+#endif
+#if HL_BAL
+    // balanced regions: HL_BAL-prime chunks dealt round-robin to the groups
+    // (chunk c to group c mod ngrp), so every region sees the same mix of
+    // prime sizes (with whole 1024-prime blocks the low groups of the first
+    // block got ~1.4x the mean hits); loads stay HL_BAL-contiguous
+    const u32 hb_l = lid % HL_BAL, hb_s = lid / HL_BAL, hb_n = wg / HL_BAL;
+    for (u32 t = 0;; ++t) {
+        const u32 i = a + ((t * hb_n + hb_s) * ngrp + grp) * HL_BAL + hb_l;
+        if (i >= b) break;
+#else
     for (u32 c0 = grp * wg; c0 < b - a; c0 += ngrp * wg) {
         const u32 i = a + c0 + lid;
         if (i >= b) break;
+#endif
         const u32 p = primes[i];
+#if HL_QS
+        // m0 and the first offset from one float-float quotient Q ~ q_first / p
+        // (the uniform split qfs; error a few units, fixed exactly below by the
+        // 64-bit wrap-around remainder, |r| << 2^63): no 64-bit mod, no
+        // inverse. Lanes with p^2 >= q_first (p near sqrt(limit)) take the
+        // general path.
+        u64 xo;
+        u32 lo, hi;
+        if ((u64)p * p < q_first) {
+            const float pf = (float)p;
+            const int pr = (int)((long)p - (long)pf);        // |pr| <= 128
+            const float ih = 1.0f / pf;
+            const float e1 = fma(-pf, ih, 1.0f);
+            const float il = ih * (e1 - (float)pr * ih);
+            const float qh = rint(qfs.xh * ih);              // >= 2^23, < 2^39
+            const float ql = fma(qfs.xh, ih, -qh) + qfs.xh * il + qfs.xl * ih;
+            u64 Q = ((u64)(u32)(qh * 2.3283064365386963e-10f) << 32) | (u64)float_int_low32_big(qh);
+            Q += (u64)(long)(int)rint(ql);
+            const u32 ql32 = (u32)Q;
+            const u32 qp_hi = mul_hi(ql32, p) + (u32)(Q >> 32) * p;
+            long r = (long)(q_first - (((u64)qp_hi << 32) | (u64)(ql32 * p)));
+            while (r < 0) { r += (long)p; --Q; }
+            while (r >= (long)p) { r -= (long)p; ++Q; }
+            const u32 r32 = (u32)r;
+            u64 t = r32 ? (u64)(p - r32) : 0UL;
+            u64 m0 = Q + (r32 ? 1UL : 0UL);
+            if (t & 1UL) { t += p; ++m0; }                   // q_first odd: odd multiple
+            xo = t >> 1;
+            lo = (u32)m0;
+            hi = (u32)(m0 >> 32);
+        } else {
+            const u64 first = first_odd_multiple((u64)p, q_first);
+            xo = (first - q_first) >> 1;
+            lo = (u32)first * inv32(p);
+            hi = (u32)rint(((float)first * (1.0f / (float)p) - (float)lo) * 2.3283064365386963e-10f);
+        }
+        if (xo >= wend) continue;
+#else
         const u64 first = first_odd_multiple((u64)p, q_first);
         const u64 xo = (first - q_first) >> 1;
         if (xo >= wend) continue;
@@ -5311,6 +5392,7 @@ __kernel void hl_harvest_mt(
         // high word from a float estimate (error << 2^31)
         const u32 lo = (u32)first * inv32(p);
         const u32 hi = (u32)rint(((float)first * (1.0f / (float)p) - (float)lo) * 2.3283064365386963e-10f);
+#endif
         // m0 = 30030 k0 + r0 (2^32 = 143022 * 30030 + 16636)
         const u32 q1 = lo / 30030u, r1 = lo - q1 * 30030u;
         const u32 t1 = hi * 16636u + r1;
@@ -5376,6 +5458,59 @@ __kernel void hl_harvest_mt(
         const float pf = (float)p, xof = (float)xo;
         const u32 xlo = (u32)xo;
 #endif
+#if HL_FLAT
+        // one loop over the prime's hits and words (r7): an iteration takes
+        // one bit and, after a word's last bit, loads the next word, so the
+        // SIMD iterates max over lanes of sum max(hits, 1) per word instead
+        // of sum over words of the max popcount (~12 -> ~17.5 hits per
+        // iteration of 32 lanes, simulated)
+        if (wi < wx) {
+            u32 word = mt[wi] & (0xFFFFFFFFu << (w0 & 31u));
+            if (wi + 1u == wx) word &= mlast;
+            u32 kk = wi / 180u;
+            u32 dmb = (kk - kb) * 30030u - r0;
+            u32 lb = (wi - kk * 180u) * 32u;
+            for (;;) {
+                if (word) {
+                    const u32 bt = 31u - clz(word & (0u - word));
+                    word &= word - 1u;
+                    const u32 dm = dmb + lm[lb + bt];
+#if HL_FX
+                    // x = xo + p h < 2^35: j from a float estimate (abs error of
+                    // fma(pf, h, xof) < 2^13 << delta: j within 1), the offset
+                    // exact in wrap-around u32 (o in (-delta, 2 delta) fits int)
+                    const u32 h = dm >> 1;
+                    u32 j = (u32)(fma(pf, (float)h, xof) * inv_delta);
+                    int o = (int)(xlo + p * h - j * delta);
+#else
+                    const u64 x = xo + (u64)p * (dm >> 1);
+                    u32 j = (u32)(((float)(u32)(x >> 32) * 4294967296.0f + (float)(u32)x) * inv_delta);
+                    int o = (int)((u32)x - j * delta);
+#endif
+                    while (o < 0) { o += (int)delta; --j; }
+                    while (o >= (int)delta) { o -= (int)delta; ++j; }
+                    const u32 off = (u32)o;
+                    if (j < nseg && off < HL_QO(j)) {
+                        const u32 idx = atomic_inc(&lpos[j]);
+                        if (idx < capg) lists[((size_t)j * ngrp + grp) * capg + idx] = off;
+                    }
+                    if (j >= 1u && j - 1u < nseg && off + delta < HL_QO(j - 1u)) {
+                        const u32 idx = atomic_inc(&lpos[j - 1u]);
+                        if (idx < capg) lists[((size_t)(j - 1u) * ngrp + grp) * capg + idx] = off + delta;
+                    }
+                }
+                if (!word) {
+                    if (++wi >= wx) break;
+                    word = mt[wi];
+                    if (wi + 1u == wx) word &= mlast;
+                    kk = wi / 180u;
+                    dmb = (kk - kb) * 30030u - r0;
+                    lb = (wi - kk * 180u) * 32u;
+                }
+            }
+        }
+    }
+#else
         u32 smask = 0xFFFFFFFFu << (w0 & 31u);
         for (; wi < wx; ++wi) {
             u32 word = mt[wi] & smask;
@@ -5414,6 +5549,7 @@ __kernel void hl_harvest_mt(
             }
         }
     }
+#endif
 #else
         u32 wi = kr * 180u + (w0 >> 5);
         u32 word = (wi < mt_words) ? mt[wi] & (0xFFFFFFFFu << (w0 & 31u)) : 0u;
@@ -5522,8 +5658,8 @@ __kernel void hl_apply(
 // sieve_large_packed with hl_apply fused in (HL_FUSE on the host): the list
 // marks and the packed marks are atomic ANDs on the same map, so they
 // commute; as a separate launch hl_apply ran alone, latency-bound (~4.8M
-// marks in 0.17 ms per 425M segment). Here every packed work-item first
-// takes list pairs (grid-stride, coalesced u64 loads), then its primes.
+// marks in 0.17 ms per 425M segment). Here every packed work-item takes its
+// primes, then list pairs (grid-stride, coalesced u64 loads; HL_APPLY_LAST).
 /// @pre    as sieve_large_packed and hl_apply (same segment, same map).
 /// @post   as sieve_large_packed followed by hl_apply.
 __attribute__((intel_reqd_sub_group_size(LARGE_PACK_SG)))
@@ -5541,9 +5677,18 @@ __kernel void sieve_large_packed_hl(
         volatile __global u32* restrict err)
 {
     const cmap g = {cm, phi1, phi5, off5};
+#if HL_APPLY_LAST
+    // primes first, list pairs after (2026-11-18 r7: large med 0.440 -> 0.419
+    // ms per segment; list pairs first, only in the upper half / quarter of
+    // the grid, or taken from a work counter after the primes were all slower)
+    large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+    hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
+                  get_global_id(0), get_global_size(0));
+#else
     hl_apply_body(prime_map, lists, capg, gcnt, j, groups, (u32)q_odds, err, g,
                   get_global_id(0), get_global_size(0));
     large_packed_body(prime_map, bases, gaps4, large_count, q_odds, q_first, q_last, g);
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -5559,6 +5704,9 @@ __kernel void sieve_large_packed_hl(
 // ----------------------------------------------------------------------------
 #ifndef MIDW_BATCH
 #define MIDW_BATCH 4             // 2026-11-17: 4 > 8 = 16 (window pass -1%)
+#endif
+#ifndef MIDW_FLOOR
+#define MIDW_FLOOR 1
 #endif
 #ifndef MIDW_SG
 #define MIDW_SG 16               // SIMD16: window pass -3% vs the compiler's SIMD32
@@ -5596,7 +5744,7 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 ///         MIDW_ANDST 0 / 1: no concurrent writer. Class bits < 2^24.
 /// @post   every class bit i < n_c of q = multiple of a mid prime is cleared.
 #ifndef MIDW_ANDST
-#define MIDW_ANDST 2             // 2: atomic AND store (the packed kernel may overlap)
+#define MIDW_ANDST 3             // 2: atomic AND store (the packed kernel may overlap); 3: 64-bit atomics
 #endif
 #ifndef MIDW_SKIP
 #define MIDW_SKIP 0              // skip marks on q = 0 mod 7 (1), 7|11 (2), 7|11|13 (3): already cleared
@@ -5644,6 +5792,38 @@ __kernel void mid_setup(__global const u32* restrict primes, const u32 a, const 
 #define MIDW_SKIP_INIT(b, P, WS) MIDW_SK1_INIT(b, P, WS) MIDW_SK2_INIT(b, P, WS) MIDW_SK3_INIT(b, P, WS)
 #define MIDW_SKIP_STEP MIDW_SK1_STEP MIDW_SK2_STEP MIDW_SK3_STEP
 #define MIDW_SKIP_TEST (MIDW_SK1_TEST MIDW_SK2_TEST MIDW_SK3_TEST)
+
+// First mark of a mid prime in the window at class bit ws: (i0 - ws) mod p,
+// branch-free (2026-11-18, window pass -9 us per segment, was an if on
+// i0 >= ws around the remainder): d = ws - i0 lies in (-p, 2^24) (i0 < p),
+// exact as a float; trunc(d / p) is within one of the true quotient, so
+// fma(-q, p, d) is the exact remainder in (-p, 2p) and two selects bring it
+// into [0, p). d < 0 (window 0, i0 > ws) gives rm = d + p, i.e. i0 - ws.
+/// @pre    i0 < p < 2^23 (mid_setup), ws < 2^24.
+/// @return the window-relative bit of p's first mark at or after ws.
+inline u32 midw_first(const u32 i0, const u32 p, const u32 ws)
+{
+#if MIDW_FLOOR
+    // r = (i0 - ws) mod p directly: floor quotient of d = i0 - ws in
+    // (-2^24, p), r = d - q p in (-p, 2p) (q within one), two fix-ups
+    const float pf = (float)p;
+    const float df = (float)(int)(i0 - ws);
+    const float qf = floor(df * (1.0f / pf));
+    float rf = fma(-qf, pf, df);
+    rf += (rf < 0.0f) ? pf : 0.0f;
+    rf -= (rf >= pf) ? pf : 0.0f;
+    return (u32)rf;
+#else
+    const float pf = (float)p;
+    const float df = (float)(int)(ws - i0);
+    const float qf = trunc(df * (1.0f / pf));
+    float rf = fma(-qf, pf, df);
+    rf += (rf < 0.0f) ? pf : 0.0f;
+    rf -= (rf >= pf) ? pf : 0.0f;
+    const u32 rmu = (u32)rf;
+    return rmu ? p - rmu : 0u;
+#endif
+}
 
 #if MIDW_SG
 __attribute__((intel_reqd_sub_group_size(MIDW_SG)))
@@ -5708,42 +5888,32 @@ __kernel void mid_window(__global u32* restrict map32, __global const u32* restr
         #pragma unroll
         for (u32 u = 0; u < MIDW_BATCH; ++u) {
             const u32 p = pv[u];
-            u32 bit;
-            if (iv[u] >= ws) bit = iv[u] - ws;
-            else {                          // d < 2^24: exact float remainder (med_prime_f32)
-                const float df = (float)(ws - iv[u]);
-                const float pf = (float)p;
-                const float qf = trunc(df * (1.0f / pf));
-                float rf = fma(-qf, pf, df);
-                rf += (rf < 0.0f) ? pf : 0.0f;
-                rf -= (rf >= pf) ? pf : 0.0f;
-                const u32 rmu = (u32)rf;
-                bit = rmu ? p - rmu : 0u;
-            }
+            const u32 bit = midw_first(iv[u], p, ws);
             MIDW_MARK_LOOP(bit, p, wb, v, ws)
         }
     }
     for (; j < n; j += wg) {
         const u32 i0 = it[j], p = pr[j];
-        u32 bit;
-        if (i0 >= ws) bit = i0 - ws;
-        else {
-            const float df = (float)(ws - i0);
-            const float pf = (float)p;
-            const float qf = trunc(df * (1.0f / pf));
-            float rf = fma(-qf, pf, df);
-            rf += (rf < 0.0f) ? pf : 0.0f;
-            rf -= (rf >= pf) ? pf : 0.0f;
-            const u32 rmu = (u32)rf;
-            bit = rmu ? p - rmu : 0u;
-        }
+        const u32 bit = midw_first(i0, p, ws);
         MIDW_MARK_LOOP(bit, p, wb, v, ws)
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     {
         __global uint4* g4 = (__global uint4*)gm;
         __local const uint4* w4 = (__local const uint4*)win;
-#if MIDW_ANDST == 2
+#if MIDW_ANDST == 3
+        // 64-bit atomic ANDs: half the atomic lanes (gm is 16 KB aligned)
+        __global u64* gm64 = (__global u64*)gm;
+        __local const u64* w64 = (__local const u64*)win;
+        for (u32 i = lid; i < (nw >> 1); i += wg) {
+            const u64 x = w64[i];
+            if (x != ~0UL) atom_and((volatile __global u64*)gm64 + i, x);
+        }
+        if ((nw & 1u) && lid == 0) {
+            const u32 x = win[nw - 1u];
+            if (x != ~0u) atomic_and((volatile __global u32*)gm + nw - 1u, x);
+        }
+#elif MIDW_ANDST == 2
         // atomic AND: the packed large kernel may already be marking
         for (u32 i = lid; i < nw; i += wg) {
             const u32 x = win[i];

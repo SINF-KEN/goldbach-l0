@@ -57,7 +57,7 @@ public:
     /// @param align  minimum alignment in bytes (power of two).
     /// @return       a non-null device pointer.
     /// @throws std::runtime_error on allocation failure.
-    void* alloc_device(size_t bytes, size_t align = 64) const;
+    void* alloc_device(size_t bytes, size_t align = 64, bool uncompressed = false) const;
     /// Allocates shared (host + device accessible) USM; caller-owned, released
     /// with free_mem().
     /// @param bytes  size in bytes.

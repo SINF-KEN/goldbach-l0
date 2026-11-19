@@ -94,11 +94,19 @@ struct GpuBuffers {
 
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
-inline constexpr uint32_t HL_MAX_K_HOST = 128;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
+inline constexpr uint32_t HL_MAX_K_HOST = 256;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
 inline constexpr uint32_t HL_HARVEST_WG = 1024; // hl_harvest work-group size (GB_HLH_WG)
 // Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
 // harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
-inline constexpr uint32_t HL_K_DEFAULT = 128;
+// 2026-11-18 (r7): K up to 256 within the list budget below: a batch has a
+// ~7 ms fixed part (per prime: list read, setup, first table word), so the
+// largest K that fits pays (K 128 -> 147 at 4e18: harvest 0.173 -> 0.166
+// ms per segment).
+inline constexpr uint32_t HL_K_DEFAULT = 256;
+// List memory cap (bytes, GB_HL_LIST_MAX): K is lowered until K x regions
+// fit. 3.5e9 = the r7 list size at 5e18 (K 128 x 3358 x 2048 entries),
+// now that the exact hit estimate and balanced regions need ~15 % fewer.
+inline constexpr uint64_t HL_LIST_MAX_DEFAULT = 3500000000ull;
 static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
 /// Copies host data to a device buffer through a shared staging allocation.
@@ -1177,7 +1185,26 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     if (hl_mt && !env::present("GB_ML_OVERLAP")) ml_overlap = false;
     // filed hits: prime m only, density 1 / (ln m_lo * 5760 / 30030) among the
     // coprime multipliers (+5 %; a region overflow fails the run closed)
-    if (hl_mt) {
+    if (hl_mt && env::onoff("GB_HL_LAM2", true)) {
+        // filed hits per segment: prime p files the prime m among its
+        // q_odds / p odd multipliers, density 2 / ln m, m ~ q / p:
+        // lam = int_lo^hi 2 q_odds / (p ln p ln(q_first0 / p)) dp (prime
+        // density 1 / ln p), by the midpoint rule in ln p. Measured at 4e18:
+        // 4171752 filed per segment vs 4171805 (the old 1 / ln m_lo
+        // estimate: 4796437). q_first0 is the run's smallest q (highest
+        // density); the region capacity adds 10 % + 10 sigma on top.
+        const double a = std::log(double(sieve_primes[bucket_begin]));
+        const double bnd = std::log(double(sieve_primes[sieve_count - 1]));
+        const double lq = std::log(double(q_first0));
+        constexpr int N = 4096;
+        const double h = (bnd - a) / N;
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double u = a + (i + 0.5) * h;
+            sum += 2.0 * double(q_odds_full) / (u * (lq - u)) * h;
+        }
+        bucket_lam = sum + 1.0;
+    } else if (hl_mt) {
         const double mlo = double(q_first0) / double(sieve_primes[sieve_count - 1]);
         bucket_lam *= std::min(1.0, 1.05 / (std::log(mlo) * 5760.0 / 30030.0));
     }
@@ -1196,11 +1223,18 @@ void DenseRun::size_bucket_ring_and_hitlists() {
             }
             return lo;
         };
+        hl_capg = env::u32("GB_HL_CAPG", hl_capg, 64u, 1u << 20);
+        if (hl_capg & (hl_capg - 1)) throw std::runtime_error("GB_HL_CAPG: not a power of two");
         while (std::ceil(bucket_lam / mmax(hl_capg)) > 4096.0) hl_capg *= 2;
         hl_G = uint32_t(std::max(1.0, std::ceil(bucket_lam / mmax(hl_capg))));
     }
     // one list allocation below 4 GiB (32-bit buffer offsets in the kernels)
     while (hl_K > 1 && uint64_t(hl_K) * hl_G * hl_capg * 4 >= (uint64_t(1) << 32)) --hl_K;
+    // and within the list budget (GB_HL_LIST_MAX bytes)
+    {
+        const uint64_t budget = env::u64("GB_HL_LIST_MAX", HL_LIST_MAX_DEFAULT);
+        while (hl_K > 1 && uint64_t(hl_K) * hl_G * hl_capg * 4 > budget) --hl_K;
+    }
     // Segments of the run (the loop below: seg_start += segment_even until
     // seg_end == limit) and the last one's q_odds (the only short one).
     // hl_harvest's 32-bit walk: off + p (off < delta), off + delta and the
@@ -1274,7 +1308,8 @@ void DenseRun::allocate_large_prime_buffers() {
     d_hl_lists = nullptr;
     d_hl_counts = nullptr;
     if (hitlist) {
-        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4));
+        d_hl_lists  = static_cast<uint32_t*>(ctx.alloc_device(size_t(hl_K) * hl_G * hl_capg * 4, 64,
+                                                              env::onoff("GB_HL_UNCOMP", false)));
         d_hl_counts = static_cast<uint32_t*>(ctx.alloc_device(size_t(HL_MAX_K_HOST) * hl_G * 4));
     }
     if (hitlist) {
@@ -1413,7 +1448,10 @@ void DenseRun::build_mtab() {
     Kernel kb(mod, "mt_build");
     kb.set_group_size(1024);
     const size_t words = size_t(mt_blocks) * 180;
-    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4));
+    // uncompressed (GB_MT_UNCOMP, default on; 2026-11-18 r7): the harvest's
+    // scattered word reads skip the compression metadata, harvest -3.4 %
+    // (the lists themselves stay compressed: uncompressed they are +17 %)
+    d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4, 64, env::onoff("GB_MT_UNCOMP", true)));
     kb.set_arg(0, sizeof(d_mtab), &d_mtab);
     kb.set_arg(1, sizeof(mt_blocks), &mt_blocks);
     kb.set_arg(2, sizeof(mt_k_lo), &mt_k_lo);
@@ -2364,6 +2402,19 @@ void DenseRun::end_iteration(const Segment& sg) {
 /// After the loop: collects the final segment (its record is seg_stat: it was
 /// never overwritten after its enqueue).
 void DenseRun::drain_final_segment() {
+    if (hitlist && env::onoff("GB_HL_FILLDBG", false)) {
+        ctx.host_sync();
+        std::vector<uint32_t> c(size_t(hl_K) * hl_G);
+        ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), c.data(), d_hl_counts, c.size() * 4, nullptr, 0, nullptr));
+        ctx.host_sync();
+        const uint32_t ns = uint32_t((run_segments - 1) % hl_K) + 1;
+        double sum = 0; uint32_t mx = 0, mn = ~0u;
+        std::vector<double> segsum(ns, 0.0);
+        for (uint32_t j = 0; j + 1 < ns; ++j) for (uint32_t g = 0; g < hl_G; ++g) {
+            const uint32_t v = c[size_t(j) * hl_G + g]; sum += v; mx = std::max(mx, v); mn = std::min(mn, v); segsum[j] += v; }
+        std::fprintf(stderr, "hl fill: %u segs, mean/region %.1f min %u max %u capg %u; per segment %.0f (lam est)\n",
+                     ns - 1, sum / double(ns - 1) / hl_G, mn, mx, hl_capg, sum / double(ns - 1));
+    }
     const uint32_t last = uint32_t((stats.segments - 1) & 1);
     ZE_CHECK(zeEventHostSynchronize(ev.check[last], UINT64_MAX));
     if (stats_on && c30_late) ZE_CHECK(zeEventHostSynchronize(ev.splitk[last], UINT64_MAX));

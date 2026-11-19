@@ -150,10 +150,16 @@ Context::~Context() {
     if (context_) zeContextDestroy(context_);
 }
 
-void* Context::alloc_device(size_t bytes, size_t align) const {
+void* Context::alloc_device(size_t bytes, size_t align, bool uncompressed) const {
     void* ptr = nullptr;
     ze_device_mem_alloc_desc_t desc{};
     desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    ze_memory_compression_hints_ext_desc_t ch{};
+    if (uncompressed) {
+        ch.stype = ZE_STRUCTURE_TYPE_MEMORY_COMPRESSION_HINTS_EXT_DESC;
+        ch.flags = ZE_MEMORY_COMPRESSION_HINTS_EXT_FLAG_UNCOMPRESSED;
+        desc.pNext = &ch;
+    }
     // Large buffers are rounded up to a whole number of 2 MB pages (2 MB
     // aligned). Measured on the B580 (runtime 26.x): an allocation whose size
     // is not a 2 MB multiple is only partly backed by 2 MB pages, and the
