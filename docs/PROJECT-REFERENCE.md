@@ -83,6 +83,7 @@ goldbach-l0/
 ├── src/
 │   ├── main.cpp            CLI + human / --csv / --json / --per-seg output
 │   ├── l0_context.cpp      gpu_devices (zeInitDrivers), Context (immediate in-order list), Module, Kernel
+│   ├── gpu_monitor.cpp     Sysman energy / frequency / throttling over a run
 │   ├── primes.cpp          segmented sieve, GBP2 (hashed) cache, masks, Miller-Rabin, CPU fallback search
 │   ├── verifier.cpp        run_gpu (dense pipeline: RunSetup / DenseRun phases), verify_cpu, device info
 │   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
@@ -233,8 +234,9 @@ format change has to keep every existing key and its formatting.
 Human (default): banner `goldbach-l0 v<VERSION>` (+ ` (sparse)`), then
 limit, start, segments, leftovers, init / gpu / sieve / large sieve /
 verify / offsets / sync-other times (`%.3f s`), total, evens/second
-(`%.3g`), `EU arbitration` (the `GB_SCHED` policy in force), `result:
-PASS`. With statistics on: a `Goldbach statistics` block (log / state
+(`%.3g`), `EU arbitration` (the `GB_SCHED` policy in force), `GPU
+(sysman)` (energy, average power, actual frequency, throttle time and
+reasons over the run, or why Sysman is off), `result: PASS`. With statistics on: a `Goldbach statistics` block (log / state
 paths, largest p(n), tail and sampled even counts, primes, twin pairs).
 With a ridge floor: the `My Top 30 Largest Goldbach Ridges` table.
 
@@ -249,13 +251,23 @@ auto) — the resolved dense split is `split_used=` (0 on the sparse path)
 and the per-segment `split` column; `evens_per_sec` = total_evens /
 gpu_seconds (init excluded); `large_items` / `tiles` are sums over
 segments; `ridge_max` is the largest kept ridge (0 when none).
+After the fixed 35 come the Sysman keys (`src/gpu_monitor.cpp`): always
+`sysman=` (`ok`, `off` for `GB_SYSMAN=0`, or why it is unusable, spaces as
+`_`), then, each only when measured, `gpu_energy_j gpu_power_w` (card power
+domain, `%.3f` / `%.2f`), `throttled_s` (hardware throttle-time counter
+delta, `%.3f`), `freq_avg_mhz freq_min_mhz throttle_reasons` (actual core
+frequency sampled ~4x per second; reasons OR-ed over the samples, e.g.
+`power+thermal` or `none`). The window is the whole run (init included), so
+`gpu_energy_j` covers `total_s`, not `gpu_s`.
 
 `--json`: pretty-printed object: `version limit start segment split`
 (`split_used` when non-zero) `sched spv segments leftovers result`, the
 times as `*_seconds` (init, gpu, total, sieve, large, verify, offset,
 table, sync), `evens_per_second total_tiles total_large_items ridge_min
 ridge_found ridge_dropped`, a `ridge_top` array (`rank, ridge, even, p, q,
-segment`), a `stats` object when statistics are on (`tail_evens,
+segment`), a `sysman` object (`status window_s`, plus `energy_j power_w`,
+`throttled_s`, `freq_avg_mhz freq_min_mhz throttle_reasons freq_samples`
+when measured), a `stats` object when statistics are on (`tail_evens,
 sampled_evens, pmax, primes, twins`) and a `per_segment` array when
 collected (`seg, start, end, evens, tiles, large_items, split, mask_count,
 leftovers, sieve_s, large_s, check_s, offset_s, wall_s`). It omits the
@@ -271,7 +283,7 @@ Every `GB_*` knob is parsed strictly (include/env.hpp): a malformed value is
 an error (`error: GB_X='v': expected ...`, exit 1), never 0 or the default.
 Numbers are whole strings in decimal, `0x` hex or `0`-prefixed octal within
 the knob's range (no sign, junk, overflow; empty is malformed). On/off switches
-(`GB_STATS`, `GB_BUCKET`, `GB_UNORDERED`, `GB_RIDGE`, `GB_SPARSE`) take `0` or
+(`GB_STATS`, `GB_BUCKET`, `GB_UNORDERED`, `GB_RIDGE`, `GB_SPARSE`, `GB_SYSMAN`) take `0` or
 `1` (empty = unset);
 trace flags (`GB_PHASE`, `GB_INIT_TRACE`, `GB_RIDGE_DEBUG`,
 `GB_BUCKET_VERIFY_DUMP`) are on when set to anything; file paths treat empty
@@ -299,6 +311,7 @@ as unset. `GB_SCM_*` ranges: `GB_SCM_DELTA` [4096, 2^26], `GB_SCM_PMAX` >= 1,
 | `GB_HL_LIST_MAX=B` | hit-list memory budget in bytes (default 3.5e9): K is lowered until one batch's lists fit ([EXACTNESS.md](EXACTNESS.md) §6) |
 | `GB_MT_CHECK=N` | after mt_build, compare N multiplier-table bits (the first 2 x 5760, then random) with Miller-Rabin; any wrong bit fails the run (copies the whole table to the host: seconds) |
 | `GB_SCHED=0\|1\|2\|off` | EU thread arbitration hint for every kernel: oldest-first / round-robin (default, +0.6%) / stall-based round-robin (the Xe2 driver default) / no hint. An explicit policy a kernel rejects is an error; a rejected default warns and runs on the driver default. Reported as `sched=` ([§9.2w](HISTORY.md#92w-slm-contention-round-atomic-owned-marks-gap-histogram-columns-round-robin-arbitration-2026-11-15)) |
+| `GB_SYSMAN=0` | no Level Zero Sysman sampling (`sysman=off`). Default on: energy, throttle time, actual frequency and throttle reasons of the GPU over the run (`src/gpu_monitor.cpp`); observation only, a sensor that is missing or not permitted is left out of the output and never fails the run |
 | `GB_UNORDERED=0` | in-order immediate list (pre-v2.4) instead of the unordered list with a barrier before every launch but the tile sieve and the harvest ([§9.2v](HISTORY.md#92v-unordered-list-the-next-segments-sieve-overlaps-the-checker-2026-10-18)) |
 | `GB_MASK_PERIOD=N` | max mask-group period in words (default 4096; more than 8 groups fall back to the per-prime mask loop) |
 | `GB_LARGE_WG=N` | large-kernel work-group size (multiple of 32 in [32, 1024], else the run fails; default 128) |

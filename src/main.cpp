@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <print>
 #include <ranges>
 #include <string>
@@ -8,6 +10,7 @@
 
 #include "config.hpp"
 #include "env.hpp"
+#include "gpu_monitor.hpp"
 #include "l0_context.hpp"
 #include "verifier.hpp"
 #include "sparse_run.hpp"
@@ -100,7 +103,7 @@ std::string json_escape(const char* s) {
 /// included when s.per_segment is non-empty).
 /// @pre   the run passed (the object always reports "result": "PASS").
 void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
-                const std::string& spv) {
+                const std::string& spv, const gb::GpuPower& pw) {
     // literal JSON braces are doubled ({{ }}) in std::format strings
     std::println("{{");
     std::println("  \"version\": \"{}\",", gb::VERSION);
@@ -136,6 +139,16 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
                    i ? "," : "", i + 1, e.p, e.n, e.p, e.q, e.seg);
     }
     std::print("{}]", s.ridge_top.empty() ? "" : "\n  ");
+    std::print(",\n  \"sysman\": {{\"status\": \"{}\", \"window_s\": {:.4f}",
+               json_escape(pw.status.c_str()), pw.window_s);
+    if (pw.have_energy)
+        std::print(", \"energy_j\": {:.3f}, \"power_w\": {:.2f}", pw.energy_j, pw.power_w);
+    if (pw.have_throttle) std::print(", \"throttled_s\": {:.3f}", pw.throttled_s);
+    if (pw.have_freq)
+        std::print(", \"freq_avg_mhz\": {:.0f}, \"freq_min_mhz\": {:.0f}, "
+                   "\"throttle_reasons\": \"{}\", \"freq_samples\": {}",
+                   pw.freq_avg_mhz, pw.freq_min_mhz, pw.reasons_text(), pw.samples);
+    std::print("}}");
     if (s.stats_on)
         std::print(",\n  \"stats\": {{\"tail_evens\": {}, \"sampled_evens\": {}, "
                    "\"pmax\": {}, \"primes\": {}, \"twins\": {}}}",
@@ -160,11 +173,26 @@ void print_json(const gb::RunStats& s, uint64_t segment, uint32_t split,
     std::print("\n}}\n");
 }
 
+/// One-line summary of the Sysman window for the text output.
+std::string power_text(const gb::GpuPower& pw) {
+    if (pw.status != "ok") return pw.status;
+    std::string t;
+    if (pw.have_energy) t += std::format("{:.0f} J, {:.1f} W avg", pw.energy_j, pw.power_w);
+    if (pw.have_freq)
+        t += std::format("{}{:.0f} MHz avg ({:.0f} min)", t.empty() ? "" : "; ",
+                         pw.freq_avg_mhz, pw.freq_min_mhz);
+    if (pw.have_throttle)
+        t += std::format("{}throttled {:.2f} s", t.empty() ? "" : "; ", pw.throttled_s);
+    if (pw.have_freq) t += std::format(" ({})", pw.reasons_text());
+    return t.empty() ? "nothing measurable" : t + std::format(" over {:.1f} s", pw.window_s);
+}
+
 /// Prints the run result as one line of key=value pairs on stdout.
 /// @pre   the run passed (the line always reports result=PASS).
-void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
+void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split,
+               const gb::GpuPower& pw) {
     // One line of key=value pairs — trivially parsed by awk/grep/Python.
-    std::println(
+    std::print(
         "version={} limit={} start={} segment={} split={} "
         "segments={} leftovers={} result=PASS "
         "init_s={:.4f} init_cache_s={:.4f} init_module_s={:.4f} init_upload_s={:.4f} "
@@ -173,7 +201,7 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         "tiles={} large_items={} "
         "ridge_min={} ridge_found={} ridge_dropped={} ridge_max={} "
         "stats={} stats_tail={} stats_sampled={} stats_pmax={} primes={} twins={} "
-        "split_used={} sched={}",
+        "split_used={} sched={} ",
         gb::VERSION, s.limit, s.start, segment, split, s.segments, s.leftovers,
         s.init_seconds, s.init_cache_s, s.init_module_s, s.init_upload_s,
         s.gpu_seconds, s.total_seconds,
@@ -184,6 +212,17 @@ void print_csv(const gb::RunStats& s, uint64_t segment, uint32_t split) {
         s.ridge_top.empty() ? 0 : s.ridge_top.front().p,
         s.stats_on ? 1 : 0, s.stats_tail, s.stats_sampled,
         s.stats_pmax, s.stats_primes, s.stats_twins, s.split_used, gb::sched_policy_name());
+    // Sysman keys appended after the fixed set; a key is present only when
+    // measured (sysman= says why the rest is missing). The status has no spaces.
+    std::string st = pw.status;
+    std::ranges::replace(st, ' ', '_');
+    std::print("sysman={}", st);
+    if (pw.have_energy) std::print(" gpu_energy_j={:.3f} gpu_power_w={:.2f}", pw.energy_j, pw.power_w);
+    if (pw.have_throttle) std::print(" throttled_s={:.3f}", pw.throttled_s);
+    if (pw.have_freq)
+        std::print(" freq_avg_mhz={:.0f} freq_min_mhz={:.0f} throttle_reasons={}",
+                   pw.freq_avg_mhz, pw.freq_min_mhz, pw.reasons_text());
+    std::println("");
 }
 
 /// Prints the per-segment table (header + one row per s.per_segment entry).
@@ -313,16 +352,19 @@ int main(int argc, char** argv) {
         // the built-in default: this executable's own kernels first (a release
         // run from the production tree must not load the tree's modules)
         else if (!spv_set) spv = gb::locate_module(spv, true);
+        gb::GpuMonitor monitor;   // GB_SYSMAN=0: off; never fails the run
+        monitor.start();
         const gb::RunStats s = sparse
             ? gb::run_gpu_sparse(limit, segment, spv, verbose, start, uint32_t(split),
                                  prime_cache.c_str(), per_seg || json)
             : gb::run_gpu(limit, segment, spv, verbose, start,
                           uint32_t(split), prime_cache.c_str(),
                           per_seg || json);
+        const gb::GpuPower pw = monitor.stop();
         if (json) {
-            print_json(s, s.segment_used ? s.segment_used : segment, uint32_t(split), spv);
+            print_json(s, s.segment_used ? s.segment_used : segment, uint32_t(split), spv, pw);
         } else if (csv) {
-            print_csv(s, s.segment_used ? s.segment_used : segment, uint32_t(split));
+            print_csv(s, s.segment_used ? s.segment_used : segment, uint32_t(split), pw);
         } else {
             std::print(
                 "goldbach-l0 v{}{}\n"
@@ -340,6 +382,7 @@ int main(int argc, char** argv) {
                 "  total          : {:.3f} s\n"
                 "  evens/second   : {:.3g}\n"
                 "  EU arbitration : {}\n"
+                "  GPU (sysman)   : {}\n"
                 "  result         : PASS\n",
                 gb::VERSION, sparse ? " (sparse)" : "",
                 s.limit, s.start, s.segments, s.leftovers,
@@ -347,7 +390,7 @@ int main(int argc, char** argv) {
                 s.sieve_seconds, s.large_seconds, s.verify_seconds,
                 s.offset_seconds, s.sync_seconds,
                 s.total_seconds,
-                s.evens_per_second, gb::sched_policy_name());
+                s.evens_per_second, gb::sched_policy_name(), power_text(pw));
         }
         if (s.stats_on && !csv && !json)
             std::print("\nGoldbach statistics (exact; log {}, state {})\n"

@@ -40,6 +40,7 @@ add_executable(goldbach_l0
     src/verifier.cpp
     src/host_math.cpp
     src/sparse.cpp
+    src/gpu_monitor.cpp
 )
 target_include_directories(goldbach_l0 PRIVATE include /usr/include/level_zero)
 target_link_libraries(goldbach_l0 PRIVATE ${LEVEL_ZERO_LOADER} Threads::Threads)
