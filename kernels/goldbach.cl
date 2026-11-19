@@ -341,6 +341,32 @@ inline void map_clear_w(volatile __global u32* m32, const u32 bit, const cmap g)
     atomic_and(m32 + (ad >> 5), CLR_MASK(ad));
 }
 
+// map_clear_w that first reads the word (L1-uncached, L2-cached load) and
+// skips the atomic when the bit is already clear (round 5, 2026-11-18).
+// For the packed primes (p >= cbrt(q)) a mark p m is redundant iff m is
+// composite (~75 % of the marks), and m's factor (<= sqrt(m) < 1.3M) is a
+// tile / mid-window prime whose clears are complete before the packed kernel
+// starts (barrier after mid_window), so the read sees them: one L2 read
+// instead of one L2 atomic on 3 of 4 marks (gpu -6 % at 4e18). Exact under
+// any interleaving: map bits only go 1 -> 0 while this runs (every concurrent
+// writer AND-clears), so a 0 read is a real clear and a 1 read just marks.
+// (2026-10-19 the same filter lost 3 %: mid windows did not exist, most
+// redundant marks were not yet visible.)
+uint __builtin_IB_lsc_load_global_uint(__global uint* base, int immElemOff, enum LSC_LDCC cacheOpt);
+#define LDCC_L1UC_L3C 2          // L1 uncached, L3 (= Xe2 L2) cached
+/// @pre    as map_clear_w; every other writer of the map during the call only
+///         clears bits (atomic AND).
+/// @post   as map_clear_w.
+inline void map_clear_chk(volatile __global u32* m32, const u32 bit, const cmap g)
+{
+    if (g.cm != 2u) { map_clear_w(m32, bit, g); return; }
+    const u32 t = bit / 15u;
+    const u32 ad = c30_class(bit - 15u * t, g) * g.off5 + t;
+    const u32 w = __builtin_IB_lsc_load_global_uint((__global u32*)(m32 + (ad >> 5)), 0,
+                                                    (enum LSC_LDCC)LDCC_L1UC_L3C);
+    if ((w >> (ad & 31u)) & 1u) atomic_and(m32 + (ad >> 5), CLR_MASK(ad));
+}
+
 // ----------------------------------------------------------------------------
 // Clear the odd multiples bit0, bit0 + p, ... (< q_odds) with 32-bit atomics.
 // All arithmetic is 32-bit: Xe2 has no native 64-bit integer ALU, and the
@@ -1955,7 +1981,7 @@ inline void mark_multiples_mq(volatile __global u64* prime_map, const u32 bit0,
         const u32 e = WHL_SF[w];
         if (((((e ^ T) | SKR_H) - SKR_L) & SKR_H) == SKR_H &&
             (!use2 || ((((WHL_SF2[w] ^ T2) | SKR2_H) - SKR2_L) & SKR2_H) == SKR2_H))
-            map_clear_w(m32, bit, g);
+            map_clear_chk(m32, bit, g);
         const u64 step = (u64)p * (e & 15u);
         if ((u64)(n - bit) <= step) break;
         bit += (u32)step;
@@ -2448,7 +2474,11 @@ __kernel void make_prime_map(
     // Primes [sieve_split, sieve_count) are handled by sieve_large_primes.
     // the fused groups may also clear the next xp primes (host GB_MASK_XP:
     // 67, 71, ...); the owned walk starts after them
-    const u32 xp = (n_groups > 0) ? n_groups_xp >> 8 : 0u;
+    const u32 xp = (n_groups > 0) ? (n_groups_xp >> 8) & 0xFFu : 0u;
+    // medium items (host plan, n_groups_xp >> 16 of them, after the group
+    // descriptors): prime index, tile words [lo, hi) as lo | hi << 16
+    const u32 med_nit = (n_groups > 0) ? n_groups_xp >> 16 : 0u;
+    __global const uint2* med_items = (__global const uint2*)(group_desc + 2u * MAX_MASK_GROUPS);
     const u32 j_begin = (mask_count > 0) ? mask_count + xp : 0;
 
     if (use_table) {
@@ -2653,6 +2683,41 @@ __kernel void make_prime_map(
             sieve_primes[sieve_split - 1u] < (1u << 23)) {   // uniform (med_prime_f32 PRE)
             __global const u32* fb32 = (__global const u32*)fb_global;   // low words
             const u32 tb = (u32)tile_bit0;
+            if (med_nit) {                             // uniform
+                // Host-planned items (prime, tile word range) of about equal
+                // mark counts, sorted by mark count: the lanes of a sub-group
+                // run equally long mark loops. Rows of WG_SIZE items snake.
+                const u32 nrow = (med_nit + WG_SIZE - 1u) / WG_SIZE;
+                const u32 meo = WG_SIZE - 1u - me;
+                u32 r = 0;
+                for (; r + MED_BATCH <= nrow; r += MED_BATCH) {
+                    u32 fbv[MED_BATCH], pv[MED_BATCH], wv[MED_BATCH];
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 it = (r + u) * WG_SIZE + (((r + u) & 1u) ? meo : me);
+                        const bool ok = it < med_nit;
+                        const uint2 d = med_items[ok ? it : 0u];
+                        wv[u] = ok ? d.y : 0u;
+                        fbv[u] = ok ? fb32[2u * d.x] : 0xFFFFFFFFu;
+                        pv[u] = ok ? sieve_primes[d.x] : 0u;
+                    }
+                    #pragma unroll
+                    for (u32 u = 0; u < MED_BATCH; ++u) {
+                        const u32 w0 = wv[u] & 0xFFFFu, w1 = wv[u] >> 16;
+                        med_prime_f32n(t32 + w0, fbv[u], pv[u], tb + 32u * w0, qc7v, s7v,
+                                       32u * (w1 - w0), c1v);
+                    }
+                }
+                for (; r < nrow; ++r) {
+                    const u32 it = r * WG_SIZE + ((r & 1u) ? meo : me);
+                    if (it >= med_nit) continue;
+                    const uint2 d = med_items[it];
+                    const u32 w0 = d.y & 0xFFFFu, w1 = d.y >> 16;
+                    med_prime_f32n(t32 + w0, fb32[2u * d.x], sieve_primes[d.x], tb + 32u * w0, qc7v, s7v,
+                                   32u * (w1 - w0), c1v);
+                }
+                j = sieve_split;
+            } else
 #if MED_SPLITN
             // (only for short medium ranges, as the mid-window split's 1500:
             // with many rows the imbalance is small and the index ALU costs,
@@ -3648,6 +3713,26 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 #endif
 #define G30_CBINS 64u
 #define G30_LH (G30_HBINS + (G30_SIMD - 1u) * G30_CBINS)
+// Block walk (2026-11-18): one loop iteration per non-empty block of 30
+// instead of per prime. The gap into the block's first prime is binned as
+// before; a block with two or more primes adds one count to its pattern bin
+// (256, after the histogram: hist[G30_HBINS + x]) and the host adds the
+// pattern's internal gaps (fixed by the segment's phases). Pattern index of
+// the slot nibble mask m (slot s at bit 4 s): bits s0 s4 s1 s5 s2 s6 s3 s7.
+// The walk maximum covers the gaps into blocks only (an internal gap is
+// < 30; the host settles a segment whose largest such gap is not larger
+// than the largest internal one: a per-block table lookup cost the walk its
+// gain).
+#ifndef G30_BLK
+#define G30_BLK 1
+#endif
+#define G30_PBINS 256u
+inline u32 g30_pat(const u32 m)
+{
+    u32 x = (m | (m >> 15)) & 0x3333u;
+    x = (x | (x >> 2)) & 0x0F0Fu;
+    return (x | (x >> 4)) & 0xFFu;
+}
 inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, __global const u32* restrict lim,
                            const u32 ord, const u32 phis, const u32 pos_lo, const u32 tb,
                            __global u32* restrict gt, const u32 tcap)
@@ -3706,12 +3791,21 @@ __kernel void count30(
         __global u32* restrict hist)
 {
     __local u32 sh[13];
+#if G30_BLK
+    __local u32 lh[G30_LH + G30_PBINS];      // + pattern bins
+#else
     __local u32 lh[G30_LH];
+#endif
     __local u64 red[G30_MAX_SG];
     const u32 lid = get_local_id(0);
     if (lid < 13u) sh[lid] = lid == 11u ? ~0u : 0u;
+#if G30_BLK
+    if (walk)
+        for (u32 i = lid; i < G30_LH + G30_PBINS; i += get_local_size(0)) lh[i] = 0u;
+#else
     if (walk)
         for (u32 i = lid; i < G30_LH; i += get_local_size(0)) lh[i] = 0u;
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     u32 ph[8];                                // phi of class c: its half offset in a block of 30
     #pragma unroll
@@ -3847,6 +3941,27 @@ __kernel void count30(
                 }
                 #pragma unroll
                 for (u32 k = 0; k < 8; ++k) W[k] = rotate(W[k], 32u - 4u * r0);
+#if G30_BLK
+                u32 nb = any[i];
+                const u32 h0 = 15u * 32u * (w + i);
+                while (nb) {
+                    const u32 b = ctz(nb);
+                    nb &= nb - 1u;
+                    const u32 k = b >> 2;
+                    const u32 x01 = (k & 1u) ? W[1] : W[0], x23 = (k & 1u) ? W[3] : W[2];
+                    const u32 x45 = (k & 1u) ? W[5] : W[4], x67 = (k & 1u) ? W[7] : W[6];
+                    const u32 x03 = (k & 2u) ? x23 : x01, x47 = (k & 2u) ? x67 : x45;
+                    const u32 m = (((k & 4u) ? x47 : x03) >> (b & 3u)) & 0x11111111u;
+                    const u32 hb = h0 + 15u * b;
+                    const u32 h = hb + ((phis >> ctz(m)) & 15u);
+                    const u32 d = h - hp;
+                    hp = hb + ((phis >> (31u - clz(m))) & 15u);
+                    atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
+                    if (d > dmax) { dmax = d; dpos = h; }
+                    if (m & (m - 1u))                   // internal gaps: the pattern bin
+                        atomic_inc(&lh[G30_LH + g30_pat(m)]);
+                }
+#else
                 u32 nb = any[i], m = 0u, hb = 0u;
                 const u32 h0 = 15u * 32u * (w + i);
                 while (nb | m) {
@@ -3868,6 +3983,7 @@ __kernel void count30(
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
                     if (d > dmax) { dmax = d; dpos = h; }
                 }
+#endif
             }
         }
     }
@@ -3905,6 +4021,10 @@ __kernel void count30(
                 for (u32 k = 1; k < G30_SIMD; ++k) t += lh[G30_HBINS + (k - 1u) * G30_CBINS + i];
             if (t) atomic_add(hist + i, t);
         }
+#if G30_BLK
+        for (u32 i = lid; i < G30_PBINS; i += get_local_size(0))
+            if (lh[G30_LH + i]) atomic_add(hist + G30_HBINS + i, lh[G30_LH + i]);
+#endif
         if (lid == 0) {
             u64 a = 0;
             for (u32 s = 0; s < get_num_sub_groups(); ++s) a = max(a, red[s]);
@@ -4643,7 +4763,7 @@ inline u32 inv32(const u32 p)
 }
 
 #ifndef MT_CB
-#define MT_CB 64                 // table blocks (30030 numbers, 180 words) per mt_build group
+#define MT_CB 128                // table blocks (30030 numbers, 180 words) per mt_build group (host: MT_CB_HOST)
 #endif
 #define MT_SPLIT_P 1024u         // primes below: marks split over MT_R sub-ranges (load balance)
 #define MT_R 32u
@@ -4660,7 +4780,7 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
                        __global const u32* restrict pat)   // MT_PRE patterns (host: mt_patterns)
 {
     __local u32 win[MT_CB * 180];
-    __local ushort lidx[30030];
+    __local ushort lidx[15015];       // odd residues r: lidx[r >> 1] (every m here is odd)
     __local uchar lstep[WHL_N];
     const u32 lid = get_local_id(0), wg = get_local_size(0);
     const u32 kb0 = get_group_id(0) * MT_CB;
@@ -4678,7 +4798,7 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
 #undef MT_P
         win[i] = v;
     }
-    for (u32 i = lid; i < 30030u; i += wg) lidx[i] = WHL_IDX[i];
+    for (u32 i = lid; i < 15015u; i += wg) lidx[i] = WHL_IDX[2u * i + 1u];
     for (u32 i = lid; i < WHL_N; i += wg) lstep[i] = WHL_STEP[i];
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 m_a = (u64)(k_lo + kb0) * 30030UL;   // even
@@ -4700,12 +4820,12 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
         u32 rel = ra + (rm ? s - rm : 0u);
         if (!(rel & 1u)) rel += s;                    // m_a even: rel odd <-> m odd
         u32 rt = (u32)(((u64)(rel % 30030u) * WHL_INV[s % 30030u]) % 30030u);   // t mod 30030
-        while (lidx[rt] == WHL_MISS) { rel += 2u * s; rt += 2u; if (rt >= 30030u) rt -= 30030u; }
+        while (lidx[rt >> 1] == WHL_MISS) { rel += 2u * s; rt += 2u; if (rt >= 30030u) rt -= 30030u; }
         if (rel >= rb) continue;
-        u32 w = lidx[rt];
+        u32 w = lidx[rt >> 1];
         for (;;) {
             const u32 kk = rel / 30030u;
-            const u32 bit = kk * 5760u + lidx[rel - kk * 30030u];
+            const u32 bit = kk * 5760u + lidx[(rel - kk * 30030u) >> 1];
             atomic_and((volatile __local u32*)&win[bit >> 5], ~(1u << (bit & 31u)));
             const u32 st = 2u * s * lstep[w];
             if (rb - rel <= st) break;

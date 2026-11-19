@@ -149,6 +149,11 @@ inline constexpr uint32_t MED_MIN_P = 512;
 // With the mid-prime windows (medium primes up to the 1500th prime only,
 // load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
 inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
+// With the medium items (GB_MED_ITEMS, default MED_ITEMS_MIDWIN marks per item
+// with the mid windows) the medium stage starts right after the mask-group
+// primes (67..79 are folded into the groups: the owned walk is empty).
+inline constexpr uint32_t MED_ITEMS_MIDWIN = 100;
+inline constexpr uint32_t MED_MIN_P_ITEMS = 80;
 // Mid-prime SLM windows (verifier.cpp, kernels/goldbach.cl mid_setup /
 // mid_window, HISTORY.md §9.2x): default prime bound (GB_MIDWIN overrides,
 // 0 = off), the auto split while the pass is on, the window in KB of SLM

@@ -303,6 +303,13 @@ struct RunSetup {
     // GB_C30_LATE (default on): count30 after the checker instead of beside
     // phase A, so it runs beside phase B and the next segment's tile sieve
     bool c30_late = env::onoff("GB_C30_LATE", true);
+    // GB_C30_PREB (default on, with GB_C30_LATE): count30 is launched after
+    // phase A's barrier BEFORE phase B, so its work-groups take their thread
+    // slots first and it ends earlier inside the next tile sieve (2026-11-18:
+    // tile kernel 0.567 -> 0.495 ms per segment, phase B 0.062 -> 0.121,
+    // gpu -0.9%)
+    bool c30_preb = env::onoff("GB_C30_PREB", true);
+    bool c30_done = false;           // this segment's count30 is already enqueued
     // GB_ML_OVERLAP (default on): no barrier between mid_window (atomic AND
     // store, MIDW_ANDST 2) and the packed large kernel, which then starts
     // beside the window pass's tail (+0.5%)
@@ -426,6 +433,8 @@ private:
 
     // ---- set_group_sizes ------------------------------------------------------
     uint32_t own_end = 0;            // primes [0, own_end): thread-owned tile walk
+    std::vector<uint32_t> med_items_host;   // medium items (prime, word range lo | hi << 16)
+    uint32_t med_nit = 0;            // items uploaded (0: none)
     double module_seconds = 0.0;
     uint32_t large_wg = 0;           // GB_LARGE_WG
 
@@ -448,6 +457,7 @@ private:
     uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
     bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
     uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
+    uint32_t slot_gphis[2] = {0, 0};       // count30's phases in phase order (block-walk patterns)
     uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
     bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
     uint64_t sampled_evens = 0;            // evens of the sampled segments
@@ -787,13 +797,37 @@ void DenseRun::set_group_sizes() {
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    const uint32_t med_min_p = env::u32("GB_MED_P", midwin_pre ? MED_MIN_P_MIDWIN : MED_MIN_P);
+    // GB_MED_ITEMS (2026-11-18): with the mid windows the medium stage takes
+    // every tile prime after the mask groups (the owned walk goes) as items of
+    // about T marks (+0.6%; T 90..110 flat, 80 / 130 worse)
+    const uint32_t med_items_t = env::u32("GB_MED_ITEMS", midwin_pre ? MED_ITEMS_MIDWIN : 0u);
+    const uint32_t med_min_p = env::u32("GB_MED_P", midwin_pre ? (med_items_t ? MED_MIN_P_ITEMS : MED_MIN_P_MIDWIN)
+                                                               : MED_MIN_P);
     own_end = std::clamp<uint32_t>(uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_split, med_min_p) -
         sieve_primes), mask_count, sieve_split);
     module_seconds = seconds_since(t_module);
     init_mark("module");
-
+    // Medium items (GB_MED_ITEMS = marks per item, default MED_ITEMS_MIDWIN
+    // with the mid windows): every medium prime split into n = round(marks
+    // per tile / T) >= 1 equal tile word ranges, the items sorted by marks
+    // (the lanes of a sub-group run equally long loops). Uploaded behind the
+    // mask group descriptors (size_buffers).
+    med_items_host.clear();
+    if (const uint32_t T = med_items_t; T > 0 && own_end < sieve_split) {
+        struct It { double m; uint32_t j, w; };
+        std::vector<It> v;
+        const uint32_t tw = uint32_t(BITS_PER_TILE / 32);
+        for (uint32_t j = own_end; j < sieve_split; ++j) {
+            const double m = double(BITS_PER_TILE) / sieve_primes[j];
+            const uint32_t n = std::clamp<uint32_t>(uint32_t(std::lround(m / T)), 1u, tw);
+            for (uint32_t i = 0; i < n; ++i)
+                v.push_back({m / n, j, (i * tw / n) | (((i + 1) * tw / n) << 16)});
+        }
+        std::stable_sort(v.begin(), v.end(), [](const It& x, const It& y) { return x.m > y.m; });
+        if (v.size() < 65536)
+            for (const It& t : v) { med_items_host.push_back(t.j); med_items_host.push_back(t.w); }
+    }
     k_sieve.set_group_size(WG_SIZE);
     // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
     // kernel indexes by global id). N must be a non-zero multiple of the
@@ -881,8 +915,13 @@ void DenseRun::size_buffers() {
     d_group_desc = nullptr;
     if (mask_groups_n == 0) mask_xp = 0;   // per-prime mask path: the owned walk takes them
     if (mask_groups_n > 0) {
-        d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared(mask_groups0.desc.size() * 4));
+        // the medium items follow the descriptors at 2 * MAX_MASK_GROUPS words
+        const size_t dw = std::max<size_t>(mask_groups0.desc.size(), 2 * MAX_MASK_GROUPS_HOST);
+        d_group_desc = static_cast<uint32_t*>(ctx.alloc_shared((dw + med_items_host.size()) * 4));
+        std::memset(d_group_desc, 0, dw * 4);
         std::memcpy(d_group_desc, mask_groups0.desc.data(), mask_groups0.desc.size() * 4);
+        std::memcpy(d_group_desc + 2 * MAX_MASK_GROUPS_HOST, med_items_host.data(), med_items_host.size() * 4);
+        med_nit = uint32_t(med_items_host.size() / 2);
     }
 }
 
@@ -932,7 +971,7 @@ void DenseRun::allocate_slot_buffers() {
             std::memset(b.x_cnt[s], 0, 16 * 4);
             b.g_part[s]  = static_cast<uint64_t*>(ctx.alloc_shared(size_t(GAPS30_GROUPS_MAX) * 8));
             b.g_tail[s]  = static_cast<uint32_t*>(ctx.alloc_shared((2 + 2 * GAPS30_TCAP) * 4));
-            b.g_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared(GAPS30_HBINS * 4));
+            b.g_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared((GAPS30_HBINS + GAPS30_PBINS) * 4));
             reset_gaps(s);
         }
         b.tile_first[s] = use_table
@@ -967,7 +1006,7 @@ void DenseRun::reset_gaps(int s) {
     b.g_tail[s][0] = b.g_tail[s][1] = 0;
     b.x_cnt[s][11] = ~0u;                   // count30's first prime position (atomic_min)
     b.x_cnt[s][12] = 0;
-    std::memset(b.g_hist[s], 0, GAPS30_HBINS * 4);
+    std::memset(b.g_hist[s], 0, (GAPS30_HBINS + GAPS30_PBINS) * 4);
 }
 
 /// Merges a completed slot's statistics buffers (after its check event).
@@ -980,8 +1019,18 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
         const bool w = walked_slot[sl];
         if (w)
             for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
+        // count30's block walk: the internal gaps of the blocks with two or
+        // more primes, by pattern (bins after the histogram)
+        uint32_t hx[GAPS30_HBINS];
+        if (w) {
+            std::memcpy(hx, b.g_hist[sl], sizeof(hx));
+            const uint32_t dint = add_pattern_gaps(hx, b.g_hist[sl] + GAPS30_HBINS, slot_gphis[sl]);
+            // count30's maximum covers the gaps into blocks only
+            if (dint && (wmax >> 32) <= 2ull * dint && b.x_cnt[sl][11] != ~0u)
+                wmax = walk_max_exact(slot_qfirst[sl], b.x_cnt[sl][11], b.x_cnt[sl][12]);
+        }
         gstats->add_gap_segment(slot_qfirst[sl], slot_evens[sl], b.x_cnt[sl], b.g_tail[sl],
-                                w ? &wmax : nullptr, w ? b.g_hist[sl] : nullptr);
+                                w ? &wmax : nullptr, w ? hx : nullptr);
     }
     gstats->add_counts(b.x_cnt[sl]);
     // ready for the slot's next segment (enqueued after this collect)
@@ -1392,7 +1441,7 @@ void DenseRun::build_mtab() {
     ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
     kb.set_arg(7, sizeof(d_pat), &d_pat);
     const auto t0 = clock_::now();
-    kb.launch(ctx.list(), (mt_blocks + 63) / 64);   // MT_CB
+    kb.launch(ctx.list(), (mt_blocks + 127) / 128);   // MT_CB (kernels/goldbach.cl)
     ctx.host_sync();
     Context::free_mem(ctx.context(), d_pat);
     if (verbose)
@@ -1457,7 +1506,7 @@ void DenseRun::pack_stats_buffers() {
         const size_t at_x_cnt   = take(16 * 4);
         const size_t at_g_part  = take(size_t(GAPS30_GROUPS_MAX) * 8);
         const size_t at_g_tail  = take((2 + 2 * size_t(GAPS30_TCAP)) * 4);
-        const size_t at_g_hist  = take(size_t(GAPS30_HBINS) * 4);
+        const size_t at_g_hist  = take(size_t(GAPS30_HBINS + GAPS30_PBINS) * 4);
         for (int s = 0; s < 2; ++s) {
             unsigned char* base = static_cast<unsigned char*>(ctx.alloc_shared(block_bytes));
             stats_block[s] = base;
@@ -1755,7 +1804,7 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     k_sieve.set_arg(15, sizeof(own_end),       &own_end);
     k_sieve.set_arg(16, sizeof(b.group_masks[sg.slot]), &b.group_masks[sg.slot]);
     k_sieve.set_arg(17, sizeof(d_group_desc),  &d_group_desc);
-    const uint32_t groups_xp = mask_groups_n | mask_xp << 8;   // make_prime_map: n_groups_xp
+    const uint32_t groups_xp = mask_groups_n | mask_xp << 8 | med_nit << 16;   // make_prime_map: n_groups_xp
     k_sieve.set_arg(18, sizeof(groups_xp), &groups_xp);
     k_sieve.set_arg(19, 4, &cm_u32);
     k_sieve.set_arg(20, 4, &sg.cgeo.tpc);
@@ -2067,7 +2116,8 @@ void DenseRun::enqueue_check(Segment& sg) {
     // ~1.5x as much). It only reads this slot's finished map (the barrier
     // before phase A follows the marks); the next mid_window barrier and the
     // host's wait on its event (collection) order everything after it.
-    if (stats_on && c30_late) enqueue_count30(sg, sampled);
+    if (stats_on && c30_late && !c30_done) enqueue_count30(sg, sampled);
+    c30_done = false;
     sg.enq_s = seconds_since(sg.t_enq);
     sg.launch_s = seconds_since(sg.t_launch0);
     sg.l3_s = seconds_since(sg.t_launch0);
@@ -2112,6 +2162,7 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
     slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
     slot_qfirst[sg.slot] = sg.q_first;
+    slot_gphis[sg.slot] = g_phis;
     k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cnt->set_arg(1, 4, &cw32);
     k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
@@ -2166,6 +2217,8 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
         else kv.launch(ctx.list(), splan.vn[v] * items_pad / WG_SIZE, xe);
     }
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    const bool preb = stats_on && c30_late && c30_preb;
+    if (preb) { enqueue_count30(sg, true); c30_done = true; }   // before phase B: see GB_C30_PREB
     k_cxb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cxb->set_arg(1, sizeof(b.x_all), &b.x_all);
     k_cxb->set_arg(2, sizeof(b.x_tab), &b.x_tab);
@@ -2185,7 +2238,9 @@ void DenseRun::enqueue_check_sampled(const Segment& sg, const Seg30& s30, uint32
     k_cxb->set_arg(16, sizeof(b.x_hist[sg.slot]), &b.x_hist[sg.slot]);
     k_cxb->set_arg(17, sizeof(b.p_first[sg.slot]), &b.p_first[sg.slot]);
     k_cxb->set_arg(18, sizeof(b.want_p), &b.want_p);
-    k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
+    // (with count30 first, the barrier above already orders it after the variants)
+    if (preb) k_cxb->launch_overlap(ctx.list(), stats_b_groups, ev.check[sg.slot]);
+    else k_cxb->launch(ctx.list(), stats_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
 /// Step 5c: the mod-30 checker, check30_a -> barrier -> check30_b.
@@ -2215,6 +2270,10 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     // read the finished map; the barrier above follows the marks)
     k_ca->launch_overlap(ctx.list(), 15 * items_pad / WG_SIZE, ev.checka[sg.slot]);
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    // GB_C30_PREB: count30 (reads the finished map only) between the barrier
+    // and phase B, both without a further barrier
+    const bool preb = stats_on && c30_late && c30_preb;
+    if (preb) { enqueue_count30(sg, false); c30_done = true; }
     k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cb->set_arg(1, sizeof(b.checked[sg.slot]), &b.checked[sg.slot]);
     k_cb->set_arg(2, 4, &chk_stride30);
@@ -2239,7 +2298,8 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     k_cb->set_arg(21, sizeof(b.want_p), &b.want_p);
     k_cb->set_arg(22, 4, &tail_t);
     k_cb->set_arg(23, sizeof(b.acct[sg.slot]), &b.acct[sg.slot]);
-    k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
+    if (preb) k_cb->launch_overlap(ctx.list(), phase_b_groups, ev.check[sg.slot]);
+    else k_cb->launch(ctx.list(), phase_b_groups, ev.check[sg.slot]);  // grid-stride
 }
 
 /// Per-segment step 6: collects the PREVIOUS segment (other slot) once this
