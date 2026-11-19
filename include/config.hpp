@@ -179,6 +179,17 @@ inline constexpr uint32_t MIDWIN_WG = 1024;
 // Small-prime mask sieve bound (must match MASK_MAX_P in kernels/goldbach.cl):
 // primes below this use whole-word AND masks in make_prime_map stage 3a.
 inline constexpr uint32_t MASK_MAX_P = 64;
+// The large-prime fast paths drop marks that the mask stage already made
+// (docs/EXACTNESS.md): the packed kernel's and the harvest's skip of p m
+// with m divisible by 17..43, and mt_build's 17..61 presieve. Both need
+// every prime up to 61 inside the mask stage.
+static_assert(MASK_MAX_P > 61, "the 17..43 mark skip and the 17..61 presieve rely on the mask stage");
+// mod_ff_q is exact for p >= 512 (GPU self-test, HISTORY.md §9.2z); the
+// split clamp keeps a margin above that.
+static_assert(MOD_FF_MIN_P >= 512, "mod_ff_q is wrong below 512");
+// mt_build: table blocks (30030 numbers, 180 words) per work-group. MUST
+// match MT_CB in kernels/goldbach.cl (tests/check_constants.py).
+inline constexpr uint32_t MT_CB_HOST = 128;
 
 // ---- Defaults ------------------------------------------------------------
 inline constexpr uint64_t DEFAULT_LIMIT          = 100'000'000ULL;  // verify evens in [4, limit]

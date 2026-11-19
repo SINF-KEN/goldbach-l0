@@ -683,6 +683,8 @@ void RunSetup::load_base_primes() {
     // (HISTORY.md §9.2z): keep every prime below MOD_FF_MIN_P in the tile walk.
     sieve_split = std::max(sieve_split, std::min(sieve_count, uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + sieve_count, MOD_FF_MIN_P) - sieve_primes)));
+    if (sieve_split < sieve_count && sieve_primes[sieve_split] < MOD_FF_MIN_P)
+        throw std::runtime_error("split prime below MOD_FF_MIN_P (docs/EXACTNESS.md)");
     large_count = sieve_count - sieve_split;
 
     // Goldbach candidate primes: p <= 9781 (see config.hpp).
@@ -1214,6 +1216,10 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         const uint64_t budget = env::u64("GB_HL_LIST_MAX", HL_LIST_MAX_DEFAULT);
         while (hl_K > 1 && uint64_t(hl_K) * hl_G * hl_capg * 4 > budget) --hl_K;
     }
+    // K = 1 is the floor of both loops: fail closed rather than let a list
+    // offset wrap (never near: K = 1 is ~30 MB at 4e18)
+    if (hitlist && uint64_t(hl_K) * hl_G * hl_capg * 4 >= (uint64_t(1) << 32))
+        throw std::runtime_error("hit lists: one batch's lists exceed 4 GiB");
     // Segments of the run (the loop below: seg_start += segment_even until
     // seg_end == limit) and the last one's q_odds (the only short one).
     // hl_harvest's 32-bit walk: off + p (off < delta), off + delta and the
@@ -1455,7 +1461,7 @@ void DenseRun::build_mtab() {
     ZE_CHECK(zeCommandListAppendMemoryCopy(ctx.list(), d_pat, pat.data(), pat.size() * 4, nullptr, 0, nullptr));
     kb.set_arg(7, sizeof(d_pat), &d_pat);
     const auto t0 = clock_::now();
-    kb.launch(ctx.list(), (mt_blocks + 127) / 128);   // MT_CB (kernels/goldbach.cl)
+    kb.launch(ctx.list(), (mt_blocks + MT_CB_HOST - 1) / MT_CB_HOST);   // MT_CB blocks per group
     ctx.host_sync();
     Context::free_mem(ctx.context(), d_pat);
     if (verbose)
