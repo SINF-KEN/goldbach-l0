@@ -965,13 +965,16 @@ inline void cop_marks(volatile __local u32* t32, const u32 c, const u32 p, u32 b
     }
 }
 
-/// ceil(span / p) for span < 2^24: float quotient + exact fix-ups.
+/// ceil(span / p): float quotient + one fix-up.
+/// @pre    span <= 2^21 (tiles 2^17, windows <= 2^20 bits), 2 <= p < 2^24,
+///         ip = 1.0f / p within 2.5 ulp. Then the float quotient is within
+///         1/p of span / p, so its floor is ceil(span / p) or one less and
+///         never more: a fix-up down cannot fire (proved in Lean,
+///         CopSkip.ceil_div_f_code; dropped 2026-11-19).
 inline u32 ceil_div_f(const u32 span, const u32 p, const float ip)
 {
-    u32 n = (u32)((float)span * ip);
-    n += (n * p < span) ? 1u : 0u;
-    n -= (n > 0u && (n - 1u) * p >= span) ? 1u : 0u;
-    return n;
+    const u32 n = (u32)((float)span * ip);
+    return n + ((n * p < span) ? 1u : 0u);
 }
 
 /// @pre    as med_prime_f32n; cres = (m mod COP_M) * 30^-1 mod COP_M for the
@@ -992,8 +995,9 @@ inline void med_prime_cop(volatile __local u32* t32, const u32 fb, const u32 cre
     const bool ahead = fb >= tile_bit0;
     const u32 bit = ahead ? fb - tile_bit0 : (u32)rf;
     if (bit >= nbits) return;
-    // t = marks from fb to bit: an exact multiple of p below 2^24, so the
-    // float quotient is within 0.05 of t and rint is exact
+    // t = marks from fb to bit: an exact multiple of p below 2^24 with
+    // p >= 64, so t < 2^18 and the float quotient is within 0.1 of t: rint
+    // is exact
     const u32 t = ahead ? 0u : (u32)rint((float)(tile_bit0 + bit - fb) * ip);
     cop_marks(t32, cres + t, p, bit, ceil_div_f(nbits - bit, p, ip), c1);
 }

@@ -79,19 +79,32 @@ dropped, so the map holds a composite as prime.
 **Rule.** The tile sieve's medium items (`med_prime_cop`) and the mid windows
 for p < MIDW_COP_MAXP (`mid_window` via `cop_marks`) skip a mark p·m when m
 is divisible by 7, 11, 13, 17, 19, 23 or 29: the mask stage cleared every
-multiple of these primes, and p·m ≠ r (p ≥ 83). A prime's marks along a class
-array have multipliers m, m + 30, m + 60, ...; with c = m · 30⁻¹ mod COP_M
-(COP_M = 7·11·…·29) mark t has m ≡ 30 (c + t), so r | m iff r | c + t.
+multiple of these primes, and p·m ≥ 2r > r because r | m (no bound on p is
+needed). A prime's marks along a class array have multipliers m, m + 30,
+m + 60, ...; with c = m · 30⁻¹ mod COP_M (COP_M = 7·11·…·29) mark t has
+m ≡ 30 (c + t), so r | m iff r | c + t.
 
 **Conditions.**
 - The mask stage covers 7..29 (MASK_MAX_P > 61, as rule 2; the verifier
-  throws if the medium items run without it).
+  throws if the medium items or the mid windows run without it).
 - c is right: the host writes it into the high word of the items' first bits
-  (`first_bits_class_range` with cop_j0 = own_end; the class bit itself stays
-  < 2³²), mid_setup into the second half of the i0 table. host_tests checks
+  (`first_bits_class_range` with cop_j0 = own_end; it throws for a K = 2 map
+  or a class bit ≥ 2³²), mid_setup into the second half of the i0 table
+  (m0 = q_first / p + (r + t) / p with r + t ∈ {0, p, 2p}; class c's first
+  mark has multiplier m0 + 2k, so c0 + k · 15⁻¹). host_tests checks
   30 c ≡ m (mod COP_M); check_constants checks COP_M and the inverses.
-- The per-word walk relies on no 32 consecutive c + t all being redundant
-  (the longest run for 7..29 is 8).
+- The float steps: `ceil_div_f` is exact for spans ≤ 2²¹ with 1/p within the
+  OpenCL 2.5 ulp (spans are ≤ 2¹⁷ in tiles, ≤ 2²⁰ in windows: GB_MIDWIN_KB
+  ≤ 128, static_assert in verifier.cpp), and the rint that recovers the mark
+  count t from the exact multiple t·p < 2²⁴ is exact for p ≥ 64 (t < 2¹⁸,
+  error < 0.1).
+
+Proved in Lean (`lean/GoldbachL0/CopSkip.lean` on branch
+`lean/host-math-proofs`): the map stays exact with these skips, the residue
+rule, the host and mid_setup residues (no 32/64-bit wrap), the shifted
+`cop_pat` skip word with its offset update and tail mask, and both float
+steps under the rounding model above. An all-redundant word (impossible:
+the longest run of c + t divisible by 7..29 is 8) would only leave mm = 0.
 
 **If violated.** A needed mark is skipped (wrong c) and the map holds a
 composite as prime: prime counts change, the run may still PASS.

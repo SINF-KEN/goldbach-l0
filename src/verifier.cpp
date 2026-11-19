@@ -330,6 +330,9 @@ struct RunSetup {
     const uint32_t* sieve_primes = nullptr;  // mmap-backed (or owned) by prime_view
     double cache_seconds = 0.0;
     uint32_t mask_count = 0;         // primes < 64: the small-prime mask path
+    // The mask stage clears every multiple of 7..29: cop_marks (medium items,
+    // mid windows) skips those marks (docs/EXACTNESS.md rule 2b).
+    bool mask_through_29() const { return mask_count > 0 && sieve_primes[mask_count - 1] >= 29; }
     uint32_t sieve_count = 0;        // base primes
     uint32_t sieve_split = 0;        // [0, split): tile walk; [split, count): large kernels
     uint64_t midwin_p2 = 0;          // GB_MIDWIN: mid-window bound (0 = off)
@@ -845,7 +848,7 @@ void DenseRun::set_group_sizes() {
     // multiplier residue, and its skips rely on the mask stage clearing
     // every multiple of 7..29 (docs/EXACTNESS.md).
     med_cop = !med_items_host.empty();
-    if (med_cop && !(mask_count > 0 && sieve_primes[mask_count - 1] >= 29))
+    if (med_cop && !mask_through_29())
         throw std::runtime_error("medium items need the mask stage through 29");
     k_sieve.set_group_size(WG_SIZE);
     // Large-kernel work-group size; GB_LARGE_WG=N overrides (tuning only: the
@@ -1091,6 +1094,9 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // preconditions on the run's geometry
     midwin_on = midwin_pre && q_first0 >= (uint64_t(1) << 60) &&
                 (q_odds_full + 14) / 15 < (uint64_t(1) << 24);
+    // mid_window walks primes below MIDW_COP_MAXP with cop_marks
+    if (midwin_on && !mask_through_29())
+        throw std::runtime_error("mid windows need the mask stage through 29");
     if (bucket_on) {
         // Hit-list only primes above max(q_odds_full, GB_BUCKET_MINP): below
         // ~9 x q_odds_full a prime's per-segment packed setup (~22 ps) is
@@ -1269,7 +1275,10 @@ void DenseRun::allocate_large_prime_buffers() {
     // Mid-prime SLM windows (§9.2x): [sieve_split, mid_end) leave the packed
     // kernel; the packed list starts at mid_end.
     mid_end = sieve_split;
+    // <= 128 KB = 2^20 bits: ceil_div_f's spans stay <= 2^21 (rule 2b)
     midw_bits = env::u32("GB_MIDWIN_KB", MIDWIN_KB, 1, 128) * 8192u;
+    static_assert(128u * 8192u <= (1u << 21) && BITS_PER_TILE <= (1u << 21),
+                  "ceil_div_f is exact for spans <= 2^21 only");
     midw_wg = env::wg32("GB_MIDWIN_WG", MIDWIN_WG);
     if (midwin_pre) {
         if (midwin_on)
