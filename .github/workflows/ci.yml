@@ -227,6 +227,9 @@ jobs:
       - name: Local CI logic (journal chain, reference cache, exact gates, ledger)
         run: python3 tests/test_ci.py
 
+      - name: Figure groups (sparse runs never drawn as dense versions)
+        run: python3 tests/test_figure_groups.py
+
       - name: Production knobs (ci/production-env.json valid, env plan, apply flow)
         run: |
           python3 ci/production_env.py ci/production-env.json --check

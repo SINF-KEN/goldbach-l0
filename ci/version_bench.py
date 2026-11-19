@@ -27,6 +27,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from figure_groups import is_sparse  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = "include/config.hpp"
 JOURNAL = ROOT / "bench" / "bench-results.csv"
@@ -113,11 +116,27 @@ def cmd_append(a):
         rows = [r for r in csv.DictReader(f) if r.get("label") in commit]
     if not any(r.get("status") == "pass" for r in rows):
         sys.exit(f"{a.bench_csv}: no passing rows for {', '.join(commit)}")
+    # the figures draw a version's dense production path; a sparse run under a
+    # version label is how v2.0.0/v2.1.0 once looked ~14x faster than the rest
+    sparse = sorted({r["label"] for r in rows if is_sparse(r.get("gb_env") or "")})
+    if sparse:
+        sys.exit(f"{a.bench_csv}: GB_SPARSE rows for {', '.join(sparse)}; the version figures "
+                 "measure the dense production path (give sparse runs their own label)")
     for r in rows:                                 # bench.py writes the checkout it ran in (production's tree)
         r["commit"] = commit[r["label"]]
         r["version"] = r["label"][1:]
     with open(a.journal, newline="") as f:
-        hdr = next(csv.reader(f))
+        old = list(csv.reader(f))
+    hdr = old[0]
+    with open(a.bench_csv, newline="") as f:
+        new_cols = [c for c in (next(csv.reader(f), None) or []) if c not in hdr]
+    if new_cols:                                   # columns bench.py added since (gb_env): as its upgrade_journal
+        hdr += new_cols
+        with open(a.journal, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(hdr)
+            w.writerows(r + [""] * len(new_cols) for r in old[1:])
+        print(f"journal: added column(s) {', '.join(new_cols)}")
     with open(a.journal, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=hdr, extrasaction="ignore").writerows(rows)
     print(f"{len(rows)} rows -> {a.journal}")
