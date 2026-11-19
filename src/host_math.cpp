@@ -86,6 +86,10 @@ void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
     for (uint32_t c = 0; c < g.K; ++c)
         std::fill(fb + size_t(c) * sieve_split + j0, fb + size_t(c) * sieve_split + j1, ~0ull);
     const uint64_t M = g.qmod;
+    // the residues exist for the mod-30 map only: a K = 2 map has no
+    // med_prime_cop, so a residue column there is a caller bug, not c = 0
+    if (cop_j0 < j1 && M != 30)
+        throw std::runtime_error("first_bits_class_range: multiplier residues need K = 8");
     for (uint32_t j = j0; j < j1; ++j) {
         const uint64_t p = sieve_primes[j];
         if (p % 3 == 0 || (M == 30 && p % 5 == 0) || p > q_last / p) continue;
@@ -99,8 +103,10 @@ void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
             const uint64_t q = m * p;
             if (q > q_last) continue;
             const uint64_t bit = (q - g.Q[c]) / M;
-            const uint64_t cop = (j >= cop_j0 && M == 30) ? m % COP_M * COP_INV30 % COP_M : 0;
-            if (cop && bit >> 32)
+            const bool has_cop = j >= cop_j0;
+            const uint64_t cop = has_cop ? m % COP_M * COP_INV30 % COP_M : 0;
+            // checked for every residue column (c = 0 is a valid residue)
+            if (has_cop && bit >> 32)
                 throw std::runtime_error("first_bits_class_range: class bit >= 2^32 with a residue");
             fb[size_t(c) * sieve_split + j] = bit | cop << 32;
         }

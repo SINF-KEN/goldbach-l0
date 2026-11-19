@@ -20,7 +20,8 @@
 # 3. the Level Zero validation layer (oneapi-src/level-zero): --info, a dense
 #    and a sparse run under parameter validation, handle lifetime tracking,
 #    the events checker and the leak checker; any checker warning, leak or
-#    failed core API call fails, and so does a layer that did not load;
+#    failed core API call fails, and so does a layer that did not load (a
+#    layer that crashes on its own load is skipped with a SKIP line);
 # 4. the bit-exact kernel validators when goldbach-tools is checked out
 #    (debug_check_hi, debug_map, debug_sieve, debug_fb).
 # "quick" skips 4 and the larger windows (~2 min instead of ~12).
@@ -28,6 +29,7 @@
 set -u
 BUILD=$(readlink -f "${1:-build}")
 QUICK=${2:-}
+skipped=""
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$BUILD/goldbach_l0
 REF=$BUILD/stats_ref
@@ -145,12 +147,24 @@ vl() {      # vl LABEL goldbach_l0 args...
         echo "  ok   $label"
     fi
 }
-vl info --info
-VW="--start 4000000000000000000 --limit 4000000002000000000 --csv"
-# shellcheck disable=SC2086
-vl dense $VW
-# shellcheck disable=SC2086
-vl sparse $VW --sparse
+# A layer whose own load crashes (level-zero-loader 1.34.0: a static
+# initializer of system_resource_tracker_checker dereferences the layer's
+# context before it exists, SIGSEGV inside dlopen for any environment) would
+# fail every run before our code: probe it on the CPU first, and skip the
+# section loudly. A missing layer still fails below ("not loaded").
+probe_rc=0
+python3 -I -c 'import ctypes; ctypes.CDLL("libze_validation_layer.so.1")' >/dev/null 2>&1 || probe_rc=$?
+if [ "$probe_rc" -ge 128 ]; then
+    echo "  SKIP the installed libze_validation_layer.so.1 crashes on load (signal $((probe_rc - 128)), no GPU involved): fix or update level-zero-loader"
+    skipped=" (SKIPPED: validation layer crashes on load)"
+else
+    vl info --info
+    VW="--start 4000000000000000000 --limit 4000000002000000000 --csv"
+    # shellcheck disable=SC2086
+    vl dense $VW
+    # shellcheck disable=SC2086
+    vl sparse $VW --sparse
+fi
 
 # --- 4. bit-exact kernel validators (goldbach-tools) ---------------------------
 if [ -z "$QUICK" ]; then
@@ -161,5 +175,5 @@ if [ -z "$QUICK" ]; then
         else echo "  FAIL $v"; tail -5 "$T/$v.out"; fail=$((fail + 1)); fi
     done
 fi
-echo "gpu_validate: $fail failure(s) -> $([ $fail = 0 ] && echo PASS || echo FAIL)"
+echo "gpu_validate: $fail failure(s)$skipped -> $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

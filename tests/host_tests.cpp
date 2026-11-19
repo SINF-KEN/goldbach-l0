@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <functional>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -1630,6 +1632,56 @@ void test_host_math_first_bits()
             check(rok, "first_bits_class_range " + tag + " multiplier residues");
         }
     }
+
+    // Residue columns fail loudly: a K = 2 map has no residues (not c = 0),
+    // and a residue entry needs its class bit below 2^32 (any c, also 0).
+    {
+        const std::vector<uint32_t> ps = odd_primes_up_to(1u << 20);
+        const uint32_t n = uint32_t(ps.size());
+        std::vector<uint64_t> buf(size_t(8) * n);
+        auto throws = [&](const ClassGeo& g, uint64_t qf, uint64_t ql, uint32_t cop_j0) {
+            try { first_bits_class_range(buf.data(), ps.data(), n, 0, n, qf, ql, g, cop_j0); }
+            catch (const std::runtime_error&) { return true; }
+            return false;
+        };
+        const uint64_t qf = 1000001, ql = qf + 2 * 1000000;
+        check(throws(class_geometry(qf, 1000000, 2), qf, ql, 0),
+              "first_bits_class_range: residues on a K = 2 map throw");
+        check(!throws(class_geometry(qf, 1000000, 2), qf, ql, UINT32_MAX),
+              "first_bits_class_range: K = 2 without residues runs");
+        // p ~ 1e6 at q_first 7: the first mark p^2 sits at class bit ~3.3e10
+        const uint64_t lo = 7, hi = uint64_t(1) << 41;
+        check(throws(class_geometry(lo, (hi - lo) / 2 + 1, 8), lo, hi, 0),
+              "first_bits_class_range: residue with a class bit >= 2^32 throws");
+        check(!throws(class_geometry(lo, (hi - lo) / 2 + 1, 8), lo, hi, UINT32_MAX),
+              "first_bits_class_range: wide class bits without residues run");
+    }
+}
+
+// ceil_div_f (kernels/goldbach.cl): (u32)(span * ip) plus one fix-up up is
+// ceil(span / p) for every span <= 2^21, also with 1/p off by 2 ulp (OpenCL
+// allows 2.5); the dropped fix-up down never fires. Every span for edge and
+// sample primes.
+void test_ceil_div_f()
+{
+    std::puts("host math: ceil_div_f");
+    bool ok = true;
+    uint64_t bad = 0;
+    for (uint32_t p : {2u, 3u, 7u, 67u, 83u, 1009u, 12553u, 65521u, 131071u, 1048573u, 16777213u}) {
+        const float ip0 = 1.0f / float(p);
+        float ips[5] = {ip0, std::nextafter(ip0, 0.0f), std::nextafter(ip0, 1.0f), 0, 0};
+        ips[3] = std::nextafter(ips[1], 0.0f);
+        ips[4] = std::nextafter(ips[2], 1.0f);
+        for (const float ip : ips)
+            for (uint32_t span = 0; span <= (1u << 21); ++span) {
+                const uint32_t n0 = uint32_t(float(span) * ip);
+                const uint32_t n = n0 + ((n0 * p < span) ? 1u : 0u);
+                const uint32_t want = uint32_t((uint64_t(span) + p - 1) / p);
+                if (n != want || n0 > want) ++bad;
+            }
+    }
+    ok = bad == 0;
+    check(ok, "ceil_div_f exact for spans <= 2^21 (1/p within 2 ulp), floor never above the ceiling");
 }
 
 // Magic reciprocals: floor(d * m >> (64 + s)) == d / p, exhaustively over a
@@ -1873,6 +1925,7 @@ void test_host_math()
 {
     test_host_math_segments();
     test_host_math_first_bits();
+    test_ceil_div_f();
     test_host_math_reciprocals();
     test_host_math_reciprocals32();
     test_host_math_tile_table();

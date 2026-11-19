@@ -122,9 +122,11 @@ ClassGeo class_geometry(uint64_t q_first, uint64_t q_odds, uint32_t K = 2);
 /// @post  for j in [j0, j1), every class c: fb[c * sieve_split + j] = (q - Q[c]) / qmod
 ///        for the smallest q >= max(p^2, q_first), q = 0 mod p, q in class c,
 ///        q <= q_last; ~0 if none (or p | qmod). Other entries untouched.
-///        For j >= cop_j0 (K = 8) a found entry also carries, in its high
-///        word, c = (m mod COP_M) * 30^-1 mod COP_M for its q = m p (the
-///        medium stage's med_prime_cop; the bit itself is < 2^32 there).
+///        For j >= cop_j0 a found entry also carries, in its high word,
+///        c = (m mod COP_M) * 30^-1 mod COP_M for its q = m p (the medium
+///        stage's med_prime_cop).
+/// @throws std::runtime_error if cop_j0 < j1 and K != 8, or a residue entry's
+///         class bit is >= 2^32 (it would not fit the low word).
 void first_bits_class_range(uint64_t* fb, const uint32_t* sieve_primes,
                             uint32_t sieve_split, uint32_t j0, uint32_t j1,
                             uint64_t q_first, uint64_t q_last, const ClassGeo& g,
