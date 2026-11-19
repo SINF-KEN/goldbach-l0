@@ -313,13 +313,16 @@ std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
 SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
                                               uint32_t mask_count,
                                               const std::vector<uint64_t>& per_prime,
-                                              uint32_t max_period) {
+                                              uint32_t max_period, uint32_t skip) {
     SmallPrimeGroups g;
     std::vector<std::vector<uint32_t>> groups;   // indices into sieve_primes
     uint64_t prod = 0;
     for (uint32_t j = 0; j < mask_count; ++j) {
         const uint64_t p = sieve_primes[j];
         if (p < 3 || p >= 64) continue;
+        // primes dividing skip (class maps: no multiples in any class) are
+        // left out of the groups: all-ones masks would only widen a period
+        if (skip % p == 0) continue;
         if (groups.empty() || prod * p > max_period) { groups.push_back({}); prod = 1; }
         groups.back().push_back(j);
         prod *= p;
@@ -351,7 +354,7 @@ SmallPrimeGroups small_prime_group_masks_canonical(const uint32_t* sieve_primes,
     for (uint32_t j = 0; j < mask_count; ++j)
         if (skip_mod % sieve_primes[j] == 0)
             std::fill_n(&per[size_t(j) * 64], 64, ~0ull);
-    return small_prime_group_masks_from(sieve_primes, mask_count, per, max_period);
+    return small_prime_group_masks_from(sieve_primes, mask_count, per, max_period, skip_mod);
 }
 
 std::vector<uint32_t> small_prime_group_offsets(const uint32_t* sieve_primes,
@@ -368,6 +371,7 @@ std::vector<uint32_t> small_prime_group_offsets(const uint32_t* sieve_primes,
     for (uint32_t j = 0; j < mask_count; ++j) {
         const uint64_t p = sieve_primes[j];
         if (p < 3 || p >= 64) continue;
+        if (step % p == 0) continue;            // as the canonical grouping (skip_mod | step)
         if (P == 0 || P * p > max_period) { flush(); P = 1; X = 0; }
         uint64_t r = 0;                         // marks at i = r (mod p); any r if p | step
         if (step % p != 0) {

@@ -96,8 +96,13 @@ inline constexpr uint64_t BUCKET_MIN_P_FACTOR = 3;
 // With the mid-prime SLM windows (HISTORY.md §9.2x) the packed kernel lost
 // most of its atomics and the crossover moved down: 1e11 at 4e18 (3 paired
 // rounds, gpu ms) 3 x 667.1, 2 x 657.8..659.1, 1.75 x 657.8, 1.5 x 660.2,
-// 1.25 x 659.8, 1 x 662.2 -> 2 x (+1.3%; §9.2y).
-inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN = 2;
+// 1.25 x 659.8, 1 x 662.2 -> 2 x (+1.3%; §9.2y). Round 3 (2026-11-18): the
+// harvest files ~18% fewer hits (17..29 skip), large_s per 1e11 at
+// GB_BUCKET_MINP = 1.03 x 283.9, 1.28 x 281.3, 1.41 x 280.1, 1.5 x 280.1,
+// 1.63 x 279.8, 1.8 x 280.5, 2 x 282.6, 2.57 x 292.3 -> 1.6 x
+// (BUCKET_MIN_P_FACTOR_MIDWIN_NUM / _DEN).
+inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN_NUM = 8;
+inline constexpr uint64_t BUCKET_MIN_P_FACTOR_MIDWIN_DEN = 5;
 // Phase-A item width in 64-bit words (768 evens per item) of every word
 // checker. MUST match A_W64 in kernels/goldbach.cl. v1.13.0: 16 -> 14 (the
 // mod-30 checker: 12 -1.0%, 14 -1.3%; 8: +0.3%). 2026-10-05: 14 -> 12 after
@@ -135,6 +140,9 @@ inline constexpr uint32_t RIDGE_MIN_DEFAULT  = 3000;
 // GB_MED_P overrides). Class map, per 1e11 window: sieve_s 261.7 (256) /
 // 256.2 (384) / 253.0 (512) / 261.8 (640) ms.
 inline constexpr uint32_t MED_MIN_P = 512;
+// With the mid-prime windows (medium primes up to the 1500th prime only,
+// load-balanced rows): 384 +0.14% over 512 (2026-11-18, 3 paired rounds).
+inline constexpr uint32_t MED_MIN_P_MIDWIN = 384;
 // Mid-prime SLM windows (verifier.cpp, kernels/goldbach.cl mid_setup /
 // mid_window, HISTORY.md §9.2x): default prime bound (GB_MIDWIN overrides,
 // 0 = off), the auto split while the pass is on, the window in KB of SLM
