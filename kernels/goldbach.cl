@@ -3244,7 +3244,8 @@ __kernel void mt_build(__global u32* restrict tab, const u32 nblocks, const u32 
 #define HL_QO(j) (((j) == nseg - 1u) ? q_odds_tail : q_odds_full)
 /// hl_harvest with the prime-multiplier filter (HL_MT): files only hits p m
 /// with m prime (see above); no residue skip sets needed (m prime has none).
-/// @pre    as hl_harvest; mt from mt_build covering every multiplier of the
+/// @pre    as hl_harvest, and the list buffer below 2^32 bytes (host-checked:
+///         K * groups * capg * 4 < 2^32); mt from mt_build covering every multiplier of the
 ///         batch window (blocks [k_lo, k_lo + mt_words / 180)); else *err |= 32.
 /// @post   as hl_harvest, restricted to the hits with m prime.
 __kernel void hl_harvest_mt(
@@ -3268,6 +3269,11 @@ __kernel void hl_harvest_mt(
     barrier(CLK_LOCAL_MEM_FENCE);
     const u64 wend = (u64)(nseg - 1u) * delta + q_odds_tail;   // window [0, wend) in bits
     const ff_x qfs = ff_split(q_first);                         // uniform
+    // region (j, grp) starts at entry j * rstride + grp * capg: 32-bit index
+    // math (the host keeps the whole list buffer below 2^32 bytes), not the
+    // ~30-instruction emulated 64-bit multiply per hit store
+    const u32 rstride = ngrp * capg;
+    __global u32* restrict lg = lists + grp * capg;
     // balanced regions: HL_BAL-prime chunks dealt round-robin to the groups
     // (chunk c to group c mod ngrp), so every region sees the same mix of
     // prime sizes (with whole 1024-prime blocks the low groups of the first
@@ -3393,11 +3399,11 @@ __kernel void hl_harvest_mt(
                     const u32 off = (u32)o;
                     if (j < nseg && off < HL_QO(j)) {
                         const u32 idx = atomic_inc(&lpos[j]);
-                        if (idx < capg) lists[((size_t)j * ngrp + grp) * capg + idx] = off;
+                        if (idx < capg) lg[j * rstride + idx] = off;
                     }
                     if (j >= 1u && j - 1u < nseg && off + delta < HL_QO(j - 1u)) {
                         const u32 idx = atomic_inc(&lpos[j - 1u]);
-                        if (idx < capg) lists[((size_t)(j - 1u) * ngrp + grp) * capg + idx] = off + delta;
+                        if (idx < capg) lg[(j - 1u) * rstride + idx] = off + delta;
                     }
                 }
                 if (!word) {
