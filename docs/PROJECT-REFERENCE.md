@@ -82,7 +82,7 @@ goldbach-l0/
 │   └── sparse.hpp, sparse_run.hpp   sparse class map geometry, plan, engine
 ├── src/
 │   ├── main.cpp            CLI + human / --csv / --json / --per-seg output
-│   ├── l0_context.cpp      Context (immediate in-order list), Module, Kernel
+│   ├── l0_context.cpp      gpu_devices (zeInitDrivers), Context (immediate in-order list), Module, Kernel
 │   ├── primes.cpp          segmented sieve, GBP2 (hashed) cache, masks, Miller-Rabin, CPU fallback search
 │   ├── verifier.cpp        run_gpu (dense pipeline: RunSetup / DenseRun phases), verify_cpu, device info
 │   ├── host_math.cpp       pure host math of the dense pipeline (geometry, tables, reciprocals)
@@ -527,7 +527,11 @@ the design record.
   scattered atomics over the 15.6 MB map then ran 15-200% slower depending
   on placement (one pipeline slot was consistently ~55% slower; this is
   the likely root of the old "bimodal slow mode"). Rounded: large_s -30%
-  and a tight run-to-run band. `ZE_CHECK` throws on any non-SUCCESS result. Context
+  and a tight run-to-run band. `ZE_CHECK` throws on any non-SUCCESS result,
+  with the driver's own text (`zeDriverGetLastErrorDescription`) appended
+  when it has one. `gpu_devices()` initializes with `zeInitDrivers` (GPU
+  drivers; `zeInit` is deprecated since API 1.10), checks every call and
+  serves both Context and `--info`. Context
   picks the first GPU device; the immediate command list is created with
   `ZE_COMMAND_QUEUE_FLAG_IN_ORDER` — comment: LOAD-BEARING for
   correctness (kernels share buffers across launches without event
@@ -540,7 +544,7 @@ the design record.
   (ceil(2^64/p); shift search validated up to 2^33; s>32 -> fallback),
   `stage_upload` (shared staging + copy; host_sync before free is
   LOAD-BEARING — without it the first segment races the uploads and the
-  device is LOST), `SlotEvents` (timing events, one pool each,
+  device is LOST), `SlotEvents` (timing events, one pool of 22,
   HOST_VISIBLE | KERNEL_TIMESTAMP), `resolve_leftovers` (Miller-Rabin
   fallback; throws on an index outside the segment or a real
   counterexample), `parallel_for`.

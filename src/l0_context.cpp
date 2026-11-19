@@ -2,6 +2,7 @@
 #include "l0_context.hpp"
 #include "env.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -16,18 +17,89 @@ namespace gb {
 std::string ze_result_string(ze_result_t r) {
     switch (r) {
     case ZE_RESULT_SUCCESS: return "success";
+    case ZE_RESULT_NOT_READY: return "not ready";
     case ZE_RESULT_ERROR_DEVICE_LOST: return "device lost";
     case ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY: return "out of host memory";
     case ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY: return "out of device memory";
-    case ZE_RESULT_ERROR_INVALID_ARGUMENT: return "invalid argument";
-    case ZE_RESULT_ERROR_INVALID_NULL_POINTER: return "invalid null pointer";
-    case ZE_RESULT_ERROR_UNINITIALIZED: return "uninitialized";
-    case ZE_RESULT_ERROR_UNSUPPORTED_FEATURE: return "unsupported feature";
     case ZE_RESULT_ERROR_MODULE_BUILD_FAILURE: return "module build failure";
-    case ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX: return "invalid kernel arg index";
+    case ZE_RESULT_ERROR_MODULE_LINK_FAILURE: return "module link failure";
+    case ZE_RESULT_ERROR_DEVICE_REQUIRES_RESET: return "device requires reset";
+    case ZE_RESULT_ERROR_DEVICE_IN_LOW_POWER_STATE: return "device in low power state";
+    case ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS: return "insufficient permissions";
+    case ZE_RESULT_ERROR_NOT_AVAILABLE: return "not available";
+    case ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE: return "dependency unavailable";
+    case ZE_RESULT_ERROR_UNINITIALIZED: return "uninitialized";
+    case ZE_RESULT_ERROR_UNSUPPORTED_VERSION: return "unsupported version";
+    case ZE_RESULT_ERROR_UNSUPPORTED_FEATURE: return "unsupported feature";
+    case ZE_RESULT_ERROR_INVALID_ARGUMENT: return "invalid argument";
+    case ZE_RESULT_ERROR_INVALID_NULL_HANDLE: return "invalid null handle";
+    case ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE: return "handle object in use";
+    case ZE_RESULT_ERROR_INVALID_NULL_POINTER: return "invalid null pointer";
     case ZE_RESULT_ERROR_INVALID_SIZE: return "invalid size";
+    case ZE_RESULT_ERROR_UNSUPPORTED_SIZE: return "unsupported size";
+    case ZE_RESULT_ERROR_UNSUPPORTED_ALIGNMENT: return "unsupported alignment";
+    case ZE_RESULT_ERROR_INVALID_SYNCHRONIZATION_OBJECT: return "invalid synchronization object";
+    case ZE_RESULT_ERROR_INVALID_ENUMERATION: return "invalid enumeration";
+    case ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION: return "unsupported enumeration";
+    case ZE_RESULT_ERROR_INVALID_NATIVE_BINARY: return "invalid native binary";
+    case ZE_RESULT_ERROR_INVALID_GLOBAL_NAME: return "invalid global name";
+    case ZE_RESULT_ERROR_INVALID_KERNEL_NAME: return "invalid kernel name";
+    case ZE_RESULT_ERROR_INVALID_FUNCTION_NAME: return "invalid function name";
+    case ZE_RESULT_ERROR_INVALID_GROUP_SIZE_DIMENSION: return "invalid group size dimension";
+    case ZE_RESULT_ERROR_INVALID_GLOBAL_WIDTH_DIMENSION: return "invalid global width dimension";
+    case ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX: return "invalid kernel arg index";
+    case ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_SIZE: return "invalid kernel arg size";
+    case ZE_RESULT_ERROR_INVALID_KERNEL_ATTRIBUTE_VALUE: return "invalid kernel attribute value";
+    case ZE_RESULT_ERROR_INVALID_MODULE_UNLINKED: return "module unlinked";
+    case ZE_RESULT_ERROR_INVALID_COMMAND_LIST_TYPE: return "invalid command list type";
+    case ZE_RESULT_ERROR_OVERLAPPING_REGIONS: return "overlapping regions";
+    case ZE_RESULT_ERROR_UNKNOWN: return "unknown error";
     default: return "error " + std::to_string(std::to_underlying(r));
     }
+}
+
+// Driver asked for the text of a failure: the first GPU's (set by
+// gpu_devices). Atomic: ZE_CHECK runs on the host worker threads too.
+static std::atomic<ze_driver_handle_t> g_error_driver{nullptr};
+
+std::string ze_failure(const char* call, ze_result_t r) {
+    std::string msg = std::string(call) + " failed: " + ze_result_string(r);
+    if (ze_driver_handle_t d = g_error_driver.load(std::memory_order_relaxed)) {
+        const char* desc = nullptr;
+        if (zeDriverGetLastErrorDescription(d, &desc) == ZE_RESULT_SUCCESS && desc && *desc)
+            msg += std::string(" (driver: ") + desc + ")";
+    }
+    return msg;
+}
+
+std::vector<Gpu> gpu_devices() {
+    ze_init_driver_type_desc_t idesc{};
+    idesc.stype = ZE_STRUCTURE_TYPE_INIT_DRIVER_TYPE_DESC;
+    idesc.flags = ZE_INIT_DRIVER_TYPE_FLAG_GPU;
+    uint32_t nd = 0;
+    ZE_CHECK(zeInitDrivers(&nd, nullptr, &idesc));
+    if (nd == 0) throw std::runtime_error("no Level Zero GPU driver found");
+    std::vector<ze_driver_handle_t> drivers(nd);
+    ZE_CHECK(zeInitDrivers(&nd, drivers.data(), &idesc));
+    drivers.resize(nd);
+
+    std::vector<Gpu> gpus;
+    for (ze_driver_handle_t d : drivers) {
+        uint32_t nv = 0;
+        ZE_CHECK(zeDeviceGet(d, &nv, nullptr));
+        std::vector<ze_device_handle_t> devs(nv);
+        ZE_CHECK(zeDeviceGet(d, &nv, devs.data()));
+        devs.resize(nv);
+        for (ze_device_handle_t dev : devs) {
+            ze_device_properties_t props{};
+            props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+            ZE_CHECK(zeDeviceGetProperties(dev, &props));
+            if (props.type == ZE_DEVICE_TYPE_GPU) gpus.push_back({d, dev});
+        }
+    }
+    if (gpus.empty()) throw std::runtime_error("no GPU device reported by Level Zero");
+    g_error_driver.store(gpus.front().driver, std::memory_order_relaxed);
+    return gpus;
 }
 
 std::optional<ze_kernel_timestamp_data_t> kernel_ticks(ze_event_handle_t ev) {
@@ -81,33 +153,9 @@ static void sched_setup() {
 }
 
 Context::Context(bool unordered) {
-    ZE_CHECK(zeInit(ZE_INIT_FLAG_GPU_ONLY));
-
-    uint32_t driver_count = 0;
-    ZE_CHECK(zeDriverGet(&driver_count, nullptr));
-    if (driver_count == 0) throw std::runtime_error("no Level Zero driver found");
-    std::vector<ze_driver_handle_t> drivers(driver_count);
-    ZE_CHECK(zeDriverGet(&driver_count, drivers.data()));
-
-    // Pick the first driver that has a GPU device.
-    for (ze_driver_handle_t d : drivers) {
-        uint32_t dev_count = 0;
-        if (zeDeviceGet(d, &dev_count, nullptr) != ZE_RESULT_SUCCESS || dev_count == 0) continue;
-        std::vector<ze_device_handle_t> devs(dev_count);
-        ZE_CHECK(zeDeviceGet(d, &dev_count, devs.data()));
-        for (ze_device_handle_t dev : devs) {
-            ze_device_properties_t props{};
-            props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-            ZE_CHECK(zeDeviceGetProperties(dev, &props));
-            if (props.type == ZE_DEVICE_TYPE_GPU) {
-                driver_ = d;
-                device_ = dev;
-                break;
-            }
-        }
-        if (device_) break;
-    }
-    if (!device_) throw std::runtime_error("no GPU device found");
+    const Gpu gpu = gpu_devices().front();
+    driver_ = gpu.driver;
+    device_ = gpu.device;
 
     sched_setup();
     // GB_UNORDERED=0: in-order list (dense pipeline only). Read before any Level Zero object is

@@ -8,14 +8,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <ze_api.h>
 
 #define ZE_CHECK(call)                                                        \
     do {                                                                      \
         ze_result_t _r = (call);                                              \
         if (_r != ZE_RESULT_SUCCESS) {                                        \
-            throw std::runtime_error(std::string(#call) + " failed: " +       \
-                                     gb::ze_result_string(_r));               \
+            throw std::runtime_error(gb::ze_failure(#call, _r));              \
         }                                                                     \
     } while (0)
 
@@ -26,13 +26,31 @@ namespace gb {
 /// @return   a short description, or "error <n>" for unlisted codes.
 std::string ze_result_string(ze_result_t r);
 
+/// The message ZE_CHECK throws: "<call> failed: <result>", plus the driver's
+/// own description of the failure (zeDriverGetLastErrorDescription) when the
+/// driver has one — e.g. which argument was rejected or why the device was
+/// lost. Never throws itself.
+std::string ze_failure(const char* call, ze_result_t r);
+
+/// One Level Zero GPU: its driver and device handle.
+struct Gpu {
+    ze_driver_handle_t driver = nullptr;
+    ze_device_handle_t device = nullptr;
+};
+
+/// Initializes Level Zero for GPU drivers (zeInitDrivers; zeInit is
+/// deprecated since API 1.10) and lists every GPU device, in driver order.
+/// Every call is checked. Safe to call more than once.
+/// @post  the first GPU's driver is the one ze_failure() asks for error text.
+/// @throws std::runtime_error if initialization fails or no GPU exists.
+std::vector<Gpu> gpu_devices();
+
 /// Device + context + in-order immediate command list for the first Level
 /// Zero GPU. Arc B-Series supports immediate command lists; that is the mode
 /// we use. Non-copyable; destroys the list and context on destruction.
 class Context {
 public:
-    /// Initializes Level Zero and binds the first GPU device of the first
-    /// driver that has one.
+    /// Initializes Level Zero and binds the first GPU of gpu_devices().
     /// @param unordered  create the list without IN_ORDER (dense pipeline
     ///        only, which then orders every launch by a barrier; sets
     ///        g_unordered). Other callers rely on in-order fills / copies.
