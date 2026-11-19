@@ -12,8 +12,8 @@ name: Version figures
 
 on:
   push:
-    branches: [main, ci/version-figures]   # BOOTSTRAP: the branch entry is removed after the first run
-    paths: [include/config.hpp, .github/workflows/version-figures.yml]
+    branches: [main]
+    paths: [include/config.hpp]
   workflow_dispatch:
     inputs:
       versions:
