@@ -2527,8 +2527,11 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 ///         gt = every gap >= G30T_TAIL but the one into the segment's first
 ///         prime (count, flags, (upper pos, g) pairs; bit-parallel test);
 ///         walk: hist[i] += gaps g = 2 i between consecutive counted primes
-///         (bin G30_HBINS - 1: g >= 2 G30_HBINS - 2), hist[0] += the counted
-///         primes without a counted predecessor (the segment's first only),
+///         in different blocks of 30 (bin G30_HBINS - 1: g >= 2 G30_HBINS -
+///         2), hist[G30_HBINS + i] += internal gaps g = 2 i (consecutive
+///         counted primes inside one block of 30, i in 1..14), hist[0]
+///         += the counted primes without a counted predecessor (the
+///         segment's first only),
 ///         part[group] = max(g << 32 | ~(upper pos)) of the group's gaps (0:
 ///         none). The map is unchanged. Exactness vs stats_ref: §9.2l.
 #define C30_CW 2                 // words per lane (host: cw32 % C30_CW == 0; 8: slower)
@@ -2552,21 +2555,46 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 #define G30_CBINS 64u
 #define G30_LH (G30_HBINS + (G30_SIMD - 1u) * G30_CBINS)
 // Block walk (2026-11-18): one loop iteration per non-empty block of 30
-// instead of per prime. The gap into the block's first prime is binned as
-// before; a block with two or more primes adds one count to its pattern bin
-// (256, after the histogram: hist[G30_HBINS + x]) and the host adds the
-// pattern's internal gaps (fixed by the segment's phases). Pattern index of
-// the slot nibble mask m (slot s at bit 4 s): bits s0 s4 s1 s5 s2 s6 s3 s7.
+// instead of per prime; the gap into the block's first prime is binned as
+// before. The internal gaps (consecutive primes inside one block of 30) are
+// counted bit-parallel per word (2026-11-19; was one SLM atomic per block
+// with two or more primes, ~1.4% of the run): for the slots a < b in phase
+// order, popcount(blocks with primes in a and b and none in between). The
+// phase order is the class order rotated by r0 (uniform), so in each of the
+// 8 static copies the gap of a slot pair is a constant: g / 2 = (res_b -
+// res_a) mod 30 / 2 in 1..14, binned at hist[G30_HBINS + g / 2].
 // The walk maximum covers the gaps into blocks only (an internal gap is
 // < 30; the host settles a segment whose largest such gap is not larger
 // than the largest internal one: a per-block table lookup cost the walk its
 // gain).
-#define G30_PBINS 256u
-inline u32 g30_pat(const u32 m)
+#define G30_PBINS 16u
+// Internal-gap counts per lane: 16-bit fields (g / 2 = d at word (d - 1) / 2,
+// bits 16 ((d - 1) & 1)); a pass adds at most 7 * 32 * C30_CW (7 pairs per
+// block), so a lane flushes them every G30_PFLUSH passes (448 * 128 < 2^16)
+// and at the end.
+#define G30_NPW 7u
+#define G30_PFLUSH 128u
+#define G30_RES {1u, 7u, 11u, 13u, 17u, 19u, 23u, 29u}   // class residues mod 30 (host CLASS_RES30)
+/// Internal-gap counts of word i (count30 walk), phase order = classes rotated by R.
+#define G30_PAIRS(R) do { \
+    const u32 res_[8] = G30_RES; \
+    _Pragma("unroll") for (u32 a_ = 0; a_ < 7u; ++a_) { \
+        u32 E_ = v[((R) + a_) & 7u][i]; \
+        _Pragma("unroll") for (u32 b_ = a_ + 1u; b_ < 8u; ++b_) { \
+            const u32 Pb_ = v[((R) + b_) & 7u][i]; \
+            const u32 d_ = ((res_[((R) + b_) & 7u] + 30u - res_[((R) + a_) & 7u]) % 30u) >> 1; \
+            pc[(d_ - 1u) >> 1] += popcount(E_ & Pb_) << (16u * ((d_ - 1u) & 1u)); \
+            E_ &= ~Pb_; \
+        } \
+    } } while (0)
+/// Adds this lane's packed internal-gap counts pc to the bins ph (SLM atomics, nonzero only).
+inline void g30_pairs_flush(__local u32* ph, const u32* pc)
 {
-    u32 x = (m | (m >> 15)) & 0x3333u;
-    x = (x | (x >> 2)) & 0x0F0Fu;
-    return (x | (x >> 4)) & 0xFFu;
+    #pragma unroll
+    for (u32 d = 1; d <= 2u * G30_NPW; ++d) {
+        const u32 c = (pc[(d - 1u) >> 1] >> (16u * ((d - 1u) & 1u))) & 0xFFFFu;
+        if (c) atomic_add(&ph[d], c);
+    }
 }
 inline void gap_tail_exact(__global const u32* restrict cmap32, const u32 cw32, __global const u32* restrict lim,
                            const u32 ord, const u32 phis, const u32 pos_lo, const u32 tb,
@@ -2626,7 +2654,7 @@ __kernel void count30(
         __global u32* restrict hist)
 {
     __local u32 sh[13];
-    __local u32 lh[G30_LH + G30_PBINS];      // + pattern bins
+    __local u32 lh[G30_LH + G30_PBINS];      // + internal-gap pair bins
     __local u64 red[G30_MAX_SG];
     const u32 lid = get_local_id(0);
     if (lid < 13u) sh[lid] = lid == 11u ? ~0u : 0u;
@@ -2636,12 +2664,16 @@ __kernel void count30(
     u32 ph[8];                                // phi of class c: its half offset in a block of 30
     #pragma unroll
     for (u32 c = 0; c < 8; ++c) ph[c] = (phic >> (4u * c)) & 15u;
-    u32 ncl[8], ntw[3];
+    u32 ncl[4], ntw[3];                       // ncl: class prime counts, 16-bit fields (class c at c / 2)
     #pragma unroll
-    for (u32 c = 0; c < 8; ++c) ncl[c] = 0u;
+    for (u32 c = 0; c < 4; ++c) ncl[c] = 0u;
     ntw[0] = ntw[1] = ntw[2] = 0u;
     u32 pfirst = ~0u, plast = 0u;             // the lane's first / last counted prime position
     u32 err = 0u, dmax = 0u, dpos = 0u;       // walk: flags, largest gap / 2 and its upper h
+    u32 pc[G30_NPW];                          // walk: internal-gap counts by g / 2 (16-bit fields)
+    #pragma unroll
+    for (u32 k = 0; k < G30_NPW; ++k) pc[k] = 0u;
+    u32 npass = 0u;
     const u32 nlanes = cw32 / C30_CW;
     const u32 scol = get_sub_group_local_id();   // < G30_SIMD: one column per lane
     const u32 gcol = scol ? G30_HBINS + (scol - 1u) * G30_CBINS : 0u;   // my column of low bins
@@ -2687,7 +2719,7 @@ __kernel void count30(
             for (u32 i = 0; i < C30_CW; ++i) {
                 const u32 m = v[c][i] & range_mask32(w + i, lo, hi);
                 v[c][i] = m;
-                ncl[c] += popcount(m);
+                ncl[c >> 1] += popcount(m) << (16u * (c & 1u));
                 any[i] |= m;
                 if (tcap && m) {
                     const u32 b0 = 30u * 32u * (w + i) + 2u * ph[c];
@@ -2747,6 +2779,18 @@ __kernel void count30(
             const u32 r0 = ord & 15u;
             #pragma unroll
             for (u32 i = 0; i < C30_CW; ++i) {
+                // internal gaps (see G30_PAIRS): one static copy per
+                // rotation r0 (uniform)
+                switch (r0) {
+                case 0: G30_PAIRS(0u); break;
+                case 1: G30_PAIRS(1u); break;
+                case 2: G30_PAIRS(2u); break;
+                case 3: G30_PAIRS(3u); break;
+                case 4: G30_PAIRS(4u); break;
+                case 5: G30_PAIRS(5u); break;
+                case 6: G30_PAIRS(6u); break;
+                default: G30_PAIRS(7u); break;
+                }
                 u32 W[8];
                 #pragma unroll
                 for (u32 c = 0; c < 8; ++c) W[c] = v[c][i];
@@ -2783,15 +2827,27 @@ __kernel void count30(
                     hp = hb + ((phis >> (31u - clz(m))) & 15u);
                     atomic_inc(&lh[d < G30_CBINS ? gcol + d : min(d, G30_HBINS - 1u)]);
                     if (d > dmax) { dmax = d; dpos = h; }
-                    if (m & (m - 1u))                   // internal gaps: the pattern bin
-                        atomic_inc(&lh[G30_LH + g30_pat(m)]);
                 }
             }
+        }
+        // the 16-bit fields (ncl: at most 32 C30_CW per pass) before they can overflow
+        if (++npass == G30_PFLUSH) {
+            if (walk) g30_pairs_flush(lh + G30_LH, pc);
+            #pragma unroll
+            for (u32 c = 0; c < 8; ++c) {
+                const u32 x = (ncl[c >> 1] >> (16u * (c & 1u))) & 0xFFFFu;
+                if (x) atomic_add(&sh[c], x);
+            }
+            #pragma unroll
+            for (u32 k = 0; k < G30_NPW; ++k) pc[k] = 0u;
+            #pragma unroll
+            for (u32 c = 0; c < 4; ++c) ncl[c] = 0u;
+            npass = 0u;
         }
     }
     #pragma unroll
     for (u32 c = 0; c < 8; ++c) {
-        const u32 s = sub_group_reduce_add(ncl[c]);
+        const u32 s = sub_group_reduce_add((ncl[c >> 1] >> (16u * (c & 1u))) & 0xFFFFu);
         if (get_sub_group_local_id() == 0 && s) atomic_add(&sh[c], s);
     }
     #pragma unroll
@@ -2809,6 +2865,11 @@ __kernel void count30(
     }
     if (walk) {
         if (err) atomic_or(gt + 1, err);
+        #pragma unroll                          // internal gaps: one SLM add per sub-group
+        for (u32 d = 1; d <= 2u * G30_NPW; ++d) {
+            const u32 c = sub_group_reduce_add((pc[(d - 1u) >> 1] >> (16u * ((d - 1u) & 1u))) & 0xFFFFu);
+            if (get_sub_group_local_id() == 0 && c) atomic_add(&lh[G30_LH + d], c);
+        }
         const u64 mx = sub_group_reduce_max(dmax ? ((u64)(2u * dmax) << 32) | (u64)(~(2u * dpos)) : (u64)0);
         if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = mx;
     }
