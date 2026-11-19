@@ -572,7 +572,7 @@ void RunSetup::resolve_range() {
     if (limit < 4) throw std::runtime_error("limit < 4: no even n >= 4 to verify");
     // Knobs of the checkers and map layouts removed in v2.6 are refused, not
     // ignored: a run asking for one would otherwise silently run something else.
-    for (const char* gone : {"GB_SPLIT", "GB_SPLIT_CAP", "GB_SPLIT_STAGES", "GB_TWIN_CAP", "GB_C30",
+    for (const char* gone : {"GB_SPLIT", "GB_SPLIT_CAP", "GB_SPLIT_STAGES", "GB_TWIN", "GB_TWIN_CAP", "GB_C30",
                              "GB_CLASSMAP", "GB_HITLIST", "GB_MASK_GROUPS"})
         if (env::present(gone))
             throw std::runtime_error(std::string(gone) + " was removed in v2.6 (the mod-30 map and "
@@ -672,20 +672,13 @@ void RunSetup::load_base_primes() {
     // 34K -0.11%, 36K -0.11% (long-end -0.06%), 38K 0.0%, 42K +0.27% -> 36K.
     // v2.6 mid-prime SLM windows (HISTORY.md §9.2x): primes [split, GB_MIDWIN)
     // go to mid_window, and the auto split drops to MIDWIN_SPLIT (2026-11-17
-    // grid: split 800..3500 x bound 2..4M within 0.3%). They need the mod-30
-    // class map (the twin and split checkers on, GB_CLASSMAP default),
+    // grid: split 800..3500 x bound 2..4M within 0.3%). They need
     // q >= 2^60 (mod_ff) and class arrays < 2^24 bits (exact float
     // remainders); otherwise the old split. GB_MIDWIN=0 disables.
     midwin_p2 = env::u64("GB_MIDWIN", MIDWIN_P2_DEFAULT, 0, UINT32_MAX);
     {
-        const auto is = [](const char* k, const char* v) {
-            const char* e = env::raw(k);
-            return e && std::string(e) == v;
-        };
         const uint64_t qof_est = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
-        midwin_pre = midwin_p2 > 0 && !is("GB_TWIN", "0") && !is("GB_SPLIT", "0") &&
-                     !is("GB_CLASSMAP", "0") && !is("GB_CLASSMAP", "6") &&
-                     start_even >= (uint64_t(1) << 60) + MAX_GB_PRIME + 2 &&
+        midwin_pre = midwin_p2 > 0 && start_even >= (uint64_t(1) << 60) + MAX_GB_PRIME + 2 &&
                      (qof_est + 14) / 15 < (uint64_t(1) << 24);
     }
     if (sieve_split == 0 || sieve_split > sieve_count)

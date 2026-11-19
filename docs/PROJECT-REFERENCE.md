@@ -151,7 +151,7 @@ A_W64 8 / 10 / 14 / 16 windows, and the timing-only ablations (ABL_*,
 LARGE_NOMARK; sparse.cl ABLL_* / ABL3_* / ABL_NOPEND). The host's GB_WHEEL_W
 and GB_BUCKET_WHEEL (usable only with such a rebuilt module) went with them,
 as did the run-time switches that only restored a superseded path or served
-one measurement: GB_TWIN=0 (plain v1.9.0 checker; CHECK_PHASE_A_CANDS /
+one measurement: GB_TWIN=0 (plain v1.9.0 checker, refused since 2026-11-19; CHECK_PHASE_A_CANDS /
 GB_CHECK_CAP with it), GB_HL_FUSE=0, GB_UPLOAD_STAGED, GB_BUCKET_RESET_BARRIER,
 GB_WRITE_CHECKED and GB_CHECK_NCAND. Host-mirrored kernel constants without a
 host override (WG_SIZE, WORDS_PER_ITEM, LARGE_PRIMES_PER_ITEM, MASK_MAX_P,
