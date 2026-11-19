@@ -1,7 +1,7 @@
 <h1 align="center">goldbach-l0</h1>
 
 <p align="center">
-  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 69.6 billion even numbers per second on one B580.</b><br>
+  <b>A Level Zero Goldbach verifier for Intel Arc GPUs: 132 billion even numbers per second on one B580.</b><br>
   <a href="https://goldbach.net01.io">Live campaign</a> ·
   <a href="docs/CORRECTNESS.md">Correctness</a> ·
   <a href="docs/BENCHMARKING.md">Benchmarks</a> ·
@@ -22,15 +22,17 @@ compiled to SPIR-V and a C++23 host. It is running a campaign over
 records exact statistics of every even it verifies (smallest Goldbach
 primes, prime and twin-prime counts, prime gaps).
 
-**v2.6.0: 69.6 billion even numbers per second** at 4×10¹⁸ (68.9 G at the
-top of the range, 2.7 J per 10⁹ evens) with exact statistics and prime gaps
-on — the whole [4×10¹⁸, 5×10¹⁸] in about **83 days** on one B580. (Measured
-on v2.5.1; the v2.6.0 audit changes — positive coverage accounting, the
-unused pipelines removed — matched it bit for bit within +0.03% / +0.12% on
-10¹² windows, 6 paired rounds.) v2.6.0 also adds the **mid-prime SLM
-windows** (+8.4%, HISTORY.md §9.2x) and the lower hit-list threshold that
-goes with them (+1.3%, §9.2y), measured in paired bench.py rounds against
-v2.5.1; the release figure follows from its CI benchmark.
+**v2.7.0: 132 billion even numbers per second** at 4×10¹⁸ (131 G at the
+top of the range, 2.4 J per 10⁹ evens) with exact statistics and prime gaps
+on: **×1.72 / ×1.74 over v2.6.0**, and a full 5×10¹³ production slice in
+**193 s instead of 364 s** (×1.89 over the v2.5.1 release it replaces, with
+byte-identical statistics). The whole [4×10¹⁸, 5×10¹⁸] now takes about
+**45 days** on one B580 (83 days with v2.5.1). The gain comes from six
+rounds of kernel work (HISTORY.md §9.2ab), the largest being the
+**prime-multiplier hit lists**: for a prime `p ≥ ∛q` a mark `p·m` matters
+only when `m` is prime, which removes ~77% of the large-prime atomics. The
+rules these fast paths rely on, and where each is checked, are in
+[docs/EXACTNESS.md](docs/EXACTNESS.md).
 
 | Document | Contents |
 |---|---|
@@ -54,26 +56,33 @@ next:
 
 1. **`make_prime_map`** (tile sieve) — the map holds only `q` coprime to 30,
    as eight class arrays (one per residue mod 30); one work-group sieves one
-   16 KB SLM tile: primes < 64 by whole-word mask tables, primes < 512 by
-   each thread in its own words, primes up to the split (1500)
-   prime-parallel with SLM atomics.
+   16 KB SLM tile: primes up to 79 by whole-word mask tables, the rest up
+   to the split (1500) as work items of ~100 marks with SLM atomics.
 2. **mid-prime windows** (`mid_setup` / `mid_window`) — primes from the
    split to 2.5×10⁶ are sieved in 128 KB SLM windows of each class array,
-   one SLM atomic per mark instead of an L2 atomic.
+   one SLM atomic per mark instead of an L2 atomic; each window is ANDed
+   into the map at the end, so the packed kernel can overlap it.
 3. **`sieve_large_packed`** — primes from 2.5×10⁶ to 2× the segment's odd
    count (~4.3×10⁸), streamed at one byte per prime; a division-free
    float-float modulo finds the first multiple, and only multipliers coprime
    to 30030 are marked (the others are multiples of a prime ≤ 13, already
-   cleared): the **multiplier wheel**.
-4. **hit lists** (`hl_harvest` / `hl_apply`) — the largest primes hit a
-   segment at most once. Every 128 segments one pass finds all their hits in
-   the coming batch and writes each as a 4-byte offset into its segment's
-   list; each segment then streams its list and marks it.
+   cleared): the **multiplier wheel**. Multipliers divisible by 17..43 are
+   skipped too (the mask stage cleared those numbers), and each mark first
+   reads its word and skips the atomic when the bit is already clear.
+4. **prime-multiplier hit lists** (`mt_build` / `hl_harvest_mt` /
+   `hl_apply`) — for a prime `p ≥ ∛q`, a composite multiplier `m` gives a
+   `p·m` that a smaller prime already marks, so only prime `m` matter. A
+   bitmap of prime multipliers is built once at start-up (~0.4 s, 2.7–3.4 GB);
+   every prime above 0.15× the segment's odd count (~35M at 4×10¹⁸) is
+   handled in batches: one pass finds the batch's hits with prime `m` and
+   writes each as a 4-byte offset into its segment's list; each segment
+   then streams its list and marks it.
 5. **`check30_a` / `check30_b`** — evens grouped by `n mod 30`, so for a
    candidate class every `q = n - p` lies in one class array and
    consecutive evens are consecutive bits: 32 evens are tested at once by a
    funnel shift, against several candidates per funnel; phase B probes the
-   ~0.1% left one by one.
+   ~0.1% left, every lane taking the next pending even as soon as it is
+   done, on a small grid beside the next segment's sieve.
 
 Evens the GPU cannot resolve are settled on the CPU by deterministic
 Miller–Rabin. The verifier **fails closed**: any GPU error, buffer
@@ -108,19 +117,25 @@ reference: [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §5–§7.
 
 ## Performance
 
-| Window (bench.py, v2.5.1 vs v2.3.0, 12 paired rounds) | v2.5.1 | v2.3.0 | change |
+| Window (bench.py, 5 paired rounds) | v2.7.0 | v2.6.0 | change |
 |---|---|---|---|
-| long — 10¹¹ at 4×10¹⁸ | **69.61 G evens/s** | 64.30 G | +8.24% |
-| long-end — 10¹¹ ending at 5×10¹⁸ | **68.87 G** | 63.38 G | +8.52% |
+| long — 10¹¹ at 4×10¹⁸ | **132.22 G evens/s** | 76.66 G | **+72.45%** (±0.12%) |
+| long-end — 10¹¹ ending at 5×10¹⁸ | **131.37 G** | 75.67 G | **+73.61%** (±0.07%) |
 
-Measured 2026-11-16 with production's release binary and configuration
-(exact statistics including the exact prime-gap walk, `GB_BUCKET_VERIFY=500`),
-each version at its own default segment; the paired 95% intervals are
-±0.12% and ±0.19%. v2.3.0 recorded no prime gaps: v2.5.1 is faster while
-doing that extra work. Per 10¹¹ integers at 4×10¹⁸: large-prime sieve
-431 ms (packed kernel + hit lists), tile sieve 168 ms, checker and
-statistics 175 ms; the next segment's sieve overlaps the checker, so the
-parts add up to more than the 718 ms GPU time. The history of every version and
+| Full production slice (5×10¹³ at 4.14065×10¹⁸, `GB_BUCKET_VERIFY=500`, exact gaps) | wall | GPU | init |
+|---|---|---|---|
+| v2.5.1 (release bb3a96f) | 364.1 s | 355.6 s | 8.4 s |
+| **v2.7.0** | **193.0 s** | 192.2 s | 0.7 s |
+
+Measured 2026-11-18/19 with exact statistics including the exact prime-gap
+walk; the slice's `goldbach_stats.state`, `.state.gaps` and ridges are
+byte-identical between the two versions. Per 10¹¹ integers at 4×10¹⁸:
+large-prime sieve 125 ms (was 342 ms in v2.6.0), tile sieve 185 ms,
+checker and statistics 165 ms; the next segment's sieve overlaps the
+checker, so the parts add up to more than the 378 ms GPU time. v2.7.0
+needs ~7 GB of the B580's 12 GB (the prime-multiplier table and the hit
+lists) and ~0.7 s of start-up per process. The figures below are from
+v2.5.1 and earlier. The history of every version and
 every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and
 [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 

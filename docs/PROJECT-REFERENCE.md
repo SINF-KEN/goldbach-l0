@@ -617,6 +617,15 @@ dominated and not comparable.)
 
 ### 13.2 Measured performance
 
+- v2.7.0 (2026-11-18/19, speed rounds 2-7 + cleanup, HISTORY.md §9.2ab/ac):
+  bench.py 5 paired rounds vs v2.6.0 (c3990ea): long **132.22 G** ev/s
+  (76.66, +72.45% ±0.12%), long-end **131.37 G** (75.67, +73.61% ±0.07%);
+  2.41 J per 1e9 evens (long). Per 1e11 at 4e18: large 125 ms, tile sieve
+  185 ms, checker + statistics 165 ms, GPU 378 ms. Full production slice
+  (5e13 at 4.14065e18, `GB_BUCKET_VERIFY=500`, exact gaps): 193.0 s wall vs
+  364.1 s for the v2.5.1 release bb3a96f (x1.886), statistics byte-identical.
+  Full [4e18, 5e18] ~45 days. Device memory ~7 GB (multiplier table 2.7-3.4
+  GB, hit lists <= 3.5e9 B), init ~0.7 s.
 - v2.5.1 (bench.py, 2026-11-16, production's release binary bb3a96f and
   configuration: exact statistics incl. the prime-gap walk,
   `GB_BUCKET_VERIFY=500`; paired against a v2.3.0 build, each at its
@@ -637,6 +646,12 @@ results of later rounds are in each round's §9.2 entry there.
 
 
 ### 13.3 Bottleneck profile (why the large sieve is closed on one B580)
+
+> Historical (pre-v2): the conclusion below no longer holds. v2.7.0 cut the
+> marks themselves instead of making them faster: the prime-multiplier hit
+> lists, the 17..43 skip and read-before-mark took the large stage from 342
+> to 125 ms per 1e11 (HISTORY.md §9.2ab). The GPU time is now split about
+> evenly between the tile sieve, the large stage and the checker.
 
 sieve_large_primes runs at ~90% of the ~14.45 G marks/s scattered-32-bit-
 RMW issue ceiling (~142M atomic marks per 125M-even segment). Exact CPU

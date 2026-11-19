@@ -1338,7 +1338,7 @@ project's claims instead of reading them. What it changed:
   independently in ~5.7 days.
 
 --------------------------------------------------------------------------
-### 9.2ab Speed rounds 2-7 (PRs #34, #29-#33, 2026-11-18/19): +72.5% / +73.6%
+### 9.2ab Speed rounds 2-7 (PRs #34, #29-#33, 2026-11-18/19, v2.7.0): +72.5% / +73.6%
 Six stacked PRs on v2.6.0 (c3990ea), one per round, each exact against v2.6
 main on 1e11 at 4e18 with `GB_BUCKET_VERIFY` (stats.state, stats.state.gaps,
 ridges, stats.log except times byte-identical). The gains are cumulative,
@@ -1364,7 +1364,7 @@ the same rounds on the pre-v2.6 base; ~0.7 % of that is v2.6's coverage
 atomic in check30_a, kept on purpose. The rules these paths rely on are in
 docs/EXACTNESS.md.
 
-### 9.2ac Cleanup after the speed rounds (2026-11-19)
+### 9.2ac Cleanup after the speed rounds (2026-11-19, v2.7.0)
 The rounds left their A/B switches and losing variants behind:
 kernels/goldbach.cl + src/verifier.cpp grew from ~5,160 to ~8,700 lines, the
 kernel from 18 to 115 `#if` branches, and the GB_* knobs from 61 to 76 (as

@@ -50,9 +50,10 @@ flowchart TD
     %% ================= GPU =================
     subgraph GPU["GPU kernels, enqueued in order (Intel Arc, Level Zero)"]
         G1["make_prime_map<br/>SLM tile sieve: small-prime masks + medium primes<br/>writes the class-map bits: 1 = prime candidate q"]
-        G2["Every 128th segment: hl_harvest<br/>each hit-list prime's hits in the next 128 segments<br/>→ per-segment u32 offset lists (overflow → bkt_err)"]
+        G1b["mid_setup + mid_window<br/>primes split..2.5M in 128 KB SLM windows,<br/>each window ANDed into the class map"]
+        G2["First segment of each batch (K ≈ 149): hl_harvest_mt<br/>hits p·m with m PRIME (multiplier bitmap from mt_build)<br/>of every prime ≥ 0.15 × q_odds in the batch<br/>→ per-segment u32 offset lists (overflow → bkt_err)"]
         G3["hl_apply<br/>streams this segment's list, atomic AND-clear"]
-        G4["sieve_large_packed<br/>one item per packed large prime, atomic AND-clear"]
+        G4["sieve_large_packed<br/>one item per packed large prime; skips m divisible by 3..43<br/>reads the word first, atomic AND-clear only if the bit is set"]
         G5["Every 100th segment: GB_BUCKET_VERIFY<br/>make_prime_map + sieve_large_packed over ALL primes<br/>→ scratch map, map_compare → verify_diff"]
         G6["count30<br/>prime + twin-prime counts"]
         G7{"sampled segment?<br/>every 256th"}
@@ -84,7 +85,7 @@ flowchart TD
     A3s -- no --> A4 --> A5 --> M1
     M1 --> I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8 --> I9 --> P1
     P1 --> P2 --> P3 --> P4 --> P5 --> G1
-    G1 -- barrier --> G2 --> G3 -- barrier --> G4 --> G5 -- barrier --> G6 --> G7
+    G1 -- barrier --> G1b --> G2 --> G3 -- barrier --> G4 --> G5 -- barrier --> G6 --> G7
     G7 -- no --> G8 -- barrier --> G9
     G7 -- yes --> G10
     G9 --> C1

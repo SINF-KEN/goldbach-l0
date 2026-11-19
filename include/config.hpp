@@ -50,7 +50,12 @@ namespace gb {
 // a payload hash ("GBP2"); the twin / class-split checkers, the dense / mod-6
 // maps and the bucket ring are removed (only A/B knobs reached them; those
 // knobs are refused). Results unchanged.
-inline constexpr const char* VERSION = "2.6.0";
+// v2.7.0 (speed rounds 2-7 + cleanup, 2026-11-18/19, HISTORY.md §9.2ab/ac):
+// prime-multiplier hit lists, the 17..43 mark skip, read-before-mark in the
+// packed kernel, the flattened phase B and the rest of the six rounds
+// (x1.72 / x1.74 vs v2.6.0 per 1e11, x1.89 per production slice vs v2.5.1);
+// the A/B switches they left are removed (refused). Results unchanged.
+inline constexpr const char* VERSION = "2.7.0";
 
 // ---- make_prime_map geometry --------------------------------------------
 // One work-group = one tile. SLM holds 64-bit words; one bit represents one
