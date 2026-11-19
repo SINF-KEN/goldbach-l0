@@ -4,7 +4,15 @@ Raw data: [`bench/`](../bench/) — `bench-results.csv` is the append-only
 journal every `tools/bench.py` session writes (one row per run, never
 edited); `bench-20260926-sparse-v2.csv` is the v2.0 sparse session. Figures:
 `bash docs/make-plots.sh` (needs pandas + matplotlib) renders
-`docs/images/` from the journal, one bar per label in `bench/figure-versions`.
+`docs/images/` from the journal, one bar per label in `bench/figure-versions`,
+one figure per pipeline: dense with exact statistics (v2.2+), dense before
+the statistics (v1.x) and sparse (`GB_SPARSE=1`). Each row's `gb_env` column
+(every `GB_*` variable the run saw, written by bench.py) decides a label's
+pipeline; rows from before that column use the legacy list in
+`ci/figure_groups.py` (v2.0.0 and v2.1.0 were benched only on the sparse
+path). A label whose drawn rows mix the two paths stops `make-plots.sh`, and
+`ci/version_bench.py append` refuses sparse rows: bench a sparse arm under its
+own label (e.g. `v2.8.0-sparse`), never under a plain version.
 A new VERSION on main is measured and drawn automatically: the
 `Version figures` workflow (`ci/version_bench.py` + `ci/experiment.py`)
 benchmarks it against the previous version, appends the rows, adds the label,

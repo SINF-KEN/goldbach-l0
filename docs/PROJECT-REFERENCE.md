@@ -646,7 +646,9 @@ dominated and not comparable.)
   Figures: `docs/images/` (regenerate: `bash docs/make-plots.sh`; redrawn
   for every new VERSION by the `Version figures` workflow):
 
-  ![steady window by version](images/waterfall-steady-by-version.png)
+  ![steady window by version, dense with statistics](images/waterfall-steady-stats-by-version.png)
+  ![steady window by version, sparse](images/waterfall-steady-sparse-by-version.png)
+  ![steady window by version, dense before the statistics](images/waterfall-steady-prestats-by-version.png)
   ![current version by window](images/waterfall-current-by-window.png)
 
 Earlier measurements (v1.6.2 – v1.8.0) are in

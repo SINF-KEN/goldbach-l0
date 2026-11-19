@@ -146,7 +146,11 @@ the previous one and opens a pull request). The history of every version and
 every measured change is in [HISTORY.md](docs/HISTORY.md) §9.2 and
 [PROJECT-REFERENCE.md](docs/PROJECT-REFERENCE.md) §13.2; methodology in [BENCHMARKING.md](docs/BENCHMARKING.md).
 
-![Timing waterfall, long window, by version](docs/images/waterfall-long-by-version.png)
+![Timing waterfall, long window, by version (dense path with exact statistics, v2.2+)](docs/images/waterfall-long-stats-by-version.png)
+
+Earlier versions are drawn separately because they ran a different pipeline:
+[dense before the statistics (v1.x)](docs/images/waterfall-long-prestats-by-version.png) and
+[sparse (v2.0.0, v2.1.0, benched with `GB_SPARSE=1` only)](docs/images/waterfall-long-sparse-by-version.png).
 
 ### The sparse path (`--sparse`, opt-in)
 
@@ -161,6 +165,8 @@ second verification: `ci/sparse_crosscheck.sh run` re-verifies the range in
 ~5.7 days while production is stopped (`status` reports what both cover).
 Design and validation:
 [HISTORY.md §9.2k](docs/HISTORY.md#92k-v20--sparse-class-map---sparse-kernelssparsecl-srcsparsecpp-includesparsehpp).
+
+![Timing waterfall, long window, sparse path](docs/images/waterfall-long-sparse-by-version.png)
 
 ## Goldbach ridge tracking (`My Top 30 Largest Goldbach Ridges`)
 
