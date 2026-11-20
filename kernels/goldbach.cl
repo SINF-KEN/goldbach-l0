@@ -2531,7 +2531,7 @@ inline u32 range_mask32(const u32 w, const u32 lo, const u32 hi)
 ///         primes without a counted predecessor (the segment's first only),
 ///         part[group] = max(g << 32 | ~(upper pos)) of the group's gaps (0:
 ///         none). The map is unchanged. Exactness vs stats_ref: §9.2l.
-#define C30_CW 4                 // words per lane (host: cw32 % C30_CW == 0; 8: slower)
+#define C30_CW 2                 // words per lane (host: cw32 % C30_CW == 0; 8: slower)
 // Exact gap of a gap-tail candidate (count30): the prime that opens block tb
 // (lowest phi class with a bit) and the last counted prime before it (look-back
 // up to 2 * 32 blocks: every gap below 2^64 spans fewer). Appends (upper pos,
@@ -2653,9 +2653,9 @@ __kernel void count30(
         #pragma unroll
         for (u32 c = 0; c < 8; ++c) {
             #pragma unroll
-            for (u32 i = 0; i < C30_CW; i += 4) {
-                const uint4 x = vload4(0, cmap32 + (u64)c * cw32 + w + i);
-                v[c][i] = x.s0; v[c][i + 1] = x.s1; v[c][i + 2] = x.s2; v[c][i + 3] = x.s3;
+            for (u32 i = 0; i < C30_CW; i += 2) {
+                const uint2 x = vload2(0, cmap32 + (u64)c * cw32 + w + i);
+                v[c][i] = x.s0; v[c][i + 1] = x.s1;
             }
         }
         // twin pairs 11/13 (classes 2, 3), 17/19 (4, 5), 29/31 (7, 0), on the

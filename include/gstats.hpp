@@ -68,7 +68,7 @@ inline constexpr uint32_t STATS_K_DEFAULT = 64;    // sampled exact phase-A cand
 inline constexpr uint32_t STATS_SAMPLE_DEFAULT = 256;  // every 256th segment: full p(n) histogram (~0.12%)
 inline constexpr uint32_t STATS_KMAX = 128;        // MUST match X_KMAX in goldbach.cl
 inline constexpr uint32_t STATS_XB_SPAN = 32;      // MUST match XB_SPAN in goldbach.cl
-inline constexpr uint32_t COUNT30_CW = 4;          // MUST match C30_CW in goldbach.cl (count30 words per lane)
+inline constexpr uint32_t COUNT30_CW = 2;          // MUST match C30_CW in goldbach.cl (count30 words per lane)
 // prime gaps (count30's tail and walk, the live paper's section 2.2)
 inline constexpr uint32_t GAPS30_TAIL = 700;       // MUST match G30T_TAIL in goldbach.cl
 inline constexpr uint32_t GAPS30_HBINS = 1024;     // MUST match G30_HBINS in goldbach.cl

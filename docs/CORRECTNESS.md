@@ -105,7 +105,7 @@ only that no failure was reported.
 | What | Checks |
 |---|---|
 | `debug_map` (tools) | the complete map (masks + tile + large primes) vs Miller–Rabin on real ranges incl. two full production segments at 4e18 and 5e18 |
-| `GB_BUCKET_VERIFY=1` | every segment's map vs a rebuild with the packed kernel over **all** large primes (hit lists and the ring), word for word |
+| `GB_BUCKET_VERIFY=1` | every segment's map vs a rebuild without hit lists (tile, mid windows, the packed kernel over **all** primes >= the mid-window bound), word for word; `GB_BUCKET_VERIFY_FULL=1` also takes the mid primes through the packed kernel (checks mid_window against other code, ~10x slower) |
 | `debug_check_hi` (tools) | the mod-30 checker vs a per-even reference on random maps in production geometry, incl. the coverage counters; mutations fail |
 | `stats_ref` vs GPU (`gpu_validate.sh`) | exact prime / twin counts, p(n) histogram and first occurrences at 1e12, 4e18, 4.4e18, 5e18, across 2^63 and at 2^64 - 2^40 |
 | local CI per production slice | re-verifies a full slice and checks its prime count against an independent primecount |
