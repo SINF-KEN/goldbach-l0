@@ -73,12 +73,10 @@ struct SegmentGeometry {
 SegmentGeometry segment_geometry(uint64_t seg_start, uint64_t limit,
                                  uint64_t segment_even, uint64_t segment_index);
 
-/// Per-prime first markable bit, SEGMENT-GLOBAL, computed once on the host
-/// (one division per prime per segment — not per tile):
+/// Per-prime first markable bit of the dense map, SEGMENT-GLOBAL (one
+/// division per prime per segment, not per tile):
 ///   fb[j] = bit of max(p*p, first odd multiple of p >= q_first)
-/// The kernel derives each tile's own start from this with the magic
-/// reciprocal, so ALL tiles launch in ONE kernel launch with no per-tile host
-/// work and no per-tile synchronization.
+/// Each tile derives its own start from it, so all tiles run in one launch.
 /// @param sieve_primes  ascending odd primes; the first @p sieve_split are used.
 /// @param q_first,q_last  odd q range of the dense map (bit i <-> q_first + 2i).
 /// @pre   q_first odd, q_first <= q_last.
@@ -87,10 +85,10 @@ std::vector<uint64_t> compute_first_bits(const uint32_t* sieve_primes,
                                          uint32_t sieve_split,
                                          uint64_t q_first, uint64_t q_last);
 
-// Class-map geometry of one segment (class mode; kernels/goldbach.cl
-// map_clear). K = 2 (v1.11.0): arrays for q = 1 / 5 (mod 6), dense bit
-// b = 3t + phi[c]. K = 8 (GB_CLASSMAP=30): arrays for the residues mod 30
-// coprime to 30, dense bit b = 15t + phi[c]. Class c holds q = Q[c] + qmod t.
+// Class-map geometry of one segment (kernels/goldbach.cl map_clear). K = 8
+// (production): arrays for the residues mod 30 coprime to 30, dense bit
+// b = 15t + phi[c]. K = 2 (host tests only): arrays for q = 1 / 5 (mod 6),
+// dense bit b = 3t + phi[c]. Class c holds q = Q[c] + qmod t.
 inline constexpr uint32_t CLASS_RES6[2]  = {1, 5};
 inline constexpr uint32_t CLASS_RES30[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 struct ClassGeo {
@@ -139,15 +137,16 @@ inline constexpr uint64_t COP_INV30 = 208467893;
 
 /// Per-tile first-mark table for the table path (u32, tile-major: row t holds
 /// the tile-local first bit of every prime in tile t, UINT32_MAX = none).
-/// Mirrors the legacy kernel math exactly: tile-local bit of
-/// max(fb, ceil jump from tile start); the per-thread 2048-bit jump happens on
-/// the GPU with 32-bit math. Parallelized over tiles (uniform short rows).
+/// Mirrors the kernel's reciprocal path exactly: tile-local bit of
+/// max(fb, ceil jump from tile start); the jump to a thread's own range
+/// happens on the GPU with 32-bit math. Parallelized over tiles (uniform
+/// short rows).
 /// @param tbl          output, tiles * own_end entries.
 /// @param own_end      row width: the thread-owned primes [0, own_end).
-/// @param fb_all       first bits from compute_first_bits (class mode:
+/// @param fb_all       first bits from compute_first_bits (class map:
 ///                     first_bits_class_range, K * sieve_split entries).
 /// @param magic,shift  reciprocals from build_magic_reciprocals.
-/// @param tpc          class mode: tiles per class (tile t is in class t / tpc);
+/// @param tpc          class map: tiles per class (tile t is in class t / tpc);
 ///                     0 for the dense map.
 /// @pre   own_end <= sieve_split; tiles cover the map (dense) or K * tpc (class);
 ///        tbl has tiles * own_end entries; fb_all from the same segment.
@@ -157,7 +156,7 @@ void build_tile_first_table(uint32_t* tbl, uint32_t tiles, uint32_t sieve_split,
                             uint32_t own_end,
                             const uint64_t* fb_all, const uint64_t* magic,
                             const uint32_t* shift, const uint32_t* sieve_primes,
-                            uint32_t tpc = 0);   // class mode: rows [tpc, 2 tpc) = M5 tiles
+                            uint32_t tpc = 0);
 
 /// Magic reciprocal (floor(2^64 / p) + 1) and the smallest shift s such that
 /// floor(x*magic >> (64+s)) == x/p on a set of probe values up to 2^33 (our
@@ -170,7 +169,7 @@ std::pair<std::vector<uint64_t>, std::vector<uint32_t>>
 build_magic_reciprocals(const uint32_t* sieve_primes, uint32_t sieve_split);
 
 /// 32-bit reciprocals for the tile table path. The kernel jumps from the
-/// tile's first mark to a thread's 2048-bit range: d = my_bit0 - tf is
+/// tile's first mark to a thread's own bit range: d = my_bit0 - tf is
 /// always < BITS_PER_TILE = 2^17, so floor(d/p) is computable with a 32-bit
 /// reciprocal: with s = bit_width(BITS_PER_TILE * p) we have 2^s > BITS_PER_TILE*p,
 /// which makes floor(d*m/2^s) = floor(d/p) exact for every d < BITS_PER_TILE

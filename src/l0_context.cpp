@@ -125,14 +125,14 @@ uint32_t env_grid(const char* name, uint32_t dflt) {
 
 // EU thread arbitration hint for every Kernel: round-robin measured +0.6%
 // over the Xe2 default (stall-based round-robin), oldest-first -0.6%; mixing
-// policies between the kernels of a segment loses (2026-11-15,
-// HISTORY.md §9.2w). GB_SCHED=0 oldest-first, 1 round-robin (default),
+// policies between the kernels of a segment loses (HISTORY.md §9.2w).
+// GB_SCHED=0 oldest-first, 1 round-robin (default),
 // 2 stall-based, off = the driver's default. Parsed once per Context, before
 // any kernel exists. Support is decided by zeKernelSchedulingHintExp itself
 // (Kernel::Kernel), NOT by ze_scheduling_hint_exp_properties_t: the B580
 // driver (26.40) reports no supported hint flags there although it accepts
-// and applies round-robin (+0.6%; gating on the query cost exactly that,
-// 2026-11-15). A policy GB_SCHED asked for must be accepted (else an error);
+// and applies round-robin (gating on the query would lose the +0.6%). A
+// policy GB_SCHED asked for must be accepted (else an error);
 // the default falls back to the driver's arbitration with a warning. The
 // policy in force is reported by sched_policy_name() (run output: sched=).
 static void sched_setup() {
@@ -170,8 +170,8 @@ Context::Context(bool unordered) {
     // Arc B-Series. Kernels appended here go straight toward execution.
     // IN_ORDER is load-bearing for correctness: the pipeline interleaves
     // kernels that share buffers without event dependencies between them
-    // (prep_large_fb -> sieve -> large primes -> check, and the two-slot
-    // buffer reuse across segments). Without the flag, Level Zero gives NO
+    // (sieve -> large primes -> check, and the two-slot buffer reuse across
+    // segments). Without the flag, Level Zero gives NO
     // ordering guarantee between appended commands, and e.g. the tile
     // kernel's whole-word map stores can race the large-prime kernel's
     // atomic ANDs (lost composite marks -> false verification).

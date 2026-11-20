@@ -1,5 +1,5 @@
 // ============================================================================
-// sparse.cl — sparse class map (v2.0, include/sparse.hpp, src/sparse.cpp)
+// sparse.cl — kernels of the sparse path (include/sparse.hpp, src/sparse.cpp)
 //
 // Map: K class arrays; array k bit t <-> q = Q + c_k + M t (M = 2310, K = 8
 // by default; the production module is built with M = 30030, K = 12).
@@ -7,8 +7,9 @@
 //             thread-owned walk, prime-parallel medium stage).
 // scm_large : one pass over every base prime >= split per segment: first
 //             multiple in each class from Q mod p, then marks (global atomics).
-// scm_check_a / scm_check_b : mod-2310 Goldbach check (phase A funnels,
+// scm_check_a / scm_check_b : mod-M Goldbach check (phase A funnels,
 //             phase B probes), see include/sparse.hpp for the geometry.
+// scm_info  : geometry handshake with the host.
 // ============================================================================
 
 typedef ulong u64;
@@ -38,8 +39,7 @@ __constant u32 SCM_RES[SCM_K] = {SCM_RES_LIST};
 // ---------------------------------------------------------------------------
 /// x mod p for 32-bit x: float quotient + exact integer fix-ups (float
 /// precision only bounds the number of fix-up iterations).
-/// @pre    p >= 1 and |x - q p| fits an int for the float estimate q, which
-///         holds for the tile primes here (p < 2^17).
+/// @pre    1 <= p < 2^30 (|x - q p| <= x 2^-23 + p then fits an int).
 /// @return x mod p.
 inline u32 mod32(const u32 x, const u32 p)
 {
@@ -203,12 +203,13 @@ __kernel void scm_tile(
 }
 
 // ---------------------------------------------------------------------------
-// Large primes: x mod p (x < 2^63) — float-float quotient for p < 2^30 (the
-// v1.8.1 FF_MOD math, validated bit-exact by tools/debug_fb), float estimate
-// + two exact u64 refinements above.
+// Large primes: x mod p (x < 2^63). The same float-float quotient as
+// goldbach.cl's mod_ff_q for p < 2^30, a float estimate + two exact u64
+// refinements above.
 // ---------------------------------------------------------------------------
-/// Low 32 bits of the integer value of a non-negative, integer-valued float.
-/// @return (u64)v mod 2^32, without a float -> u64 conversion.
+/// (u64)v mod 2^32 without a float -> u64 conversion.
+/// @pre    v >= 0 and integer-valued (|v| >= 2^23 or exactly integral).
+/// @return the low 32 bits of the integer value of v.
 inline u32 float_int_low32(const float v)
 {
     const u32 b = as_uint(v);
@@ -220,6 +221,7 @@ inline u32 float_int_low32(const float v)
 typedef struct { float xh; float xl; u32 x32; } ff_x;
 /// Float-float split of a uniform dividend for mod_ff (computed once, reused
 /// for every prime).
+/// @pre    x < 2^63.
 /// @return {xh = float(x), xl = float(x - xh), x32 = low 32 bits of x}.
 inline ff_x ff_split(const u64 x)
 {
@@ -230,8 +232,12 @@ inline ff_x ff_split(const u64 x)
     return r;
 }
 /// x mod p from a pre-split dividend (float-float quotient, exact fix-ups).
-/// @pre    x < 2^63 (from ff_split), 1 <= p < 2^30.
-/// @return x mod p (validated bit-exact by tools/debug_fb).
+/// The correction rint(ql), about (x / p) 2^-23, must fit an int: at
+/// x ~ 4e18 every prime 67..251 gives a wrong remainder (goldbach.cl
+/// mod_ff_q, HISTORY.md §9.2z). The default split (131072) keeps every
+/// large prime far above that.
+/// @pre    x < 2^63 (from ff_split); 512 <= p < 2^30 (x / p < 2^53).
+/// @return x mod p, exact.
 inline u32 mod_ff(const ff_x x, const u32 p)
 {
     const float pf = (float)p;
@@ -247,8 +253,8 @@ inline u32 mod_ff(const ff_x x, const u32 p)
     while (r >= (int)p) r -= (int)p;
     return (u32)r;
 }
-/// x mod p for any 1 <= p < 2^32 (two float refinements + exact fix-ups);
-/// the slower fallback of mod_ff for p >= 2^30.
+/// x mod p (two float refinements + exact fix-ups); the slower fallback of
+/// mod_ff for p >= 2^30.
 /// @pre    x < 2^63.
 /// @return x mod p.
 inline u32 mod_big(const u64 x, const u32 p)
@@ -274,7 +280,9 @@ inline u32 mod_big(const u64 x, const u32 p)
 ///         are consecutive items of one packing group (contains a subgroup scan);
 ///         large_count >= 1.
 /// @param pv  out: the item's primes, ascending.
-/// @post   entries at global index >= large_count are garbage: callers skip them.
+/// @post   pv[k] = packed prime item * LARGE_PACK_PPI + k for every index
+///         below large_count; the entries past it are unspecified (callers
+///         skip them).
 inline void decode_large(__global const u32* restrict bases,
                          __global const u32* restrict gaps4,
                          const u32 item, const u32 large_count, u32* pv)
@@ -300,7 +308,6 @@ inline void decode_large(__global const u32* restrict bases,
     }
 }
 
-// p^-1 mod M for p mod M (0 for non-units), host-uploaded.
 // First hit of p in class k (see sparse.hpp): rho = (-Q) mod p is the offset
 // of the first multiple m0 p >= Q; with p = M a + b and b^-1 = inv,
 // delta = ((c_k - rho) * inv) mod M is the smallest m - m0 >= 0 with
@@ -318,7 +325,7 @@ inline void decode_large(__global const u32* restrict bases,
 /// @param invtab      [M] b^-1 mod M for units b, 0 otherwise.
 /// @pre   every large prime p satisfies p < 2^32 - max(M^2, T), so that
 ///        rho + b delta and t + p do not wrap (p < ~3.39e9 for M = 30030,
-///        i.e. limit < ~1.15e19); p does not divide M.
+///        i.e. limit < ~1.15e19); p does not divide M; p >= 512 (mod_ff).
 /// @pre   runs after scm_tile on the same map (in-order list + barrier).
 /// @post  every multiple of a large prime with class index < T is cleared.
 __attribute__((intel_reqd_sub_group_size(LARGE_PACK_SG)))
@@ -365,7 +372,8 @@ __kernel void scm_large(
 }
 
 // ---------------------------------------------------------------------------
-// Checker (mod-2310 form of check30_a / check30_b; include/sparse.hpp).
+// Checker (mod-M form of goldbach.cl's check30_a / check30_b;
+// include/sparse.hpp).
 // ---------------------------------------------------------------------------
 #define SCM_MAXD 4               // largest pattern shift (host-checked)
 /// @return S[w] when 0 <= w < n, else 0 (negative w wraps out of range).
@@ -373,7 +381,7 @@ inline u32 ld_guard(const __global u32* S, const int w, const u32 n)
 {
     return ((u32)w < n) ? S[w] : 0u;
 }
-// Phase A, span windows (v2.0c). Per plan segment ONE window covers every
+// Phase A, span windows. Per plan segment ONE window covers every
 // funnel of the segment (the plan caps a segment's U span at A3_SPAN words):
 // A3_W = A3_WPL + A3_SPAN + 1 words loaded once (vload8), pattern-ORed once
 // (prefix doubling: masks 3 / 7 / 15 / 31 in 1 / 2 / 2 / 3 shift-OR steps),

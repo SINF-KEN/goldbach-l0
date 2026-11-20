@@ -18,7 +18,7 @@ struct ScmOptions {
     const char* prime_cache = nullptr;
     uint32_t pmax = 0;          // 0: GB_SCM_PMAX or the geometry's default
     uint32_t dlt = 0;           // evens per class per segment (0: GB_SCM_DELTA or the geometry's)
-    uint32_t split_p = 0;       // tile / large prime bound (0: GB_SCM_SPLIT_P or 131072)
+    uint32_t split_p = 0;       // tile / large prime bound (0: GB_SCM_SPLIT_P or 131072; >= 512: sparse.cl mod_ff)
     double target = 64.0;       // plan: phase-A tests per even class (M = 30030: 60..64 flat, pending ~0.02%)
     bool write_checked = false; // validation: phase A / B write checked[]
 };
@@ -121,7 +121,8 @@ private:
 /// class map pipeline (ScmEngine, two slots overlapped).
 /// @param segment_even  if set and != DEFAULT_SEGMENT_EVEN, selects dlt =
 ///                      max(segment_even / M, 4096); otherwise the geometry default.
-/// @param split_p       tile / large prime bound (0: GB_SCM_SPLIT_P or 131072).
+/// @param split_p       tile / large prime bound (0: GB_SCM_SPLIT_P or 131072);
+///                      must not be below 512 (sparse.cl mod_ff).
 /// Other parameters as run_gpu (verifier.hpp).
 /// @pre   start_even (rounded to even, >= 4) <= limit, and high enough for
 ///        ScmEngine.

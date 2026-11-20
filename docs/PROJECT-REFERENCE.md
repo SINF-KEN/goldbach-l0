@@ -30,8 +30,8 @@ evens/s at 4e18 (~15x the dense path's ~70 G) but no exact statistics.
 - `tools/` is a symlink to a sibling clone of the companion
   `goldbach-tools` repo (validators, bench.py, run_range.sh); without it the
   build produces the verifier and the host tests only.
-- Version constant: `gb::VERSION` (include/config.hpp, with the release
-  history), echoed by `--info` and the `--csv` output.
+- Version constant: `gb::VERSION` (include/config.hpp; release notes in
+  [HISTORY.md](HISTORY.md) §R), echoed by `--info` and the `--csv` output.
 
 --------------------------------------------------------------------------
 ## 2. Quick start

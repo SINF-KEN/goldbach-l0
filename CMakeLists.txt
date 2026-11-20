@@ -68,7 +68,7 @@ if(Python3_FOUND)
     add_test(NAME test_ci COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tests/test_ci.py)
 endif()
 add_test(NAME cli_tests COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_tests.sh $<TARGET_FILE:goldbach_l0>)
-# Exact Goldbach statistics (v2.2): stats_ref is the independent CPU
+# Exact Goldbach statistics: stats_ref is the independent CPU
 # reference. GPU-free: `stats_known` checks p(n) against T. Oliveira e
 # Silva's published S(p) table, `stats_tools` the summary / dashboard
 # scripts on synthetic files. Local only (label gpu, CI runs -LE gpu):
@@ -90,7 +90,8 @@ add_test(NAME gpu_validate COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_validate.s
 set_tests_properties(gpu_validate PROPERTIES LABELS gpu TIMEOUT 3600)
 
 # ---------------------------------------------------------------------------
-# SPIR-V kernel build: kernels/goldbach.cl -> kernels/goldbach_bmg.spv
+# SPIR-V kernel build: kernels/goldbach.cl -> kernels/goldbach_bmg.spv,
+# kernels/sparse.cl -> kernels/sparse_bmg.spv and sparse30030_bmg.spv.
 # Uses Intel's ocloc (ships with the compute-runtime / Level Zero packages).
 # ---------------------------------------------------------------------------
 find_program(OCLOC_EXE ocloc)
@@ -172,7 +173,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tools/sweep.py)
     add_executable(debug_check_hi tools/debug_check_hi.cpp src/l0_context.cpp src/primes.cpp)
     add_executable(debug_fb tools/debug_fb.cpp src/l0_context.cpp src/primes.cpp)
     add_executable(debug_map tools/debug_map.cpp src/l0_context.cpp src/primes.cpp)
-    # Sparse class map (v2.0): full-segment map vs CPU sieve, checker vs CPU
+    # Sparse class map: full-segment map vs CPU sieve, checker vs CPU
     # reference (skipped with an older goldbach-tools checkout).
     if(EXISTS ${CMAKE_SOURCE_DIR}/tools/debug_sparse.cpp)
         add_executable(debug_sparse tools/debug_sparse.cpp src/sparse.cpp src/l0_context.cpp src/primes.cpp)

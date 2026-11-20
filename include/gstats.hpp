@@ -1,5 +1,5 @@
 #pragma once
-// Exact Goldbach statistics of the dense path (v2.2; kernels check30_b,
+// Exact Goldbach statistics of the dense path (kernels check30_b,
 // check30_xs8/6/4/3, check30_xb, count30 in kernels/goldbach.cl). On by
 // default for runs that use the mod-30 checker far above MAX_GB_PRIME;
 // GB_STATS=0 turns it off.
@@ -17,8 +17,8 @@
 //   * prime and twin-prime counts in [start, limit] (every segment; count30
 //     popcounts of the exact class map), primes by residue mod 30;
 //   * leftovers (p(n) > MAX_GB_PRIME, never seen so far) by CPU Miller-Rabin.
-//   * prime gaps (v2.4; v2.5: the walk fused into count30; after Oliveira e
-//     Silva, Herzog and Pardi 2014, section 2.2): every gap q - prev(q) with
+//   * prime gaps (count30's tail and walk; after Oliveira e Silva, Herzog
+//     and Pardi 2014, section 2.2): every gap q - prev(q) with
 //     q in [start + 1, limit - 1], exactly: count, sums of g^k (k = 1..4,
 //     128-bit), the largest gap, every gap >= GAPS30_TAIL (700) with its
 //     first lower prime; the full histogram N(g) on the walked segments.
@@ -114,7 +114,7 @@ inline constexpr uint32_t GAPS30_TCAP = 4096;      // tail entries per segment (
 inline constexpr uint32_t GAPS30_GROUPS = 48;      // default count30 grid on walked segments (work-groups, grid-stride)
                                                   // on a GAPS30_REF_EUS device; scaled by the device's EU count
                                                   // (gaps30_groups). count30 runs beside phase B and the next tile
-                                                  // sieve (since 2026-11-18 launched before phase B); B580 gpu ms per 1e11: 20 655, 24 645,
+                                                  // sieve (launched before phase B); B580 gpu ms per 1e11: 20 655, 24 645,
                                                   // 28 641, 32/36 639, 40 657 (!), 44/48 638.5, 60 640, 64 645, 80 643
 inline constexpr uint32_t GAPS30_REF_EUS = 160;    // EUs of the device GAPS30_GROUPS was tuned on (B580: 20 Xe2 cores x 8)
 inline constexpr uint32_t GAPS30_GROUPS_MAX = 4096;
@@ -485,8 +485,8 @@ public:
     /// wanted while the campaign has no first occurrence for it at or below
     /// @p start. A bin first seen only ABOVE the run (a range committed out
     /// of order) stays wanted, so this run's smaller n can replace it
-    /// (commit keeps the minimum); excluding every seen bin silently kept
-    /// the higher n as "first".
+    /// (commit keeps the minimum); excluding every seen bin would keep the
+    /// higher n as "first".
     /// @pre   called before the run's first segment is enqueued.
     void set_run_start(uint64_t start)
     {
@@ -521,9 +521,9 @@ public:
         evens_sampled_ += n;
         return n;
     }
-    /// Normal segment: check30_b tail counts by p >> 1 (class-aggregated:
-    /// stored under class 15 -> folded into the per-class arrays as class 0
-    /// would be wrong, so they go to a separate aggregate).
+    /// Normal segment: check30_b tail counts by p >> 1. check30_b does not
+    /// split them by class, so they go to a separate aggregate, not into the
+    /// per-class arrays.
     void add_tail(const uint32_t* hist_p)
     {
         for (size_t b = 0; b < pbins(); ++b)

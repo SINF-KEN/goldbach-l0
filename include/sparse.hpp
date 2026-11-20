@@ -1,5 +1,5 @@
 #pragma once
-// Sparse class map (v2.0, `--sparse`; kernels/sparse.cl, src/sparse.cpp).
+// Sparse class map (`--sparse`; kernels/sparse.cl, src/sparse.cpp).
 //
 // Every even n needs ONE certified prime q = n - p, so the map does not have
 // to cover every odd q: it holds only the q in K residue classes mod M (the

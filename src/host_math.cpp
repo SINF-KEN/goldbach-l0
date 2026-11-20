@@ -1,6 +1,5 @@
-// Pure host math of the dense pipeline (see include/host_math.hpp for the
-// contracts). Moved verbatim from src/verifier.cpp so host_tests can check
-// it against brute force; no Level Zero dependency.
+// Pure host math of the dense pipeline (contracts: include/host_math.hpp).
+// No Level Zero dependency, so host_tests can check it against brute force.
 
 #include "host_math.hpp"
 
@@ -117,7 +116,7 @@ void build_tile_first_table(uint32_t* tbl, uint32_t tiles, uint32_t sieve_split,
                             uint32_t own_end,
                             const uint64_t* fb_all, const uint64_t* magic,
                             const uint32_t* shift, const uint32_t* sieve_primes,
-                            uint32_t tpc) {   // class mode: rows [tpc, 2 tpc) = M5 tiles
+                            uint32_t tpc) {
     // Only the thread-owned columns [0, own_end) are read by the kernel
     // (medium primes derive their tile start from fb), so rows hold own_end.
     parallel_for(0, tiles, 16, [&](uint32_t t0, uint32_t t1) {

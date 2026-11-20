@@ -1,6 +1,7 @@
 #pragma once
-// CPU-side prime generation and a standalone 64-bit primality test used by
-// the (rare) CPU fallback path and the reference checker.
+// CPU-side primes: the base-prime list and its disk cache, the small-prime
+// mask tables of the tile sieve, and the exact 64-bit primality tests of the
+// CPU fallback and the reference checker.
 
 #include <cmath>
 #include <cstdint>
@@ -33,9 +34,9 @@ uint64_t prime_payload_hash(const uint32_t* p, size_t cnt);
 /// its limit equals @p n, its size matches, the payload hash matches and the
 /// payload passes the content check (the odd primes < 64 first, then strictly
 /// ascending odd values <= n); otherwise generates the list and publishes the
-/// cache atomically (temp file, fsync, rename). The content check alone let a
-/// prime replaced by an odd composite between its neighbours through (one
-/// changed entry, thousands of false primes in the map).
+/// cache atomically (temp file, fsync, rename). The hash matters: the content
+/// check alone passes a prime replaced by an odd composite between its
+/// neighbours (one changed entry, thousands of false primes in the map).
 /// @param cache_path  cache file, or nullptr to skip caching.
 /// @pre    n < 2^32.
 /// @post   a damaged cache is never trusted; a failed write leaves no file
@@ -121,14 +122,15 @@ private:
     } pending_;
 };
 
-/// Small-prime word-mask table for the GPU sieve (see goldbach.cl stage 3a).
+/// Small-prime word-mask table for the dense odd map (goldbach.cl
+/// make_prime_map stage 3a; the validators and the mask groups build on it).
 ///
 /// For each of the first @p mask_count odd primes produces 64 uint64 masks
 /// indexed by "phase" = (global word index) mod p. mask[p_idx*64 + phase] has
 /// a 0 bit at every local bit b < 64 with (64*word_index + b) mod p == r,
 /// where r is the global bit of the first odd multiple of p relative to
-/// q_first. Applying tile[w] &= mask[phase] (phase advancing by 64 mod p per
-/// word) clears all odd multiples of p without any per-bit RMW.
+/// q_first. Applying tile[w] &= mask[phase] (the phase advances by 1 per
+/// word) clears all odd multiples of p without any per-bit read-modify-write.
 ///
 /// @param sieve_primes  odd primes; must match the kernel's sieve_primes[0..mask_count).
 /// @param mask_count    number of primes to tabulate.
@@ -153,7 +155,8 @@ struct SmallPrimeGroups {
 };
 
 /// Grouped masks for the dense odd map starting at @p q_first:
-/// small_prime_group_masks_from(small_prime_mask_table(...)).
+/// small_prime_group_masks_from(small_prime_mask_table(...)) (validators,
+/// host tests).
 /// @pre    q_first is odd.
 /// @return one period-long AND-mask table per group; group g's word x uses
 ///         entry x mod period_g.
@@ -172,11 +175,11 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
                                               const std::vector<uint64_t>& per_prime,
                                               uint32_t max_period = 4096, uint32_t skip = 1,
                                               uint32_t extra = 0);
-/// Canonical group tables (class modes): every prime's marks at index 0 mod p,
+/// Canonical group tables (class maps): every prime's marks at index 0 mod p,
 /// so the tables depend on the primes only; a progression reads word x of
 /// group g at table word (x - Y_g) mod P_g (Y_g from small_prime_group_offsets).
 /// @param skip_mod  primes dividing it get all-ones masks (no multiples in
-///                  any class, e.g. 3 for the mod-6 map).
+///                  any class: 15 for the mod-30 class map).
 /// @param extra    the next @p extra primes (sieve_primes[mask_count], ...,
 ///                  >= 64) are folded into the groups too, each into the
 ///                  group of smallest period (make_prime_map: MASK_XP_DEFAULT).
@@ -195,15 +198,15 @@ std::vector<uint32_t> small_prime_group_offsets(const uint32_t* sieve_primes,
                                                 uint32_t step, uint32_t max_period = 4096,
                                                 uint32_t extra = 0);
 /// Class-map variant of small_prime_mask_table: index i <-> q = base + step*i
-/// (class mode: step 6). A prime dividing @p step has no multiples (all-ones
-/// masks); primes outside [3, 64) get all-zero entries.
+/// (mod-30 class map: step 30). A prime dividing @p step has no multiples
+/// (all-ones masks); primes outside [3, 64) get all-zero entries.
 /// @return exactly mask_count * 64 AND masks, same layout as small_prime_mask_table.
 std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
                                                   uint32_t mask_count,
                                                   uint64_t base, uint32_t step);
 
 /// Largest limit the GPU paths accept: 2^64 - 2^40. Host first-hit math
-/// (q_first + p - 1, m * p, the wheel/bucket next hit) adds at most ~2^38 to a
+/// (q_first + p - 1, m * p, the wheel / hit-list next hit) adds at most ~2^38 to a
 /// value <= limit, so this margin keeps every intermediate below 2^64; above
 /// it a wrapped hit would silently skip a mark (a composite left as prime).
 inline constexpr uint64_t MAX_SUPPORTED_LIMIT = 0ull - (1ull << 40);
@@ -221,11 +224,12 @@ inline void require_supported_limit(uint64_t limit) {
 /// Base-prime bound for a run up to @p limit: floor(sqrt(limit)) + 16 (the
 /// slack marks nothing: p^2 > limit), saturated at 2^32 - 1 — every prime
 /// <= sqrt(2^64 - 1) fits a u32.
+/// The saturation matters: a plain uint32_t(sqrt(double(limit)) + 16) wraps
+/// to ~16 above (2^32 - 16)^2 ~ 1.8446744e19, which sieved with the primes
+/// < 64 only.
 /// @pre    none (any u64; the double sqrt errs by far less than the slack).
 /// @return B >= floor(sqrt(limit)), so the odd primes <= B include every
-///         prime factor <= sqrt(q) of every odd composite q <= limit. The former inline
-/// uint32_t(sqrt(double(limit)) + 16) wrapped to ~16 for
-/// limit > (2^32 - 16)^2 ~ 1.8446744e19 and sieved with the primes < 64 only.
+///         prime factor <= sqrt(q) of every odd composite q <= limit.
 inline uint32_t base_prime_bound(uint64_t limit) {
     const double r = std::sqrt(double(limit)) + 16.0;
     return r >= 4294967295.0 ? 0xFFFFFFFFu : uint32_t(r);

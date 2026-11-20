@@ -36,14 +36,9 @@ double seconds_since(clock_::time_point t0) {
     return std::chrono::duration<double>(clock_::now() - t0).count();
 }
 
-// GPU buffer layout (all allocated once, reused for every segment):
-//
-//   d_prime_map   : odd-prime bitset for the current q segment
-//                   bit i  <->  q = q_first + 2*i
-//   d_gb_primes   : uint16 candidate primes p <= 9781 (uploaded once)
-//   d_sieve_primes: uint32 base primes (uploaded once)
-//   d_leftovers   : uint32 indices of unresolved even numbers
-//   d_leftover_n  : uint32 count of leftovers (device counter)
+// GPU buffers of the dense path, allocated once and reused for every
+// segment: read-only tables shared by both pipeline slots, and per-slot
+// buffers (segment k uses slot k & 1).
 struct GpuBuffers {
     // Read-only tables shared by both pipeline slots (uploaded once).
     uint32_t* sieve_primes = nullptr;
@@ -52,14 +47,14 @@ struct GpuBuffers {
 
     // Per-slot buffers: the segment pipeline alternates between slot 0 and
     // slot 1 so segment k's GPU work overlaps segment k-1's host work.
-    uint64_t* prime_map[2]  = {};  // odd-prime bitset for the q segment
+    uint64_t* prime_map[2]  = {};  // the segment's mod-30 class map (8 class arrays)
     uint64_t* first_bits[2] = {};  // per-prime first markable bit (segment-global)
     uint64_t* mask_table[2] = {};  // small-prime word masks (per segment: q_first-dependent)
     uint32_t* leftovers[2]  = {};  // compact exception list
     uint32_t* leftover_n[2] = {};  // leftover count (shared: host-readable)
-    uint32_t* tile_first[2] = {};  // [tile * sieve_split + j] per-tile first mark
+    uint32_t* tile_first[2] = {};  // [tile * own_end + j] per-tile first mark
     uint64_t* group_masks[2] = {}; // fused mask stage: per-group mask tables
-    uint32_t* group_y[2] = {};     // class modes: per class x group canonical-table word offsets
+    uint32_t* group_y[2] = {};     // per class x group: canonical-table word offsets
     uint32_t* pending[2]    = {};  // two-phase checker: evens left by phase A
     uint32_t* pending_n[2]  = {};  // their count (shared: host-checked for overflow)
     // Positive coverage (check30_a / check30_b): [0] evens phase A resolved,
@@ -94,21 +89,19 @@ struct GpuBuffers {
 // Mask-group bound shared with the kernel (check_constants.py checks it).
 inline constexpr uint32_t MAX_MASK_GROUPS_HOST = 8;   // kernel MAX_MASK_GROUPS
 inline constexpr uint32_t HL_MAX_K_HOST = 256;  // kernels/goldbach.cl HL_MAX_K (SLM counters)
-// hl_harvest work-group size (2026-11-18: the scattered list stores are L2
-// write-combined; a larger group fills its regions' lines faster, harvest
-// -6 ms per 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST work-items.
+// hl_harvest work-group size: the scattered list stores are L2
+// write-combined, and a larger group fills its regions' lines faster
+// (harvest -6 ms per 1e11 vs 256). The kernel needs >= HL_MAX_K_HOST
+// work-items.
 inline constexpr uint32_t HL_HARVEST_WG = 1024;
 static_assert(HL_HARVEST_WG >= HL_MAX_K_HOST && HL_HARVEST_WG <= 1024, "hl_harvest: group size");
-// Segments per harvest batch (GB_HITLIST_K). 2026-11-18 with the 1024 groups,
-// harvest ms per 1e11: K 32 47.9, 48 41.4, 64 41.8, 80 41.3, 96 44.7, 128 44.1.
-// 2026-11-18 (r7): K up to 256 within the list budget below: a batch has a
-// ~7 ms fixed part (per prime: list read, setup, first table word), so the
-// largest K that fits pays (K 128 -> 147 at 4e18: harvest 0.173 -> 0.166
-// ms per segment).
+// Segments per harvest batch (GB_HITLIST_K), lowered to fit the list budget
+// below. A batch has a ~7 ms fixed part (per prime: list read, setup, first
+// table word), so the largest K that fits pays (K 128 -> 147 at 4e18:
+// harvest 0.173 -> 0.166 ms per segment).
 inline constexpr uint32_t HL_K_DEFAULT = 256;
 // List memory cap (bytes, GB_HL_LIST_MAX): K is lowered until K x regions
-// fit. 3.5e9 = the r7 list size at 5e18 (K 128 x 3358 x 2048 entries),
-// now that the exact hit estimate and balanced regions need ~15 % fewer.
+// fit. 3.5e9 holds K 128 at 5e18 (3358 regions x 2048 entries).
 inline constexpr uint64_t HL_LIST_MAX_DEFAULT = 3500000000ull;
 static_assert(WG_SIZE >= HL_MAX_K_HOST, "hl_harvest: one thread per SLM batch counter");
 
@@ -133,17 +126,17 @@ void* stage_upload(Context& ctx, const void* data, size_t bytes, void* dst) {
 
 // Per-slot kernel-timestamp events: sieve/large/check for each of the two
 // pipeline slots. One pool holds all of them; each event is still reset on
-// its own (zeEventHostReset acts on one event, not on its pool), as the
-// sparse path's SparseEvents always did.
+// its own (zeEventHostReset acts on one event, not on its pool), as in the
+// sparse path's SparseEvents.
 struct SlotEvents {
     static constexpr uint32_t kEvents = 22;
     ze_event_pool_handle_t pool = nullptr;
     ze_event_handle_t sieve[2] = {};
     ze_event_handle_t large[2] = {};
     ze_event_handle_t check[2] = {};   // last checker kernel (host waits on it)
-    ze_event_handle_t checka[2] = {};  // two-phase checker: phase A (timing only)
-    ze_event_handle_t bucket[2] = {};  // hl_apply / bucket_process (timing only; counted in large_s)
-    ze_event_handle_t splitk[2] = {};  // split_map (timing only; counted in check_s)
+    ze_event_handle_t checka[2] = {};  // phase A: check30_a, or check30_xs3 on sampled segments (timing only)
+    ze_event_handle_t bucket[2] = {};  // unfused hl_apply (timing only; counted in large_s)
+    ze_event_handle_t splitk[2] = {};  // count30 (timing only)
     ze_event_handle_t xv[3][2] = {};   // check30_xs8 / 6 / 4 (timing only; counted in check_s)
     ze_event_handle_t hl[2] = {};      // hl_harvest (timing only; counted in large_s)
     ze_event_handle_t mw[2] = {};      // mid_window (timing only; counted in sieve_s)
@@ -246,7 +239,7 @@ void resolve_leftovers(Context& ctx, uint32_t* leftover_buf, uint32_t n_left,
 /// One segment of the loop (stack object, one per iteration): geometry, the
 /// class-map kernel arguments derived from it, and the host timings the
 /// iteration's steps record. Kernel arguments are passed by address and
-/// copied by set_arg, so the fields serve exactly as run_gpu's locals did.
+/// copied by set_arg.
 struct Segment {
     uint64_t seg_start = 0;          // first even n
     uint64_t seg_end   = 0;          // last even n (inclusive)
@@ -256,14 +249,14 @@ struct Segment {
     uint64_t q_odds    = 0;
     uint64_t tiles     = 0;          // dense-map tiles
     uint32_t slot      = 0;          // pipeline slot
-    ClassGeo cgeo;                   // class mode: class arrays of cgeo.tpc tiles
+    ClassGeo cgeo;                   // class map: class arrays of cgeo.tpc tiles
     uint64_t tiles_launch = 0;       // tile-kernel work-groups
     uint32_t c5w  = 0;               // class stride (u64 words)
     uint32_t off5 = 0;               // class stride (bits)
     uint32_t phis = 0;               // class phases (kernel arg)
     uint32_t ga1 = 0, ga2 = 0;       // phi1 / phi5 kernel args
     uint32_t mask_coff = 0;          // group-mask table offset per class
-    uint32_t mask_count_seg = 0;     // small-prime mask entries
+    uint32_t mask_count_seg = 0;     // primes cleared by the small-prime masks
     // host timings (GB_PHASE trace and telemetry)
     clock_::time_point t_enq, t_launch0;
     double args_s = 0.0;
@@ -282,14 +275,13 @@ struct Segment {
 //
 // RunSetup holds the arguments and the host-only setup (no Level Zero: range
 // clamping, base primes); DenseRun adds the Level Zero state and runs the
-// phases in the order run_gpu always ran them. Every object a phase creates
-// is a member declared in the order run_gpu declared it as a local, so the
-// destructors (Kernel, Module, Context) run in the same order on return and
-// on an exception.
+// phases in order. Members are declared in dependency order, so the
+// destructors (Kernel before Module before Context) run in the right order
+// on return and on an exception.
 // ---------------------------------------------------------------------------
 struct RunSetup {
-    // Arguments of run_gpu (limit / start_even / segment_even are clamped
-    // in place, as the parameters were).
+    // Arguments of run_gpu (limit / start_even / segment_even are clamped in
+    // place).
     uint64_t limit;
     uint64_t segment_even;
     const std::string& spv_path;
@@ -316,7 +308,7 @@ struct RunSetup {
     // ---- resolve_range ----------------------------------------------------
     uint32_t phase_b_groups = 0;     // GB_CHECK_BGROUPS (check30_b grid)
     uint32_t stats_b_groups = 0;     // GB_STATS_BGROUPS
-    uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, mode default)
+    uint32_t bucket_groups_env = 0;  // GB_BUCKET_GROUPS (0: unset, default)
     RunStats stats;
     clock_::time_point t_start;
     uint64_t total_evens = 0;        // evens in [start_even, limit]
@@ -401,7 +393,7 @@ private:
     void reset_slot_counters(uint32_t sl);
     void check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left);
 
-    // Helpers (former lambdas of run_gpu)
+    // Helpers
     void reset_gaps(int s);
     void collect_stats(uint32_t sl, uint64_t seg_start_sl);
     bool query_slot(uint32_t slot, double& ds, double& dl, double& dv);
@@ -415,9 +407,8 @@ private:
 
     // ---- configure_checkers ---------------------------------------------------
     // The map is the mod-30 class map (8 class arrays, kernel class mode 2)
-    // and the checker the mod-30 one (check30_a / check30_b): v2.6 removed
-    // the dense and mod-6 maps, the twin and class-split checkers and the
-    // bucket ring, which only A/B knobs still reached.
+    // and the checker the mod-30 one (check30_a / check30_b); the knobs of
+    // removed variants are refused (resolve_range).
     static constexpr uint32_t ncls_map = 8;
     const uint32_t cm_u32 = 2;       // kernel class-mode argument
     bool med_cop = false;            // first bits carry med_prime_cop residues (items)
@@ -431,7 +422,7 @@ private:
     std::unique_ptr<Kernel> k_ca, k_cb;
 
     // ---- configure_ridges_and_stats ---------------------------------------------
-    // optional: constructed (it reads GB_RIDGE*) where run_gpu constructed it
+    // constructed in configure_ridges_and_stats (its constructor reads GB_RIDGE*)
     std::optional<RidgeTracker> ridges;
     std::string ridge_path;          // GB_RIDGE_FILE
     const char* ridge_file = nullptr;  // ridge_path.c_str()
@@ -478,6 +469,7 @@ private:
     clock_::time_point t_live0;
 
     // ---- size_bucket_ring_and_hitlists -------------------------------------------
+    // (bucket_* names: the hit lists, which replaced the bucket ring)
     uint64_t delta = 0;              // q-bit advance per segment (segment_even / 2)
     uint64_t q_odds_full = 0;        // map bits of a full segment
     uint64_t q_first0 = 0;           // first segment's q_first
@@ -487,9 +479,9 @@ private:
     uint32_t hl_K = 0;               // hit lists: segments per harvest
     uint32_t hl_G = 1, hl_capg = 64; // harvest regions, entries per region
     uint64_t run_segments = 0, run_last_q_odds = 0;  // hit lists: segments of the run
-    bool hl_mt = false;              // HL_MT: harvest files only hits p m with m prime
+    bool hl_mt = false;              // GB_HL_MT: harvest files only hits p m with m prime
     bool mt_try = false;             // ... planned (the hit-list threshold follows it)
-    /// HL_MT feasibility for hit-listed primes >= pmin: multipliers m of
+    /// GB_HL_MT feasibility for hit-listed primes >= pmin: multipliers m of
     /// every hit in [m_lo, m_hi]; needs p^3 > limit and p^2 > m_hi (a
     /// composite m then has a factor < p), the table's sieving primes
     /// (<= sqrt(m_hi)) far below m_lo, m_hi < 2^38 (hl_harvest_mt's
@@ -525,7 +517,7 @@ private:
     uint32_t* d_hl_lists = nullptr;
     uint32_t* d_hl_counts = nullptr;
     std::unique_ptr<Kernel> k_cmp, k_large_full, k_hlh, k_hla;
-    uint32_t bucket_groups = 0;      // GB_BUCKET_GROUPS or the mode default
+    uint32_t bucket_groups = 0;      // unfused hl_apply grid: GB_BUCKET_GROUPS or 2 x BUCKET_GROUPS
     uint32_t bucket_verify_every = 0;  // GB_BUCKET_VERIFY (0: off)
     bool bucket_verify = false;
     PackedLarge packed_full;
@@ -566,7 +558,7 @@ private:
     uint64_t sum_tiles = 0, sum_large_items = 0;
     bool phase_trace = false;        // GB_PHASE
     bool hl_used[2] = {false, false};   // slot's segment launched a harvest (timing)
-    std::vector<uint64_t> fb_host;   // per-segment first bits (class mode: persistent)
+    std::vector<uint64_t> fb_host;   // per-segment first bits of the class map (reused buffer)
     double sum_prep = 0.0, sum_enq = 0.0, sum_wait = 0.0, sum_coll = 0.0;
     double sum_args = 0.0, sum_launch = 0.0;
     bool split_used[2] = {false, false};   // slot's segment ran count30 (timed on ev.splitk)
@@ -597,16 +589,16 @@ void RunSetup::resolve_range() {
                                      "fixed; docs/HISTORY.md 9.2ac)");
     gb::require_supported_limit(limit);
     // The last even n is limit rounded down (as run_gpu_sparse does). An odd
-    // limit left the segment and count30 ranges ending on an even q, so the
-    // statistics missed a prime at limit - 2 (and the twin pair below it)
-    // while the gap sum still included it.
+    // limit would end the segment and count30 ranges on an even q: the
+    // statistics would miss a prime at limit - 2 (and the twin pair below
+    // it) while the gap sum still included it.
     limit &= ~uint64_t(1);
     // Grid-stride work-group counts, validated before any GPU work: env_grid
     // refuses 0, which would skip phase B (pending evens never checked) or the
-    // hit-list / bucket marks (composites left "prime") and still PASS.
+    // hit-list marks (composites left "prime") and still PASS.
     phase_b_groups = env_grid("GB_CHECK_BGROUPS", CHECK30_B_GROUPS);
     stats_b_groups = env_grid("GB_STATS_BGROUPS", 160u);
-    bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (mode default)
+    bucket_groups_env = env_grid("GB_BUCKET_GROUPS", 0u);   // 0: unset (default)
     stats.limit = limit;
     t_start = clock_::now();
 
@@ -652,39 +644,26 @@ void RunSetup::load_base_primes() {
     sieve_primes = prime_view.data();
     cache_seconds = seconds_since(t_cache);
 
-    // Primes handled by the kernel's small-prime mask path (stage 3a): the
-    // first mask_count entries of sieve_primes (ascending) are all < 64.
-    // Keep in sync with MASK_MAX_P in kernels/goldbach.cl (table indexing
-    // requires p < 64 so the phase fits the 64-entry per-prime table).
+    // Primes cleared by the kernel's small-prime masks: the first mask_count
+    // entries of sieve_primes (ascending), all < MASK_MAX_P = 64 (the phase
+    // must fit the 64-entry per-prime table).
     mask_count = uint32_t(
         std::lower_bound(sieve_primes, sieve_primes + prime_view.size(), 64u) -
         sieve_primes);
 
-    // Split point between the SLM tile walk (primes < split) and the flat
-    // one-work-item-per-prime large kernel (primes >= split). The tile walk
-    // costs O(pi(split)) per thread per tile; the large kernel costs
-    // O(segment_odds/p) per prime. At N=4e18, pi(sqrt(N)) ~ 98M — walking
-    // ALL base primes per tile blew the driver watchdog (engine reset), so
-    // the split is what makes 4e18 feasible at all.
-    // 0 = auto: keep the tile walk's per-thread prime loop around 64K
-    // iterations (pi(1e6) ~ 78K) and hand everything above to the large
-    // kernel. Tunable via --split for the sweep tool.
+    // Split between the SLM tile walk (primes < split) and the large-prime
+    // kernels (primes >= split). Walking every base prime per tile is out of
+    // the question at 4e18 (pi(sqrt(N)) ~ 98M: the driver watchdog resets the
+    // engine), so the split is what makes 4e18 feasible at all.
+    // 0 = auto. With the mid-prime SLM windows (HISTORY.md §9.2x) primes
+    // [split, GB_MIDWIN) go to mid_window and the split is MIDWIN_SPLIT (split
+    // 800..3500 x bound 2..4M within 0.3%). The windows need q >= 2^60
+    // (mod_ff) and class arrays < 2^24 bits (exact float remainders);
+    // without them the split is 36000 (gpu per 1e11 at 4e18 vs 32K: 28K
+    // +2.6%, 34K / 36K -0.11%, 38K 0.0%, 42K +0.27%). --split overrides;
+    // GB_MIDWIN=0 disables the windows.
     sieve_count = uint32_t(prime_view.size());
     sieve_split = sieve_split_arg;
-    // 0 = auto: 30000 (~350K) with 16 KB tiles (v1.8.1): moving primes out
-    // of the global-atomic large kernel into the SLM medium stage pays until
-    // its per-prime-per-tile setup dominates. 2e10 window at 4e18 (16 KB
-    // tiles): 20K 21.10G, 25K 21.15G, 30K 21.18G, 35K 21.17G, 40K 21.14G.
-    // (64 KB tiles: 40K optimum.) Keep explicit --split for sweeps.
-    // v1.11.0 class map, 350M spans, per 1e11 at 4e18: 30K 945.6, 32K 939.7,
-    // 34K 940.6, 36K 942.4, 40K 945.7 ms kernel time -> 32K.
-    // v1.13.0 (mod-30 checker, 425M spans), gpu per 1e11 vs 32K: 28K +2.6%,
-    // 34K -0.11%, 36K -0.11% (long-end -0.06%), 38K 0.0%, 42K +0.27% -> 36K.
-    // v2.6 mid-prime SLM windows (HISTORY.md §9.2x): primes [split, GB_MIDWIN)
-    // go to mid_window, and the auto split drops to MIDWIN_SPLIT (2026-11-17
-    // grid: split 800..3500 x bound 2..4M within 0.3%). They need
-    // q >= 2^60 (mod_ff) and class arrays < 2^24 bits (exact float
-    // remainders); otherwise the old split. GB_MIDWIN=0 disables.
     midwin_p2 = env::u64("GB_MIDWIN", MIDWIN_P2_DEFAULT, 0, UINT32_MAX);
     {
         const uint64_t qof_est = (segment_even - 5 + MAX_GB_PRIME) / 2 + 1;
@@ -726,8 +705,8 @@ void DenseRun::configure_checkers() {
     // a host-only change sizes the phase-A launch for a different width and
     // leaves evens unchecked.
     a_w64 = CHECK_PHASE_A_W64;
-    // Mod-30 checker (v1.13.0, include/check30.hpp): evens grouped by n mod
-    // 30 read the class arrays directly. GB_C30_PLAN overrides the plan.
+    // Mod-30 checker (include/check30.hpp): evens grouped by n mod 30 read
+    // the class arrays directly. GB_C30_PLAN overrides the plan.
     const char* pe = env::raw("GB_C30_PLAN");   // make_plan30 validates it
     plan30 = make_plan30(gb_all, pe ? pe : CHECK30_PLAN);
     k_ca = std::make_unique<Kernel>(mod, "check30_a");
@@ -735,15 +714,15 @@ void DenseRun::configure_checkers() {
 }
 
 /// Phase 3b: Goldbach ridge tracking (floor clamp, store load) and the exact
-/// statistics (GB_STATS / GB_GAPS: plan, state, count30 / check30_x kernels).
+/// statistics (GB_STATS / GB_GAPS: plan, state, count30 / check30_xs* / _xb).
 void DenseRun::configure_ridges_and_stats() {
     // ---- Goldbach ridge tracking (include/ridge.hpp) -----------------------
     // The phase-B checkers record the smallest witness of every pending even
     // they resolve (their rest lists are ascending, so the first hit is the
-    // ridge; the mod-30 family probes useful residues before the futile ones,
+    // ridge; the mod-30 checker probes useful residues before the futile ones,
     // exact for n > MAX_GB_PRIME + 5 — the host's exact validation drops the
-    // rare tiny-n records where that ordering could differ). Since v2.2 every
-    // phase-A funnel member is below the plan's bound (3000), so every even
+    // rare tiny-n records where that ordering could differ). Every phase-A
+    // funnel member is below the plan's bound (3000), so every even
     // with a ridge >= 3000 reaches phase B: the top list is complete there
     // (below the bound phase A may resolve an even first; kept entries are
     // exact either way).
@@ -814,7 +793,7 @@ void DenseRun::set_group_sizes() {
     // several marks per thread range) and the prime-parallel SLM-atomic walk
     // (primes >= MED_MIN_P, a few marks per tile). GB_MED_P overrides the
     // bound for sweeps; a bound >= the split prime disables the medium stage.
-    // Medium items (2026-11-18): with the mid windows the medium stage takes
+    // Medium items: with the mid windows the medium stage takes
     // every tile prime after the mask groups (the owned walk goes) as items of
     // about T marks (+0.6%; T 90..110 flat, 80 / 130 worse). Without them
     // (low starts) the owned walk stays.
@@ -868,9 +847,9 @@ void DenseRun::set_group_sizes() {
     }
 }
 
-/// Phase 4: sizes of the per-slot buffers (map, checked, split maps, pending
+/// Phase 4: sizes of the per-slot buffers (map, checked stride, pending
 /// list, tile table) and the fused small-prime mask grouping (allocates and
-/// fills its shared descriptor table).
+/// fills its shared descriptor table, with the medium items behind it).
 void DenseRun::size_buffers() {
     // ------------------------------------------------- Persistent buffers -
     // q range spans [seg_start - 9781, seg_end - 3]: that is the segment plus a
@@ -895,25 +874,25 @@ void DenseRun::size_buffers() {
     // Evens phase A leaves to phase B: ~0.045% of a segment at 4e18 (106K
     // of 233.75M), ~0.25% on a sampled segment (586K). Sized at 1/32 of the
     // segment (12x the sampled peak); the host fails closed if a segment
-    // ever overflows it. (1/8 reserved 234 MB of VRAM for ~1 MB of use.)
+    // ever overflows it.
     pending_cap = uint32_t(std::min<uint64_t>(
         std::max<uint64_t>(max_segment_evens / 32, 1u << 16), UINT32_MAX / 2));
 
     // Per-tile first-mark table (tile-major, u32): removes all 64-bit
     // reciprocal math from the tile kernel's prime walk. The kernel needs one
     // u32 load per prime instead of a 64-bit mul_hi chain. Kept under a host
-    // memory budget; beyond it the kernel falls back to the legacy in-kernel
-    // reciprocal path (huge segments only).
+    // memory budget; beyond it the kernel takes its reciprocal path (huge
+    // segments only).
     table_bytes = uint64_t(own_end) * map_tiles * 4;
     use_table = own_end > mask_count &&
                            sieve_split > 0 &&
                            table_bytes * 2 <= uint64_t(1) << 30;
     use_table_u32 = use_table ? 1u : 0u;
 
-    // Fused small-prime mask stage (make_prime_map): grouped mask tables,
-    // rebuilt per segment (q_first-dependent); the grouping itself is fixed.
-    // More than MAX_MASK_GROUPS_HOST groups (a GB_MASK_PERIOD sweep) fall back
-    // to the kernel's per-prime mask loop.
+    // Fused small-prime mask stage (make_prime_map): canonical group tables,
+    // the same for every segment (per segment only each class's word offsets
+    // group_y change). More than MAX_MASK_GROUPS_HOST groups (a
+    // GB_MASK_PERIOD sweep) fall back to the kernel's per-prime mask loop.
     const bool mask_groups_on = mask_count > 0;
     // Max group period in words. 4096 -> 8 groups, 75 KB of tables (primes
     // 3..61): measured sieve_s per 2e10 window 0.1086 vs 0.1161 at 16384
@@ -921,7 +900,7 @@ void DenseRun::size_buffers() {
     // cache-resident. Must yield <= MAX_MASK_GROUPS (8) groups, else the
     // per-prime path is used. GB_MASK_PERIOD overrides.
     mask_period = env::u32("GB_MASK_PERIOD", 4096);   // = small_prime_group_masks default (debug_map validates it)
-    // 2026-11-18: the first MASK_XP_DEFAULT owned primes (67, 71, 73, 79) are folded
+    // The first MASK_XP_DEFAULT owned primes (67, 71, 73, 79) are folded
     // into the mod-30 class map's canonical mask groups, each into the group
     // of smallest period (tables 75 KB -> 1.9 MB, no extra loads): the owned
     // walk loses its densest primes. Bench +0.6% (long, long-end, 1e14);
@@ -955,8 +934,6 @@ void DenseRun::size_buffers() {
 void DenseRun::allocate_slot_buffers() {
     for (int s = 0; s < 2; ++s) {
         b.prime_map[s]  = static_cast<uint64_t*>(ctx.alloc_device(map_words * 8));
-        // (v2.6: the unused S1 / S5 split maps that were kept "for v1.12.0's
-        // device-memory layout" are gone: 1e12 at 4e18, 6 ABBA rounds, 0.03%.)
         // per-class tables back to back
         const size_t ncls = ncls_map;
         b.first_bits[s] = static_cast<uint64_t*>(ctx.alloc_shared(ncls * sieve_split * 8));
@@ -1015,11 +992,11 @@ void DenseRun::allocate_slot_buffers() {
     b.c30_meta  = static_cast<uint32_t*>(ctx.alloc_device(plan30.meta.size() * 4));
     b.c30_rest  = static_cast<uint16_t*>(ctx.alloc_device(plan30.rest.size() * 2));
     b.c30_rtab  = static_cast<uint32_t*>(ctx.alloc_device(plan30.rtab.size() * 4));
-    // The base-prime list is uploaded to DEVICE memory: the large kernel
-    // streams it (~393 MB per segment) and device-local reads are fastest.
-    // The payload comes straight from the mmap'd cache into one shared
-    // staging buffer — the old fread pass is gone — and the DMA copy doubles
-    // as the clock warm-up before the segment loop.
+    // The base-prime list is uploaded to DEVICE memory (read by the tile,
+    // mid-window and harvest kernels; device-local reads are fastest). The
+    // payload comes straight from the mmap'd cache into one shared staging
+    // buffer, and the DMA copy doubles as the clock warm-up before the
+    // segment loop.
     b.sieve_primes = static_cast<uint32_t*>(ctx.alloc_device(size_t(sieve_count) * 4));
 }
 
@@ -1067,9 +1044,10 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
     std::memcpy(b.want_p, gstats->want_p().data(), gstats->want_p().size() * 4);
 }
 
-/// Phase 6: which large primes leave the packed kernel (bucket ring or hit
-/// lists), the ring size and bucket capacity, the hit-list batch / regions,
-/// and the run's segment count for the harvest.
+/// Phase 6: which large primes leave the packed kernel for the hit lists,
+/// the hit-list batch / regions, the multiplier table's range, and the run's
+/// segment count for the harvest. Also decides whether the mid-window pass
+/// runs.
 void DenseRun::size_bucket_ring_and_hitlists() {
     init_mark("buffers");
     // Primes p > q_odds_full hit a segment at most once; they leave the
@@ -1100,13 +1078,12 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     if (midwin_on && !mask_through_29())
         throw std::runtime_error("mid windows need the mask stage through 29");
     if (bucket_on) {
-        // Hit-list only primes above max(q_odds_full, GB_BUCKET_MINP): below
-        // ~9 x q_odds_full a prime's per-segment packed setup (~22 ps) is
-        // cheaper than filing its ~q_odds/p entries (~200 ps each).
+        // Threshold of the per-prime harvest (config.hpp: 8 / 5 x q_odds_full
+        // with the mid windows, 3 x without); GB_BUCKET_MINP overrides.
         const uint64_t minp_default = midwin_on
             ? q_odds_full * BUCKET_MIN_P_FACTOR_MIDWIN_NUM / BUCKET_MIN_P_FACTOR_MIDWIN_DEN
             : BUCKET_MIN_P_FACTOR * q_odds_full;
-        // HL_MT (hl_harvest_mt files only hits with a prime multiplier) makes
+        // GB_HL_MT (hl_harvest_mt files only hits with a prime multiplier) makes
         // a hit-listed prime cheap enough to go down to HL_MT_MINP_NUM / _DEN
         // x q_odds_full (multi-hit primes included; the harvest handles any
         // number of hits per segment), when the multiplier table is feasible.
@@ -1124,8 +1101,8 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                 mt_p = hi;
             }
         }
-        // GB_HL_MT=0: the old hit-list path (hl_harvest, primes > q_odds_full
-        // only), kept as a fallback
+        // GB_HL_MT=0, or no feasible table: the per-prime harvest (hl_harvest,
+        // primes > q_odds_full only)
         mt_try = env::onoff("GB_HL_MT", true) && mt_geometry(mt_p, m_lo_t, m_hi_t);
         uint64_t minp = mt_try ? mt_p : env::u64("GB_BUCKET_MINP", minp_default);
         if (!mt_try)   // hl_harvest files at most one hit per prime and segment
@@ -1135,10 +1112,10 @@ void DenseRun::size_bucket_ring_and_hitlists() {
                                                  uint32_t(std::min<uint64_t>(minp, UINT32_MAX))) -
                                 sieve_primes);
         const uint64_t pmax = sieve_primes[sieve_count - 1];
-        // Engagement range: the one the bucket ring had (its horizon, the
-        // farthest next hit in segments, within 256), where hit lists were
-        // measured and validated; small spans keep the packed kernel. The
-        // 32-bit bound is the harvest's (re-checked below).
+        // Engagement range: a prime's farthest next hit within 256 segments
+        // (horizon), the range the hit lists were measured and validated in;
+        // small spans keep the packed kernel. The 32-bit bound is the
+        // harvest's (re-checked below).
         const uint64_t x = q_odds_full - 1 + wheel_max_step * pmax;
         const uint64_t horizon = ((x < q_odds_full) ? 0 : (x - q_odds_full) / delta + 1) + 2;
         if (bucket_begin >= sieve_count || horizon > 256 ||
@@ -1163,7 +1140,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // < 2^32 and q_odds_full < 2 delta. GB_HITLIST_K sets the batch.
     hitlist = bucket_on;
     hl_K = env::u32("GB_HITLIST_K", HL_K_DEFAULT, 1u, HL_MAX_K_HOST);
-    // HL_MT (kernels/goldbach.cl hl_harvest_mt): the multipliers m of the
+    // GB_HL_MT (kernels/goldbach.cl hl_harvest_mt): the multipliers m of the
     // hit-listed primes' hits lie in [q_first0 / pmax, limit / pmin]; a hit
     // is filed only when m is prime. Needs every hit-listed p above the
     // cube root (m < p^2: composite m has a factor < p) and the table's
@@ -1201,8 +1178,8 @@ void DenseRun::size_bucket_ring_and_hitlists() {
         // q_odds / p odd multipliers, density 2 / ln m, m ~ q / p:
         // lam = int_lo^hi 2 q_odds / (p ln p ln(q_first0 / p)) dp (prime
         // density 1 / ln p), by the midpoint rule in ln p. Measured at 4e18:
-        // 4171752 filed per segment vs 4171805 (the old 1 / ln m_lo
-        // estimate: 4796437). q_first0 is the run's smallest q (highest
+        // 4171752 filed per segment vs 4171805 (a 1 / ln m_lo estimate:
+        // 4796437). q_first0 is the run's smallest q (highest
         // density); the region capacity adds 10 % + 10 sigma on top.
         const double a = std::log(double(sieve_primes[bucket_begin]));
         const double bnd = std::log(double(sieve_primes[sieve_count - 1]));
@@ -1249,7 +1226,7 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     // seg_end == limit) and the last one's q_odds (the only short one).
     // hl_harvest's 32-bit walk: off + p (off < delta), off + delta and the
     // segment index all stay below 2^32. 2 delta < 2^32 already follows from
-    // bucket_on (a bucketed p > q_odds_full > delta with pmax + q_odds_full
+    // bucket_on (a hit-listed p > q_odds_full > delta with pmax + q_odds_full
     // < 2^32); it is checked here so the kernel does not depend on that.
     if (hitlist && !(q_odds_full < 2 * delta && 2 * delta < (uint64_t(1) << 32) &&
                      delta + sieve_primes[sieve_count - 1] < (uint64_t(1) << 32)))
@@ -1270,9 +1247,10 @@ void DenseRun::size_bucket_ring_and_hitlists() {
     init_mark("bucket-geom+lambda");
 }
 
-/// Phase 7: the packed large-prime lists (host packing + device buffers),
-/// the bucket ring or hit-list buffers and their kernels, and the
-/// GB_BUCKET_VERIFY reference path (full packed list, scratch map, kernels).
+/// Phase 7: the mid-window range, the packed large-prime lists (host
+/// packing + device buffers), the hit-list buffers and their kernels, and
+/// the GB_BUCKET_VERIFY reference path (full packed list, scratch map,
+/// kernels).
 void DenseRun::allocate_large_prime_buffers() {
     // Mid-prime SLM windows (§9.2x): [sieve_split, mid_end) leave the packed
     // kernel; the packed list starts at mid_end.
@@ -1342,9 +1320,9 @@ void DenseRun::allocate_large_prime_buffers() {
     // GB_BUCKET_VERIFY=1: rebuild every segment's map WITHOUT hit lists (tile
     // + packed kernel over ALL large primes) into a scratch map and compare it
     // word for word with the production map on the GPU. Validation mode.
-    // GB_BUCKET_VERIFY=N checks every Nth segment (1 = all; e.g. 100 costs
-    // ~1% and is a cheap production safety net: an end-to-end PASS cannot
-    // reveal a lost hit-list mark — other candidates still resolve the evens).
+    // GB_BUCKET_VERIFY=N checks every Nth segment (1 = all). Sampled, it is
+    // the production safety net: an end-to-end PASS cannot reveal a lost
+    // hit-list mark (other candidates still resolve the evens).
     bucket_verify_every = env::present("GB_BUCKET_VERIFY")
         ? env::u32("GB_BUCKET_VERIFY", 0u, 1u) : 0u;
     bucket_verify = bucket_on && bucket_verify_every > 0;
@@ -1382,9 +1360,8 @@ void DenseRun::allocate_large_prime_buffers() {
 /// completion sync, then the staging buffers are freed.
 void DenseRun::upload_tables() {
     // Reciprocal tables are consumed only by the tile kernel, whose loop ends
-    // at sieve_split. At 4e18 the complete prime list is ~98M entries, while
-    // the default split is only 78K; sizing these to the full list wasted
-    // gigabytes and over a billion setup operations per isolated run.
+    // at sieve_split: sized to the split, not to the full list (~98M primes
+    // at 4e18).
     b.magic        = static_cast<uint64_t*>(ctx.alloc_device(size_t(sieve_split) * 8));
     b.shifts       = static_cast<uint32_t*>(ctx.alloc_device(size_t(sieve_split) * 4));
     b.ms32         = static_cast<uint64_t*>(ctx.alloc_device(size_t(sieve_split) * 8));
@@ -1462,15 +1439,15 @@ void DenseRun::upload_tables() {
     if (hl_mt) build_mtab();
 }
 
-/// HL_MT: builds the multiplier primality table on the device (mt_build)
+/// GB_HL_MT: builds the multiplier primality table on the device (mt_build)
 /// and, with GB_MT_CHECK=N, checks N random table bits on the CPU.
 void DenseRun::build_mtab() {
     Kernel kb(mod, "mt_build");
     kb.set_group_size(1024);
     const size_t words = size_t(mt_blocks) * 180;
-    // uncompressed (2026-11-18 r7): the harvest's scattered word reads skip
-    // the compression metadata, harvest -3.4 % (the lists themselves stay
-    // compressed: uncompressed they are +17 %)
+    // uncompressed: the harvest's scattered word reads skip the compression
+    // metadata, harvest -3.4 % (the lists themselves stay compressed:
+    // uncompressed they are +17 %)
     d_mtab = static_cast<uint32_t*>(ctx.alloc_device(words * 4, 64, true));
     kb.set_arg(0, sizeof(d_mtab), &d_mtab);
     kb.set_arg(1, sizeof(mt_blocks), &mt_blocks);
@@ -1546,10 +1523,6 @@ void DenseRun::pack_stats_buffers() {
     // one buffer here the host writes during enqueue — is written before it.
     // Nothing on the host reads or writes the block again until the slot's
     // next collect, so a queued kernel never sees the block leave the device.
-    //
-    // (Until v2.6 the seven original allocations stayed allocated, unused, so
-    // "nothing that exists today moves" in device memory; the same layout
-    // belief kept the unused S1 / S5 maps, which measured 0.03% (noise).)
     if (stats_on) {
         const size_t ph_bytes = (size_t(MAX_GB_PRIME) / 2 + 1) * 4;
         size_t block_bytes = 0;
@@ -1581,9 +1554,9 @@ void DenseRun::pack_stats_buffers() {
             b.g_part[s]  = static_cast<uint64_t*>(static_cast<void*>(base + at_g_part));
             b.g_tail[s]  = static_cast<uint32_t*>(static_cast<void*>(base + at_g_tail));
             b.g_hist[s]  = static_cast<uint32_t*>(static_cast<void*>(base + at_g_hist));
-            // the state the kernels expect before a slot's first segment (as
-            // the original buffers had it): p_hist / x_cnt zero, p_first all
-            // ones, count30's gap outputs reset
+            // the state the kernels expect before a slot's first segment:
+            // p_hist / x_cnt zero, p_first all ones, count30's gap outputs
+            // reset
             std::memset(b.p_first[s], 0xFF, ph_bytes);
             reset_gaps(s);
         }
@@ -1593,15 +1566,10 @@ void DenseRun::pack_stats_buffers() {
 /// Phase 10: the per-slot timestamp events; closes the init timing.
 void DenseRun::create_events() {
     gb_count = uint32_t(gb_primes.size());
-    // The mask-table kernel arg is set per segment (the table CONTENT is
-    // q_first-dependent and rewritten into the slot's shared buffer each
-    // iteration, alongside first_bits).
-
-    // Events for per-kernel GPU timing and GPU-side dependencies.
-    // Per pipeline slot: sieve signals after the tile-sieve launch, large
-    // after the large-prime launch (the check kernel waits on BOTH GPU-side),
-    // check signals after the check launch (the host waits on it once per
-    // segment). One pool; every event is reset on its own.
+    // Per pipeline slot: timestamp events of the tile sieve, the large-prime
+    // kernels and the checker (SlotEvents); the host waits on the check
+    // event once per segment. Launch order comes from the barrier per
+    // launch, not from the events.
     init_mark("upload");
     ev.create(ctx.context());
     // nothing computed from the base primes is trusted before their cache passed
@@ -1746,11 +1714,8 @@ void DenseRun::begin_segment(Segment& sg) {
     sg.t_seg_wall = clock_::now();
     sg.offset_before = offset_seconds;
 
-    // The small-prime mask table is q_first-dependent; the kernel's stage
-    // 3.5 (restore q = p) is range-sensitive and skipped when q_first >
-    // MASK_MAX_P, so masks stay valid at every range (disabling them at
-    // high ranges forced Xe2 into thousands of scalar SLM RMWs per lane
-    // for p=3..61 instead of 18 x 32 whole-word ANDs).
+    // The masks apply at every range: the kernel restores q = p (stage 3.5)
+    // only where the segment can contain a mask prime.
     sg.mask_count_seg = mask_count;
 
     // Per-segment telemetry record (collected after the NEXT iteration's
@@ -1763,9 +1728,8 @@ void DenseRun::begin_segment(Segment& sg) {
     seg_stat.mask_count  = sg.mask_count_seg;
     seg_stat.tiles       = sg.tiles_launch;
     // work-items of the packed large-prime kernel as launched below
-    // (LARGE_PACK_PPI primes each; the bucketed / hit-listed primes are
-    // not work-items of it). The legacy LARGE_PRIMES_PER_ITEM count over
-    // every large prime reported ~4x the real launch.
+    // (LARGE_PACK_PPI primes each; the hit-listed primes are not work-items
+    // of it)
     seg_stat.large_items = (uint64_t(packed_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
     sum_tiles += sg.tiles_launch;
     sum_large_items += seg_stat.large_items;
@@ -1814,9 +1778,10 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
         // Large-prime first bits are computed inline by the packed kernel
         // (tools/debug_fb.cpp validates that formula bit for bit).
 
-        // Small-prime mask table for THIS segment (q_first-dependent).
-        // Same shared-buffer pipeline-safety argument as first_bits:
-        // this slot was last read two segments ago, already synced.
+        // Small-prime masks for THIS segment: the per-class group offsets
+        // (or, without mask groups, the per-prime tables). Same
+        // shared-buffer pipeline-safety argument as first_bits: this slot
+        // was last read two segments ago, already synced.
         for (uint32_t c = 0; c < sg.cgeo.K; ++c) {
             if (mask_groups_n > 0) {
                 // canonical tables (uploaded once): per class only the
@@ -1843,10 +1808,9 @@ void DenseRun::prepare_segment_tables(Segment& sg) {
 void DenseRun::enqueue_sieve(Segment& sg) {
     sg.t_enq = clock_::now();
 
-    // --- make_prime_map args (single launch covers ALL tiles)
-    // Kernel arg order: 0=map 1=primes 2=fb_global 3=magic 4=shifts
-    //                   5=count 6=q_odds 7=SLM 8=mask_count 9=mask_table
-    //                   10=q_first 11=sieve_split
+    // --- make_prime_map args (single launch covers ALL tiles), in the
+    // order of the kernel's signature; arg 5 (sieve_count, unused by the
+    // kernel) gets the split
     const auto t_args0 = clock_::now();
     k_sieve.set_arg(0, sizeof(b.prime_map[sg.slot]),    &b.prime_map[sg.slot]);
     k_sieve.set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
@@ -1952,8 +1916,8 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
 /// Step 4b' (mid windows, §9.2x): after a barrier (the tile kernel's stores
 /// and mid_setup complete), mid_window rebuilds each 128 KB window of the
 /// class map with the mid primes' marks and ANDs it into the map with
-/// 64-bit atomics, so the packed kernel may run beside it (without HL_MT;
-/// else its barrier orders its atomics after them).
+/// 64-bit atomics, so the packed kernel may run beside it (with GB_HL_MT=0;
+/// with the multiplier filter a barrier orders the packed kernel after it).
 void DenseRun::enqueue_midwin(const Segment& sg, uint64_t* map, ze_event_handle_t done) {
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     const uint32_t c5w32 = sg.c5w * 2u;
@@ -2054,10 +2018,10 @@ void DenseRun::enqueue_packed_large(const Segment& sg, uint32_t hl_jb) {
     // kernel may run beside it: both only AND-clear bits. The barrier
     // enqueue_midwin appends before mid_window already follows the tile
     // sieve's stores, mid_setup and the hit-list harvest (enqueued before it),
-    // which is all this kernel needs. With HL_MT the packed kernel waits for
-    // mid_window instead (barrier): it then shortens with every prime moved
-    // to the hit lists, while beside mid_window its span did not (2026-11-18:
-    // 35M gpu -2 % only without the overlap); GB_HL_MT=0 keeps the overlap
+    // which is all this kernel needs. With GB_HL_MT the packed kernel waits
+    // for mid_window instead (barrier): it then shortens with every prime
+    // moved to the hit lists, while beside mid_window its span did not (35M:
+    // gpu -2 % only without the overlap); GB_HL_MT=0 keeps the overlap
     // (+0.5 % on that path).
     const bool ml_ovl = !hl_mt && mid_n > 0;
     if (!ml_ovl) ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
@@ -2327,9 +2291,9 @@ void DenseRun::enqueue_check30(const Segment& sg, const Seg30& s30, uint32_t rid
     // count30 (statistics; reads the finished map only) between phase A's
     // barrier and phase B, neither behind a further barrier: launched first,
     // its work-groups take their thread slots first and it ends inside the
-    // next segment's tile sieve (2026-11-18: tile kernel 0.567 -> 0.495 ms per
-    // segment, gpu -0.9%; beside phase A, which is ALU-bound, it cost ~1.5x
-    // as much). The next mid_window barrier and the host's wait on its event
+    // next segment's tile sieve (tile kernel 0.567 -> 0.495 ms per segment,
+    // gpu -0.9%; beside phase A, which is ALU-bound, it cost ~1.5x as
+    // much). The next mid_window barrier and the host's wait on its event
     // (collection) order everything after it.
     if (stats_on) enqueue_count30(sg, false);
     k_cb->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
@@ -2491,9 +2455,9 @@ void DenseRun::reset_slot_counters(uint32_t sl) {
 }
 
 /// Positive coverage of a collected slot: every even of its segment must be
-/// accounted for as resolved on the GPU or listed for the CPU fallback. A
-/// PASS used to mean only "no failure was reported": a checker launch that
-/// did not run (or covered too few evens) left nothing pending and passed.
+/// accounted for as resolved on the GPU or listed for the CPU fallback.
+/// Without it, a checker launch that did not run (or covered too few evens)
+/// would leave nothing pending and pass.
 /// mod-30 segments: check30_a's resolved count + pending == segment evens and
 /// check30_b's resolved count + leftovers == pending. Sampled segments: the
 /// exact histogram's count of the segment + leftovers == segment evens.
@@ -2507,7 +2471,7 @@ void DenseRun::check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left) {
                                      " + leftovers " + std::to_string(n_left) + " != segment evens" + seg);
         return;
     }
-    if (!acct_slot[sl]) return;          // a fallback checker without accounting
+    if (!acct_slot[sl]) return;          // acct_slot == !sampled: not taken (sampled returned above)
     const uint64_t res_a = b.acct[sl][0], res_b = b.acct[sl][1];
     if (res_a + pend != prev_seg_evens)
         throw std::runtime_error("coverage: phase A resolved " + std::to_string(res_a) + " + pending " +
@@ -2571,10 +2535,10 @@ void DenseRun::assemble_run_stats() {
     stats.sieve_seconds  = sieve_seconds;
     stats.large_seconds  = large_seconds;
     stats.verify_seconds = verify_seconds;
-    // Host offset preparation is now GPU-side (prep_large_fb); the remaining
-    // host work per segment is the tile table + masks, overlapped with GPU
-    // execution. Report a non-negative residual rather than a misleading
-    // negative sync.
+    // The large kernels compute their first marks inline (no host offset
+    // pass); the host work per segment (first bits, tile table, masks)
+    // overlaps the GPU. Report a non-negative residual rather than a
+    // misleading negative sync.
     stats.sync_seconds   = std::max(0.0, stats.gpu_seconds - sieve_seconds -
                                          large_seconds - verify_seconds);
     stats.offset_seconds = offset_seconds;
@@ -2604,9 +2568,9 @@ void DenseRun::assemble_run_stats() {
                              "default floor once the top list fills)\n", RIDGE_CAP);
 }
 
-/// Phase 14 (success path only, as before): destroys the events and frees the
-/// device buffers in run_gpu's order. On an exception nothing here runs; the
-/// kernels, module and context are destroyed by ~DenseRun (as the locals were).
+/// Phase 14 (success path only): destroys the events and frees the device
+/// buffers. On an exception nothing here runs; ~DenseRun destroys the
+/// kernels, module and context.
 void DenseRun::release_device_objects() {
     ev.destroy();
 
@@ -2647,7 +2611,7 @@ void DenseRun::release_device_objects() {
 }
 
 /// Runs the phases after construction (phases 1-2 and the Level Zero objects
-/// are done by then), in run_gpu's order.
+/// are done by then), in order.
 RunStats DenseRun::run() {
     // ---- Level Zero setup (ctx, mod and the first four kernels: DenseRun's
     // member initializers) -----------------------------------------------------

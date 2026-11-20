@@ -34,13 +34,13 @@ expect_rc 2 "unknown option" --no-such-option
 expect_rc 0 "--help" --help
 
 echo "empty / reversed ranges and bad option values -> exit 2 (before any GPU work)"
-# Before v2.3.0, start > limit verified n = limit (outside the request) and
-# reported PASS; an odd start == limit failed with an unrelated GPU error.
+# start > limit must not verify n = limit (outside the request) and report
+# PASS, and an odd start == limit must not fail with an unrelated GPU error.
 expect_rc 2 "--start 200 --limit 100 (reversed)" --start 200 --limit 100
 expect_rc 2 "--start 101 --limit 101 (no even)" --start 101 --limit 101
 expect_rc 2 "--start 4000000000000000001 --limit 4000000000000000001" --start 4000000000000000001 --limit 4000000000000000001
 expect_rc 2 "--limit 3 (no even >= 4)" --limit 3
-# n = 4 alone has no odd q: used to wrap q_odds to 2^63 and size the launch from it
+# n = 4 alone has no odd q: it would wrap q_odds to 2^63 and size the launch from it
 expect_rc 1 "--limit 4 (n = 4 = 2 + 2 only; GPU path needs limit >= 6)" --limit 4
 expect_rc 2 "--start 18446744073709551615 (odd max, wraps when rounded)" --start 18446744073709551615 --limit 18446744073709551615
 expect_rc 2 "--split 4294967296 (> 2^32 - 1)" --split 4294967296 --limit 1e6
@@ -57,8 +57,8 @@ for top in 18446744073709551614 18446742974197923842; do
 done
 
 echo "zero / malformed work-group knobs fail closed before any GPU work -> exit 1"
-# A zero grid-stride grid skipped phase B (pending evens never checked) or the
-# hit-list marks, and could still report PASS.
+# A zero grid-stride grid would skip phase B (pending evens never checked) or
+# the hit-list marks, and could still report PASS.
 for knob in GB_CHECK_BGROUPS=0 GB_STATS_BGROUPS=0 GB_BUCKET_GROUPS=0 GB_CHECK_BGROUPS=abc \
             GB_CHECK_BGROUPS=-1 GB_SCM_BGROUPS=0; do
     mode=""; [ "${knob%%=*}" = GB_SCM_BGROUPS ] && mode=--sparse

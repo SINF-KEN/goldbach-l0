@@ -42,8 +42,8 @@ std::vector<uint64_t> small_prime_mask_table(const uint32_t* sieve_primes,
     //
     // Word w covers global bits [64w, 64w+64). Its mask must clear the
     // local bits b < 64 with (64w + b) = r (mod p), i.e.
-    // b = (r - 64w) mod p. Phase = w mod p determines b; consecutive words
-    // advance the phase by 64 mod p.
+    // b = (r - 64w) mod p, which depends only on the phase w mod p:
+    // consecutive words advance the phase by 1.
     for (uint32_t j = 0; j < mask_count; ++j) {
         const uint64_t p = sieve_primes[j];
         if (p < 3 || p >= 64) continue;   // kernel contract: phase fits u32, table sized for p < 64
@@ -141,9 +141,9 @@ bool prime_payload_ok(const uint32_t* p, size_t cnt, uint64_t lim) {
 }
 
 /// Publishes @p primes as the cache @p path atomically: a unique temp file,
-/// fsync, rename (writing the final path in place let a concurrent builder's
-/// truncation expose a zero-filled hole to a third process). The cache is
-/// optional: on any failure no file is left behind.
+/// fsync, rename (writing the final path in place would let a concurrent
+/// builder's truncation expose a zero-filled hole to a third process). The
+/// cache is optional: on any failure no file is left behind.
 void write_cache(const std::string& path, uint64_t n, const std::vector<uint32_t>& primes) {
     const std::string tmp = path + ".tmp." + std::to_string(::getpid());
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -297,10 +297,10 @@ SmallPrimeGroups small_prime_group_masks(const uint32_t* sieve_primes,
         small_prime_mask_table(sieve_primes, mask_count, q_first), max_period);
 }
 
-// Class-map masks (class mode): index i <-> q = base + step*i (step 6 for the
-// q = 1 / 5 (mod 6) arrays). Multiples of p are the i = r (mod p) with
-// base + step*r = 0 (mod p); a prime dividing step (3 for step 6) has no
-// multiple in the progression (all-ones masks). Same table layout as
+// Class-map masks: index i <-> q = base + step*i (step 30 for the mod-30
+// class arrays). Multiples of p are the i = r (mod p) with
+// base + step*r = 0 (mod p); a prime dividing step (3 and 5 for step 30) has
+// no multiple in the progression (all-ones masks). Same table layout as
 // small_prime_mask_table (64 phase masks per prime, phase = word index mod p).
 std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
                                                   uint32_t mask_count,
@@ -329,7 +329,7 @@ std::vector<uint64_t> small_prime_mask_table_step(const uint32_t* sieve_primes,
 
 // Folds the @p extra primes after the mask primes (sieve_primes[mask_count],
 // ...: 67, 71, ...) into the groups, each into the group of smallest period at
-// that point (2026-11-18 MASK_XP_DEFAULT: the fused mask stage clears them with no
+// that point (MASK_XP_DEFAULT: the fused mask stage clears them with no
 // extra loads; the tile's owned walk starts after them).
 static void fold_extra_primes(std::vector<std::vector<uint32_t>>& groups, const uint32_t* sieve_primes,
                               uint32_t mask_count, uint32_t extra) {
@@ -394,7 +394,7 @@ SmallPrimeGroups small_prime_group_masks_from(const uint32_t* sieve_primes,
     return g;
 }
 
-// Canonical group tables (class modes): every prime's marks at index 0 mod p
+// Canonical group tables (class maps): every prime's marks at index 0 mod p
 // (primes dividing skip_mod have none: all-ones), so the table depends on the
 // primes only. A progression with marks at i = r_p (mod p) reads group g at
 // word (x - Y_g) mod P_g (small_prime_group_offsets): the pattern is periodic
