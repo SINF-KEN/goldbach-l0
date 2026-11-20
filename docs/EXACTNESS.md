@@ -109,6 +109,24 @@ the longest run of c + t divisible by 7..29 is 8) would only leave mm = 0.
 **If violated.** A needed mark is skipped (wrong c) and the map holds a
 composite as prime: prime counts change, the run may still PASS.
 
+## 2c. Mid windows: primes ≥ the window size mark at most once
+
+**Rule.** `mid_window` walks the mid primes p ≥ win_bits (2²⁰ class bits)
+without a mark loop: one test `bit < wb` and at most one SLM atomic per
+window (2026-11-19 r12). A window holds wb ≤ win_bits class bits and the marks
+of p in one class are p apart, so a second mark bit + p ≥ win_bits ≥ wb never
+lies in the window.
+
+**Enforced.** The kernel switches a lane to that loop when the prime at its
+batch base (index j − lid ≤ j) is ≥ win_bits; the primes ascend, so every
+prime the lane walks there is ≥ win_bits. Each lane's index j only advances,
+so every prime is still walked exactly once.
+
+**If broken** (a switch bound below win_bits): marks after
+the first in a window are lost, composites stay "prime" (caught by
+`GB_BUCKET_VERIFY_FULL=1` and the prime counts, not by the default verify,
+which runs mid_window itself).
+
 ## 3. Read-before-mark in the packed kernel
 
 **Rule.** `map_clear_chk` (kernels/goldbach.cl:336) reads the map word
@@ -201,6 +219,9 @@ src/verifier.cpp:111).
   about 30 MB, so this never fired.
 - The harvest's 32-bit walk needs q_odds_full < 2·delta < 2³² and
   delta + p_max < 2³² (src/verifier.cpp:1229, throws).
+- `hl_harvest_mt` forms each store's entry index j·hl_G·hl_capg + g·hl_capg +
+  idx in u32 (2026-11-19 r12; it was an emulated 64-bit multiply per hit). The
+  4 GiB rule above bounds it below 2³⁰.
 
 **Device memory.** At 4e18..5e18 the run takes ~6.5-7.2 GB of the B580's 12 GB:
 lists ~3.5 GB, multiplier table 2.7-3.4 GB, maps and the rest. Do not add more
