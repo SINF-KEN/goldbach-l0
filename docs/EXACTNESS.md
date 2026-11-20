@@ -185,12 +185,20 @@ path used the same remainder.
 
 ## 5. Gap walk by blocks of 30: host Miller-Rabin fallback
 
-**Rule.** count30's gap walk steps once per non-empty block of 30 and adds the
-gaps inside a block from a 256-entry pattern histogram. Its maximum only covers
+**Rule.** count30's gap walk steps once per non-empty block of 30. The gaps
+inside a block are counted bit-parallel per 32 blocks: for slots a < b in phase
+order (the class order rotated by the segment's first class r0), the blocks with
+primes in a and b and none in between, each an internal gap g with g / 2 =
+(res_b - res_a) mod 30 / 2. That value depends only on the two residues, not on
+q_first, so each of the 8 rotations is a static copy and the counts go straight
+to 14 bins g / 2 = 1..14 (16-bit lane fields, flushed every 128 passes: at most
+7 · 64 per pass). Exact iff phase order = class order rotated by r0 (host-checked
+in enqueue_count30) and the classes are the residues 1, 7, ..., 29 in order
+(CLASS_RES30 = G30_RES). Its maximum only covers
 gaps into blocks. When a segment's largest such gap is not larger than the
 largest internal one (all gaps ≤ 28, which only happens on tiny ranges), the
 host recomputes the maximum with Miller-Rabin over the counted range
-(`walk_max_exact`, include/gstats.hpp:111, called at src/verifier.cpp:1030).
+(`walk_max_exact`, include/gstats.hpp:100, called at src/verifier.cpp:1053).
 
 **Condition.** The CPU walk is bounded at 10⁷ numbers. Above that it throws
 (`gaps: block-walk maximum needs a CPU walk over ...`), so the run fails closed
