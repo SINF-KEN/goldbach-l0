@@ -109,6 +109,24 @@ the longest run of c + t divisible by 7..29 is 8) would only leave mm = 0.
 **If violated.** A needed mark is skipped (wrong c) and the map holds a
 composite as prime: prime counts change, the run may still PASS.
 
+## 2c. Mid windows: primes ≥ the window size mark at most once
+
+**Rule.** `mid_window` walks the mid primes p ≥ win_bits (2²⁰ class bits)
+without a mark loop: one test `bit < wb` and at most one SLM atomic per
+window (2026-11-19 r12). A window holds wb ≤ win_bits class bits and the marks
+of p in one class are p apart, so a second mark bit + p ≥ win_bits ≥ wb never
+lies in the window.
+
+**Enforced.** The kernel switches a lane to that loop when the prime at its
+batch base (index j − lid ≤ j) is ≥ win_bits; the primes ascend, so every
+prime the lane walks there is ≥ win_bits. Each lane's index j only advances,
+so every prime is still walked exactly once.
+
+**If broken** (a switch bound below win_bits): marks after
+the first in a window are lost, composites stay "prime" (caught by
+`GB_BUCKET_VERIFY_FULL=1` and the prime counts, not by the default verify,
+which runs mid_window itself).
+
 ## 3. Read-before-mark in the packed kernel
 
 **Rule.** `map_clear_chk` (kernels/goldbach.cl:336) reads the map word
@@ -167,12 +185,20 @@ path used the same remainder.
 
 ## 5. Gap walk by blocks of 30: host Miller-Rabin fallback
 
-**Rule.** count30's gap walk steps once per non-empty block of 30 and adds the
-gaps inside a block from a 256-entry pattern histogram. Its maximum only covers
+**Rule.** count30's gap walk steps once per non-empty block of 30. The gaps
+inside a block are counted bit-parallel per 32 blocks: for slots a < b in phase
+order (the class order rotated by the segment's first class r0), the blocks with
+primes in a and b and none in between, each an internal gap g with g / 2 =
+(res_b - res_a) mod 30 / 2. That value depends only on the two residues, not on
+q_first, so each of the 8 rotations is a static copy and the counts go straight
+to 14 bins g / 2 = 1..14 (16-bit lane fields, flushed every 128 passes: at most
+7 · 64 per pass). Exact iff phase order = class order rotated by r0 (host-checked
+in enqueue_count30) and the classes are the residues 1, 7, ..., 29 in order
+(CLASS_RES30 = G30_RES). Its maximum only covers
 gaps into blocks. When a segment's largest such gap is not larger than the
 largest internal one (all gaps ≤ 28, which only happens on tiny ranges), the
 host recomputes the maximum with Miller-Rabin over the counted range
-(`walk_max_exact`, include/gstats.hpp:111, called at src/verifier.cpp:1030).
+(`walk_max_exact`, include/gstats.hpp:100, called at src/verifier.cpp:1053).
 
 **Condition.** The CPU walk is bounded at 10⁷ numbers. Above that it throws
 (`gaps: block-walk maximum needs a CPU walk over ...`), so the run fails closed
@@ -201,6 +227,9 @@ src/verifier.cpp:111).
   about 30 MB, so this never fired.
 - The harvest's 32-bit walk needs q_odds_full < 2·delta < 2³² and
   delta + p_max < 2³² (src/verifier.cpp:1229, throws).
+- `hl_harvest_mt` forms each store's entry index j·hl_G·hl_capg + g·hl_capg +
+  idx in u32 (2026-11-19 r12; it was an emulated 64-bit multiply per hit). The
+  4 GiB rule above bounds it below 2³⁰.
 
 **Device memory.** At 4e18..5e18 the run takes ~6.5-7.2 GB of the B580's 12 GB:
 lists ~3.5 GB, multiplier table 2.7-3.4 GB, maps and the rest. Do not add more
@@ -245,7 +274,8 @@ The atomic costs ~0.7 % (PR #33). It is kept on purpose.
 1. `./build.sh` with the pinned ocloc; commit the fresh `.spv` (CI's kernels
    gate). `ctest -LE gpu` (check_constants covers the constants above).
 2. Exactness against the previous build with val.sh on 4e18 +1e11 and 5e18
-   −1e11 with `GB_BUCKET_VERIFY=1`, on 1e12, 1e14 and 1e18 (+1e10), and on a
+   −1e11 with `GB_BUCKET_VERIFY=1` (add `GB_BUCKET_VERIFY_FULL=1` when mid_window
+   changes: the default reference runs mid_window itself), on 1e12, 1e14 and 1e18 (+1e10), and on a
    5e8 window at 4e18. stats.state, stats.state.gaps, ridges and stats.log
    (except times) must be byte-identical.
 3. `GB_HL_MT=0` at 4e18 must stay exact (the fallback).

@@ -378,7 +378,7 @@ private:
     void prepare_segment_tables(Segment& sg);
     void enqueue_sieve(Segment& sg);
     void enqueue_large_primes(Segment& sg);
-    void enqueue_midwin(const Segment& sg);
+    void enqueue_midwin(const Segment& sg, uint64_t* map, ze_event_handle_t done);
     void enqueue_hitlists(const Segment& sg, uint32_t& hl_jb);
     void enqueue_packed_large(const Segment& sg, uint32_t hl_jb);
     void enqueue_bucket_verify(const Segment& sg);
@@ -390,6 +390,7 @@ private:
     void end_iteration(const Segment& sg);
     void drain_final_segment();
     void collect_slot(uint32_t sl, SegmentStats& rec);
+    void reset_slot_counters(uint32_t sl);
     void check_coverage(uint32_t sl, uint32_t pend, uint32_t n_left);
 
     // Helpers
@@ -460,7 +461,6 @@ private:
     uint32_t tail_t = 0;             // check30_b tail recording bound (stats)
     bool sampled_slot[2] = {false, false}; // slot's segment is a full-histogram sample
     uint64_t slot_qfirst[2] = {0, 0};      // slot's segment position origin (gap positions)
-    uint32_t slot_gphis[2] = {0, 0};       // count30's phases in phase order (block-walk patterns)
     uint32_t slot_ggroups[2] = {0, 0};     // count30 work-groups launched for the slot's segment
     bool walked_slot[2] = {false, false};  // count30 walked the slot's gaps
     uint64_t sampled_evens = 0;            // evens of the sampled segments
@@ -521,6 +521,8 @@ private:
     uint32_t bucket_verify_every = 0;  // GB_BUCKET_VERIFY (0: off)
     bool bucket_verify = false;
     PackedLarge packed_full;
+    uint32_t verify_lo = 0;          // GB_BUCKET_VERIFY: packed reference primes [verify_lo, count)
+    bool verify_mid = false;         // GB_BUCKET_VERIFY: the reference runs mid_window (not _FULL)
     uint32_t* d_full_bases = nullptr;
     uint32_t* d_full_gaps = nullptr;
     uint64_t* d_verify_map = nullptr;
@@ -953,10 +955,10 @@ void DenseRun::allocate_slot_buffers() {
         b.pending[s]   = static_cast<uint32_t*>(ctx.alloc_device(size_t(pending_cap) * 4));
         b.pending_n[s] = static_cast<uint32_t*>(ctx.alloc_shared(4));
         b.acct[s]      = static_cast<uint32_t*>(ctx.alloc_shared(8));
-        std::memset(b.acct[s], 0, 8);
         // Ridge append buffer: u32 count in word 0 (low half) + RIDGE_CAP
         // (n, p) pairs; shared so the host merges it without a D2H copy.
         b.ridge[s]     = static_cast<uint64_t*>(ctx.alloc_shared((1 + 2 * size_t(RIDGE_CAP)) * 8));
+        reset_slot_counters(s);
         b.p_hist[s]  = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
         b.p_first[s] = static_cast<uint32_t*>(ctx.alloc_shared((MAX_GB_PRIME / 2 + 1) * 4));
         std::memset(b.p_hist[s], 0, (MAX_GB_PRIME / 2 + 1) * 4);
@@ -1016,12 +1018,12 @@ void DenseRun::collect_stats(uint32_t sl, uint64_t seg_start_sl) {
         const bool w = walked_slot[sl];
         if (w)
             for (uint32_t g = 0; g < slot_ggroups[sl]; ++g) wmax = std::max(wmax, b.g_part[sl][g]);
-        // count30's block walk: the internal gaps of the blocks with two or
-        // more primes, by pattern (bins after the histogram)
+        // count30's block walk: the internal gaps of the blocks of 30
+        // (bins g / 2 after the histogram)
         uint32_t hx[GAPS30_HBINS];
         if (w) {
             std::memcpy(hx, b.g_hist[sl], sizeof(hx));
-            const uint32_t dint = add_pattern_gaps(hx, b.g_hist[sl] + GAPS30_HBINS, slot_gphis[sl]);
+            const uint32_t dint = add_inner_gaps(hx, b.g_hist[sl] + GAPS30_HBINS);
             // count30's maximum covers the gaps into blocks only
             if (dint && (wmax >> 32) <= 2ull * dint && b.x_cnt[sl][11] != ~0u)
                 wmax = walk_max_exact(slot_qfirst[sl], b.x_cnt[sl][11], b.x_cnt[sl][12]);
@@ -1329,7 +1331,17 @@ void DenseRun::allocate_large_prime_buffers() {
     d_verify_map = nullptr;
     verify_diff = nullptr;
     if (bucket_verify) {
-        packed_full = pack_large_primes(sieve_primes, sieve_split, sieve_count);
+        // The reference rebuilds the map without hit lists: tile, mid windows
+        // (when on) and the packed kernel over every larger prime. It checks
+        // the hit-list path (harvest, multiplier table, lists, apply) against
+        // the plain packed marks and re-runs every stage. (Until v2.8 the mid
+        // primes went through the packed kernel too: global atomics at ~29 ms
+        // per verified segment, ~3.5 % of production at GB_BUCKET_VERIFY=500.)
+        // GB_BUCKET_VERIFY_FULL: the old, slower reference (mid primes in the
+        // packed kernel too: also checks mid_window against other code).
+        verify_mid = mid_n > 0 && !env::present("GB_BUCKET_VERIFY_FULL");
+        verify_lo = verify_mid ? mid_end : sieve_split;
+        packed_full = pack_large_primes(sieve_primes, verify_lo, sieve_count);
         d_full_bases = static_cast<uint32_t*>(ctx.alloc_device(packed_full.bases.size() * 4));
         d_full_gaps  = static_cast<uint32_t*>(ctx.alloc_device(packed_full.gaps.size()));
         verify_diff  = static_cast<uint32_t*>(ctx.alloc_shared(4));
@@ -1839,15 +1851,12 @@ void DenseRun::enqueue_sieve(Segment& sg) {
     // blocks forever (this caused size-dependent hangs). All events are
     // quiescent here: their previous signals belonged to segment k-2,
     // whose check kernel was host-synchronized during the last iteration.
+    // leftover_n / pending_n / acct / ridge's count are zeroed by the host
+    // after each collect (reset_slot_counters) instead of three 1-byte-
+    // pattern MemoryFills per segment (builtin fill kernels; long6 +0.14%).
+    // Under unitrace those fills appear to stall until count30 ends (67 us
+    // average): an instrumentation artefact, not a bubble of the real run.
     const uint32_t zero = 0;
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.leftover_n[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.pending_n[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.acct[sg.slot], &zero, 4, 8,
-                                           nullptr, 0, nullptr));
-    ZE_CHECK(zeCommandListAppendMemoryFill(ctx.list(), b.ridge[sg.slot], &zero, 1, 4,
-                                           nullptr, 0, nullptr));
     // statistics: p_hist / p_first / x_cnt are reset by the host after
     // each collect (collect_stats); x_hist is used by sampled segments only
     if (stats_on && stats.segments % stats_sample == 0)
@@ -1893,7 +1902,7 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
     uint32_t hl_jb = 0;   // this segment's list (hit lists)
     if (hitlist) enqueue_hitlists(sg, hl_jb);
     if (mid_n > 0) {
-        enqueue_midwin(sg);
+        enqueue_midwin(sg, b.prime_map[sg.slot], ev.mw[sg.slot]);
     }
     if (large_count > 0) {
         enqueue_packed_large(sg, hl_jb);
@@ -1909,12 +1918,12 @@ void DenseRun::enqueue_large_primes(Segment& sg) {
 /// class map with the mid primes' marks and ANDs it into the map with
 /// 64-bit atomics, so the packed kernel may run beside it (with GB_HL_MT=0;
 /// with the multiplier filter a barrier orders the packed kernel after it).
-void DenseRun::enqueue_midwin(const Segment& sg) {
+void DenseRun::enqueue_midwin(const Segment& sg, uint64_t* map, ze_event_handle_t done) {
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     const uint32_t c5w32 = sg.c5w * 2u;
     const uint64_t ncmax = (sg.q_odds + 14) / 15;
     const uint32_t wpc = uint32_t((ncmax + midw_bits - 1) / midw_bits);
-    k_midw->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
+    k_midw->set_arg(0, sizeof(map), &map);
     k_midw->set_arg(1, sizeof(b.sieve_primes), &b.sieve_primes);
     k_midw->set_arg(2, 4, &sieve_split);
     k_midw->set_arg(3, 4, &mid_n);
@@ -1926,7 +1935,7 @@ void DenseRun::enqueue_midwin(const Segment& sg) {
     k_midw->set_arg(9, 4, &midw_bits);
     k_midw->set_local_arg(10, size_t(midw_bits) / 8);
     k_midw->set_arg(11, 8, &sg.q_first);
-    k_midw->launch_overlap(ctx.list(), uint32_t(ncls_map) * wpc, ev.mw[sg.slot]);
+    k_midw->launch_overlap(ctx.list(), uint32_t(ncls_map) * wpc, done);
 }
 
 /// Step 4a: hit lists for primes [bucket_begin, sieve_count): the batch
@@ -2051,11 +2060,13 @@ void DenseRun::enqueue_bucket_verify(const Segment& sg) {
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     k_sieve.set_arg(0, sizeof(d_verify_map), &d_verify_map);
     k_sieve.launch(ctx.list(), uint32_t(sg.tiles_launch));
-    ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
+    if (verify_mid) enqueue_midwin(sg, d_verify_map, nullptr);   // barrier, mid windows (mid_setup's table)
+    else ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     k_large_full->set_arg(0, sizeof(d_verify_map), &d_verify_map);
     k_large_full->set_arg(1, sizeof(d_full_bases), &d_full_bases);
     k_large_full->set_arg(2, sizeof(d_full_gaps), &d_full_gaps);
-    k_large_full->set_arg(3, sizeof(large_count), &large_count);
+    const uint32_t full_count = sieve_count - verify_lo;
+    k_large_full->set_arg(3, sizeof(full_count), &full_count);
     k_large_full->set_arg(4, sizeof(sg.q_odds), &sg.q_odds);
     k_large_full->set_arg(5, sizeof(sg.q_first), &sg.q_first);
     k_large_full->set_arg(6, sizeof(sg.q_last), &sg.q_last);
@@ -2063,7 +2074,7 @@ void DenseRun::enqueue_bucket_verify(const Segment& sg) {
     k_large_full->set_arg(8, 4, &sg.ga1);
     k_large_full->set_arg(9, 4, &sg.ga2);
     k_large_full->set_arg(10, 4, &sg.off5);
-    const uint64_t items_full = (uint64_t(large_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
+    const uint64_t items_full = (uint64_t(full_count) + LARGE_PACK_PPI - 1) / LARGE_PACK_PPI;
     k_large_full->launch(ctx.list(), uint32_t((items_full + large_wg - 1) / large_wg));
     ZE_CHECK(zeCommandListAppendBarrier(ctx.list(), nullptr, 0, nullptr));
     const uint64_t nwords = uint64_t(sg.cgeo.K) * sg.c5w;
@@ -2173,7 +2184,6 @@ void DenseRun::enqueue_count30(const Segment& sg, bool sampled) {
     const uint32_t cgroups = (cw32 / COUNT30_CW + WG_SIZE - 1) / WG_SIZE;
     slot_ggroups[sg.slot] = cwalk ? std::min(gaps_groups, cgroups) : cgroups;
     slot_qfirst[sg.slot] = sg.q_first;
-    slot_gphis[sg.slot] = g_phis;
     k_cnt->set_arg(0, sizeof(b.prime_map[sg.slot]), &b.prime_map[sg.slot]);
     k_cnt->set_arg(1, 4, &cw32);
     k_cnt->set_arg(2, sizeof(b.x_lim[sg.slot]), &b.x_lim[sg.slot]);
@@ -2430,6 +2440,18 @@ void DenseRun::collect_slot(uint32_t sl, SegmentStats& rec) {
                           prev_seg_evens, gb_primes, verbose, stats.segments - 1, &*ridges,
                           gstats.get(), sampled_slot[sl]);
     ridges->save(ridge_file);
+    reset_slot_counters(sl);
+}
+
+/// Zeroes slot @p sl's checker counters (leftover_n, pending_n, acct and the
+/// ridge count) from the host, as collect_stats does for p_hist / x_cnt.
+/// @pre no command that touches the slot is in flight (its check and count30
+///      events have fired, or the slot was never used).
+void DenseRun::reset_slot_counters(uint32_t sl) {
+    *b.leftover_n[sl] = 0;
+    *b.pending_n[sl] = 0;
+    b.acct[sl][0] = b.acct[sl][1] = 0;
+    *reinterpret_cast<uint32_t*>(b.ridge[sl]) = 0;
 }
 
 /// Positive coverage of a collected slot: every even of its segment must be

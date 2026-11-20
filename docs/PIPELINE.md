@@ -54,7 +54,7 @@ flowchart TD
         G2["First segment of each batch (K ≈ 149): hl_harvest_mt<br/>hits p·m with m PRIME (multiplier bitmap from mt_build)<br/>of every prime ≥ 0.15 × q_odds in the batch<br/>→ per-segment u32 offset lists (overflow → bkt_err)"]
         G3["hl_apply<br/>streams this segment's list, atomic AND-clear"]
         G4["sieve_large_packed<br/>one item per packed large prime; skips m divisible by 3..43<br/>reads the word first, atomic AND-clear only if the bit is set"]
-        G5["Every 100th segment: GB_BUCKET_VERIFY<br/>make_prime_map + sieve_large_packed over ALL primes<br/>→ scratch map, map_compare → verify_diff"]
+        G5["Every 100th segment: GB_BUCKET_VERIFY<br/>make_prime_map + mid_window + sieve_large_packed over all larger primes (no hit lists)<br/>→ scratch map, map_compare → verify_diff"]
         G6["count30<br/>prime + twin-prime counts"]
         G7{"sampled segment?<br/>every 256th"}
         G8["check30_a: phase A<br/>1024 evens per item, tests n-p in the class map<br/>for the first candidates; unresolved → pending"]

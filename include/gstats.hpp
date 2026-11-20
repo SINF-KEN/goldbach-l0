@@ -68,35 +68,24 @@ inline constexpr uint32_t STATS_K_DEFAULT = 64;    // sampled exact phase-A cand
 inline constexpr uint32_t STATS_SAMPLE_DEFAULT = 256;  // every 256th segment: full p(n) histogram (~0.12%)
 inline constexpr uint32_t STATS_KMAX = 128;        // MUST match X_KMAX in goldbach.cl
 inline constexpr uint32_t STATS_XB_SPAN = 32;      // MUST match XB_SPAN in goldbach.cl
-inline constexpr uint32_t COUNT30_CW = 4;          // MUST match C30_CW in goldbach.cl (count30 words per lane)
+inline constexpr uint32_t COUNT30_CW = 2;          // MUST match C30_CW in goldbach.cl (count30 words per lane)
 // prime gaps (count30's tail and walk, the live paper's section 2.2)
 inline constexpr uint32_t GAPS30_TAIL = 700;       // MUST match G30T_TAIL in goldbach.cl
 inline constexpr uint32_t GAPS30_HBINS = 1024;     // MUST match G30_HBINS in goldbach.cl
-inline constexpr uint32_t GAPS30_PBINS = 256;      // count30 block-walk pattern bins (G30_PBINS), after the histogram
+inline constexpr uint32_t GAPS30_PBINS = 16;       // count30 internal-gap bins g / 2 (G30_PBINS), after the histogram
 
-/// Adds the internal gaps of count30's block-walk patterns to a gap
-/// histogram (bins g / 2): pattern x (bits s0 s4 s1 s5 s2 s6 s3 s7 = the
-/// slots of a block of 30 in phase order holding a prime) occurred pat[x]
-/// times; consecutive slots a < b contribute gap / 2 = phase_b - phase_a,
-/// phases = nibbles of phis (ascending).
+/// Adds the internal gaps of count30's block walk to a gap histogram (bins
+/// g / 2): bin d (1..14) of @p inner counts the consecutive primes inside one
+/// block of 30 that are g = 2 d apart.
 /// @return the largest internal gap / 2 that occurred (0: none).
-inline uint32_t add_pattern_gaps(uint32_t* hist, const uint32_t* pat, uint32_t phis)
+inline uint32_t add_inner_gaps(uint32_t* hist, const uint32_t* inner)
 {
     uint32_t dmax = 0;
-    for (uint32_t x = 0; x < GAPS30_PBINS; ++x) {
-        if (!pat[x]) continue;
-        int prev = -1;
-        for (uint32_t t = 0; t < 8; ++t) {
-            const uint32_t bit = t < 4 ? 2 * t : 2 * (t - 4) + 1;
-            if (!((x >> bit) & 1u)) continue;
-            const int ph = int((phis >> (4 * t)) & 15u);
-            if (prev >= 0) {
-                hist[ph - prev] += pat[x];
-                dmax = std::max<uint32_t>(dmax, uint32_t(ph - prev));
-            }
-            prev = ph;
+    for (uint32_t d = 1; d < GAPS30_PBINS; ++d)
+        if (inner[d]) {
+            hist[d] += inner[d];
+            dmax = d;
         }
-    }
     return dmax;
 }
 
