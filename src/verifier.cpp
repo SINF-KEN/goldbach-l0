@@ -2589,8 +2589,17 @@ void DenseRun::release_device_objects() {
         if (b.pending_n[s]) Context::free_mem(ctx.context(), b.pending_n[s]);
         if (b.acct[s]) Context::free_mem(ctx.context(), b.acct[s]);
         if (b.ridge[s]) Context::free_mem(ctx.context(), b.ridge[s]);
+        Context::free_mem(ctx.context(), b.x_hist[s]);
+        // With statistics on, p_hist / p_first point into stats_block (init
+        // freed the originals); only without them are they their own buffers.
+        if (!stats_on) {
+            Context::free_mem(ctx.context(), b.p_hist[s]);
+            Context::free_mem(ctx.context(), b.p_first[s]);
+        }
         Context::free_mem(ctx.context(), stats_block[s]);
     }
+    for (void* p : {(void*)b.x_all, (void*)b.x_tab, (void*)b.x_ch, (void*)b.x_j, (void*)b.want_p})
+        Context::free_mem(ctx.context(), p);
     for (void* p : {(void*)b.c30_cands, (void*)b.c30_meta, (void*)b.c30_rest, (void*)b.c30_rtab})
         if (p) Context::free_mem(ctx.context(), p);
     Context::free_mem(ctx.context(), d_group_desc);
